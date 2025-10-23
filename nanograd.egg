@@ -1,0 +1,27 @@
+;;;; -*- Hen -*-
+
+(
+ ; Your egg's license:
+ (license "LGPL-3")
+
+ ; Egg category
+ (category math)
+
+ ; A list of eggs nanograd depends on.
+ (dependencies srfi-1 srfi-4 srfi-42 srfi-69
+               mathh vector-lib blas yasos s11n
+               )
+
+ (author "Ivan Raikov")
+
+ (synopsis "Minimalistic automatic differentiation framework.")
+
+ (components (extension nanograd-autograd (source "autograd.scm") (csc-options "-O3" "-d1"))
+             (extension nanograd-layer (source "layer.scm") (csc-options "-O3" "-d1"))
+             (extension nanograd-optimizer (source "optimizer.scm") (csc-options "-O3" "-d1"))
+             (extension nanograd-diagnostics (source "gradient-diagnostics.scm") (csc-options "-O3" "-d1"))
+             )
+
+ (test-dependencies test)
+
+)
