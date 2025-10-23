@@ -319,7 +319,7 @@ LPGLv3 License - see LICENSE file for details
 
 This framework is inspired by:
 - **PyTorch**: Dynamic computation graphs and autograd design
-- **micrograd**: Minimalist autograd engine by Andrej Karpathy
-- **tinygrad**: Small neural network framework
+- [micrograd](https://github.com/karpathy/micrograd): Minimalistic autograd engine by Andrej Karpathy
+- [tinygrad](https://github.com/tinygrad/tinygrad): Small neural network framework
 
 Built with CHICKEN Scheme and powered by YASOS and BLAS.
