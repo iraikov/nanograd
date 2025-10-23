@@ -630,14 +630,6 @@
      params
      layer-names)))
 
-(define (count-dead-neurons model)
-  "Count neurons that never activate (always output 0)"
-  (printf "\n========================================\n")
-  (printf "Dead Neuron Analysis\n")
-  (printf "========================================\n\n")
-  (printf "Note: This requires activation statistics from training data\n")
-  (printf "In a full implementation, track activations during training\n"))
-
 ;;; ==================================================================
 ;;; Advanced Training: Data Augmentation
 ;;; ==================================================================
