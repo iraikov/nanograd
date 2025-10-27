@@ -446,7 +446,7 @@
   (reset-test-stats!)
   (printf "\n")
   (printf "========================================\n")
-  (printf "LAYER UNIT TESTS\n")
+  (printf "Layer unit tests\n")
   (printf "========================================\n")
   
   (test-activation-objects)

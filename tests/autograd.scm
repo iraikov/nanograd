@@ -55,7 +55,7 @@
     (if (not (= n1 n2))
         (begin
           (set! *test-failed* (+ *test-failed* 1))
-          (printf "  âœ— ~A (length mismatch: ~A vs ~A)\n" name n1 n2))
+          (printf "  X ~A (length mismatch: ~A vs ~A)\n" name n1 n2))
         (let loop ((i 0) (max-diff 0.0) (all-ok? #t))
           (if (= i n1)
               (if all-ok?

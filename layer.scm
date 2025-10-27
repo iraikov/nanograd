@@ -13,8 +13,11 @@
    forward parameters zero-grad-layer!
    layer-input-size layer-output-size
    layer-activation layer-name layer-norm
-   layer->serializable
+   
+   ;; Serialization operations
+   layer->serializable serializable->layer
    save-layer load-layer
+   save-model load-model
    
    ;; Activation functions (as objects)
    make-relu make-tanh make-sigmoid make-identity
@@ -59,7 +62,7 @@
    ((activation-name self) "Tanh")
    ((activation-forward self x) (tanh-op x))))
 
-  ;; Replace the make-sigmoid implementation with:
+  ;; Sigmoid activation
   (define (make-sigmoid)
     (object
      ((activation? self) #t)
@@ -91,10 +94,13 @@
 
   ;; operations for layer serialization
   (define-operation (save-layer layer filepath))
-  (define-operation (load-layer filepath))
   (define-operation (layer->serializable layer))
 
-  ;; Helpers for tensor serialization
+  ;;; ==================================================================
+  ;;; Serialization/Deserialization Helpers
+  ;;; ==================================================================
+
+  ;; Tensor serialization (uses s11n for efficient storage)
   (define (tensor->serializable tensor)
     "Convert a tensor to a serializable representation"
     (let ((data (tensor-data tensor))
@@ -105,7 +111,7 @@
       `((dtype . ,dtype)
         (shape . ,shape)
         (requires-grad . ,requires-grad)
-        (data . ,data))
+        (data . ,data))  ; handle SRFI-4 vectors with s11n
       ))
 
   (define (serializable->tensor serializable-tensor)
@@ -116,10 +122,11 @@
            (data (cdr (assq 'data serializable-tensor))))
       (case dtype
         ((f32) (make-tensor32 data shape requires-grad: requires-grad))
-        ((f64) (make-tensor64 data shape requires-grad: requires-grad)))))
+        ((f64) (make-tensor64 data shape requires-grad: requires-grad))
+        (else (error 'serializable->tensor 
+                     (format #f "Unknown dtype: ~A" dtype))))))
 
   ;; Activation Function Serialization
-
   (define (activation->serializable act)
     "Convert an activation function to serializable representation"
     (let ((name (activation-name act)))
@@ -136,6 +143,243 @@
        ((string=? name "Identity") (make-identity))
        (else (error 'serializable->activation 
                     (format #f "Unknown activation function: ~A" name))))))
+
+  ;;; ==================================================================
+  ;;; Layer Deserialization with Dimension Checking
+  ;;; ==================================================================
+
+  (define (check-dimension-match expected actual context)
+    "Verify that dimensions match, error if not"
+    (unless (= expected actual)
+      (error 'dimension-mismatch
+             (format #f "~A: expected ~A but got ~A" 
+                     context expected actual))))
+
+  (define (serializable->layer serializable-repr)
+    "Reconstruct a layer from its serializable representation with dimension checking"
+    (let ((layer-type (cdr (assq 'type serializable-repr))))
+      (cond
+       ;; Dense Layer Deserialization
+       ((eq? layer-type 'dense-layer)
+        (let* ((name (cdr (assq 'name serializable-repr)))
+               (input-size (cdr (assq 'input-size serializable-repr)))
+               (output-size (cdr (assq 'output-size serializable-repr)))
+               (dtype (cdr (assq 'dtype serializable-repr)))
+               (weights-ser (cdr (assq 'weights serializable-repr)))
+               (biases-ser (cdr (assq 'biases serializable-repr)))
+               (activation-ser (cdr (assq 'activation serializable-repr)))
+               
+               ;; Deserialize tensors
+               (weights (serializable->tensor weights-ser))
+               (biases (serializable->tensor biases-ser))
+               (activation (serializable->activation activation-ser))
+               
+               ;; Check dimensions
+               (weight-shape (tensor-shape weights))
+               (bias-shape (tensor-shape biases)))
+          
+          ;; Validate weight dimensions
+          (check-dimension-match output-size (car weight-shape)
+                                "Dense layer weight rows")
+          (check-dimension-match input-size (cadr weight-shape)
+                                "Dense layer weight columns")
+          
+          ;; Validate bias dimensions
+          (check-dimension-match output-size (car bias-shape)
+                                "Dense layer bias size")
+          
+          ;; Create layer with deserialized tensors
+          (object
+           ;; Type predicates
+           ((layer? self) #t)
+           ((dense-layer? self) #t)
+           
+           ;; Layer info
+           ((layer-name self) name)
+           ((layer-input-size self) input-size)
+           ((layer-output-size self) output-size)
+           ((layer-activation self) activation)
+           
+           ;; Forward pass
+           ((forward self input)
+            (let ((input-shape (tensor-shape input)))
+              (unless (= (car input-shape) input-size)
+                (error 'forward 
+                       (format #f "Input size mismatch: expected ~A, got ~A"
+                               input-size (car input-shape)))))
+            
+            (let* ((linear-output (matmul-op weights input))
+                   (output-with-bias (add linear-output biases)))
+              (activation-forward activation output-with-bias)))
+           
+           ;; Get all parameters
+           ((parameters self)
+            (list weights biases))
+           
+           ;; Zero gradients
+           ((zero-grad-layer! self)
+            (zero-grad! weights)
+            (zero-grad! biases))
+
+           ((layer->serializable self)
+            `((type . dense-layer)
+              (name . ,name)
+              (input-size . ,input-size)
+              (output-size . ,output-size)
+              (dtype . ,dtype)
+              (weights . ,(tensor->serializable weights))
+              (biases . ,(tensor->serializable biases))
+              (activation . ,(activation->serializable activation))))
+           
+           ((save-layer self filepath)
+            (save-layer-to-file self filepath)))))
+       
+       ;; Conv2D Layer Deserialization
+       ((eq? layer-type 'conv2d-layer)
+        (let* ((name (cdr (assq 'name serializable-repr)))
+               (in-channels (cdr (assq 'in-channels serializable-repr)))
+               (out-channels (cdr (assq 'out-channels serializable-repr)))
+               (kernel-size (cdr (assq 'kernel-size serializable-repr)))
+               (dtype (cdr (assq 'dtype serializable-repr)))
+               (weights-ser (cdr (assq 'weights serializable-repr)))
+               (biases-ser (cdr (assq 'biases serializable-repr)))
+               (activation-ser (cdr (assq 'activation serializable-repr)))
+               
+               ;; Deserialize tensors
+               (weights (serializable->tensor weights-ser))
+               (biases (serializable->tensor biases-ser))
+               (activation (serializable->activation activation-ser))
+               
+               ;; Check dimensions
+               (weight-shape (tensor-shape weights))
+               (bias-shape (tensor-shape biases)))
+          
+          ;; Validate weight dimensions (out_channels, in_channels, KH, KW)
+          (check-dimension-match out-channels (car weight-shape)
+                                "Conv2D output channels")
+          (check-dimension-match in-channels (cadr weight-shape)
+                                "Conv2D input channels")
+          (check-dimension-match kernel-size (caddr weight-shape)
+                                "Conv2D kernel height")
+          (check-dimension-match kernel-size (cadddr weight-shape)
+                                "Conv2D kernel width")
+          
+          ;; Validate bias dimensions
+          (check-dimension-match out-channels (car bias-shape)
+                                "Conv2D bias size")
+          
+          ;; Create layer with deserialized tensors
+          (object
+           ;; Type predicates
+           ((layer? self) #t)
+           ((conv2d-layer? self) #t)
+           
+           ;; Layer info
+           ((layer-name self) name)
+           ((layer-input-size self) in-channels)
+           ((layer-output-size self) out-channels)
+           ((layer-activation self) activation)
+           
+           ;; Forward pass
+           ((forward self input)
+            (let ((ishape (tensor-shape input)))
+              (unless (= (car ishape) in-channels)
+                (error 'forward 
+                       (format #f "Input channel mismatch: expected ~A, got ~A"
+                               in-channels (car ishape)))))
+            
+            (let* ((conv-output (conv2d input weights biases
+                                        stride: 1
+                                        padding: 0)))
+              (activation-forward activation conv-output)))
+           
+           ;; Get parameters
+           ((parameters self)
+            (list weights biases))
+           
+           ;; Zero gradients
+           ((zero-grad-layer! self)
+            (zero-grad! weights)
+            (zero-grad! biases))
+
+           ((layer->serializable self)
+            `((type . conv2d-layer)
+              (name . ,name)
+              (in-channels . ,in-channels)
+              (out-channels . ,out-channels)
+              (kernel-size . ,kernel-size)
+              (dtype . ,dtype)
+              (weights . ,(tensor->serializable weights))
+              (biases . ,(tensor->serializable biases))
+              (activation . ,(activation->serializable activation))))
+
+           ((save-layer self filepath)
+            (save-layer-to-file self filepath)))))
+       
+       ;; Sequential Layer Deserialization
+       ((eq? layer-type 'sequential)
+        (let* ((name (cdr (assq 'name serializable-repr)))
+               (layers-ser (cdr (assq 'layers serializable-repr)))
+               
+               ;; Recursively deserialize all layers
+               (layers (map serializable->layer layers-ser)))
+          
+          ;; Verify layer connectivity (output of layer i matches input of layer i+1)
+          (let loop ((remaining-layers layers))
+            (when (>= (length remaining-layers) 2)
+              (let ((curr-layer (car remaining-layers))
+                    (next-layer (cadr remaining-layers)))
+                (check-dimension-match 
+                 (layer-output-size curr-layer)
+                 (layer-input-size next-layer)
+                 (format #f "Sequential layer connectivity between ~A and ~A"
+                         (layer-name curr-layer)
+                         (layer-name next-layer))))
+              (loop (cdr remaining-layers))))
+          
+          ;; Create sequential layer
+          (object
+           ;; Type predicates
+           ((layer? self) #t)
+           ((sequential? self) #t)
+           
+           ;; Layer info
+           ((layer-name self) name)
+           ((layer-input-size self) 
+            (if (null? layers)
+                0
+                (layer-input-size (car layers))))
+           ((layer-output-size self)
+            (if (null? layers)
+                0
+                (layer-output-size (last layers))))
+           
+           ;; Forward pass (chain through all layers)
+           ((forward self input)
+            (fold (lambda (layer x)
+                    (forward layer x))
+                  input
+                  layers))
+           
+           ;; Get all parameters from all layers
+           ((parameters self)
+            (append-map parameters layers))
+           
+           ;; Zero gradients for all layers
+           ((zero-grad-layer! self)
+            (for-each zero-grad-layer! layers))
+           
+           ((layer->serializable self)
+            `((type . sequential)
+              (name . ,name)
+              (layers . ,(map layer->serializable layers))))
+           
+           ((save-layer self filepath)
+            (save-layer-to-file self filepath)))))
+       
+       (else
+        (error 'serializable->layer 
+               (format #f "Unknown layer type: ~A" layer-type))))))
 
   
   ;;; ==================================================================
@@ -268,7 +512,16 @@
        
        ;; Zero gradients for all layers
        ((zero-grad-layer! self)
-        (for-each zero-grad-layer! layer-list)))))
+        (for-each zero-grad-layer! layer-list))
+       
+       ;; Serialize sequential layer with all its sub-layers
+       ((layer->serializable self)
+        `((type . sequential)
+          (name . ,name)
+          (layers . ,(map layer->serializable layer-list))))
+       
+       ((save-layer self filepath)
+        (save-layer-to-file self filepath)))))
 
   ;;; ==================================================================
   ;;; Layer Normalization
@@ -412,7 +665,7 @@
       (let* ((conv-output (conv2d input weights biases
                                   stride: stride
                                   padding: padding
-                                  debug: (string=? name "Conv2"))))
+                                  )))
         ;; Apply activation
         (activation-forward activation conv-output)))
      
@@ -604,7 +857,9 @@
                     params)))
     (printf "===================\n\n"))
 
-  ;; File I/O Operations
+  ;;; ==================================================================
+  ;;; File I/O Operations
+  ;;; ==================================================================
 
   (define (save-layer-to-file layer filepath)
     "Save a layer to a file using s11n serialization"
@@ -613,13 +868,29 @@
         (lambda ()
           (serialize serializable)))))
 
-  #;(define (load-layer-from-file filepath)
+  (define (load-layer-from-file filepath)
     "Load a layer from a file using s11n deserialization"
     (let ((serializable (with-input-from-file filepath
                           (lambda ()
                             (deserialize)))))
       (serializable->layer serializable)))
 
+  ;; Public API for layer save/load
+  (define (save-layer layer filepath)
+    "Public API: Save a layer to file"
+    (save-layer-to-file layer filepath))
   
+  (define (load-layer filepath)
+    "Public API: Load a layer from file"
+    (load-layer-from-file filepath))
+
+  ;; Model save/load (alias for sequential models)
+  (define (save-model model filepath)
+    "Save a model (sequential or single layer) to file"
+    (save-layer-to-file model filepath))
+  
+  (define (load-model filepath)
+    "Load a model from file"
+    (load-layer-from-file filepath))
   
 ) ;; end module
