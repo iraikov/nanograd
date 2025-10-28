@@ -23,7 +23,8 @@
    ;; Activation functions
    relu tanh-op sigmoid
    sigmoid-stable
-   softplus leaky-relu 
+   softplus leaky-relu
+   gelu silu
    softmax log-softmax
    
    ;; Loss functions
@@ -53,6 +54,10 @@
    blas
    )
 
+  ;; Hygienic macro for dtype-based operation dispatch
+  (include "with-dtype.scm")
+
+  
   ;;; ==================================================================
   ;;; Tensor interface using YASOS
   ;;; ==================================================================
@@ -88,9 +93,8 @@
 
   (define (make-base-tensor data shape dtype requires-grad?)
     (let ((grad (if requires-grad?
-                    (case dtype
-                      ((f32) (make-f32vector (apply * shape) 0.0))
-                      ((f64) (make-f64vector (apply * shape) 0.0)))
+                    (with-dtype dtype
+                                (vec (apply * shape) 0.0))
                     #f))
           (backward-fn #f)
           (children '()))  ; store tensor dependencies
@@ -144,9 +148,8 @@
       (let* ((rank (length shape))
              (new-shape (map (lambda (axis) (list-ref shape axis)) axes))
              (size (apply * shape))
-             (new-data (case dtype
-                         ((f32) (make-f32vector size 0.0))
-                         ((f64) (make-f64vector size 0.0)))))
+             (new-data (with-dtype dtype (vec size 0.0)))
+             )
    
         ;; Compute strides for old and new layouts
         (define (compute-strides shape)
@@ -177,10 +180,9 @@
                      (new-idx (fold (lambda (idx stride acc)
                                       (+ acc (* idx stride)))
                                     0 new-indices new-strides)))
-                
-                (case dtype
-                  ((f32) (f32vector-set! new-data new-idx (f32vector-ref data i)))
-                  ((f64) (f64vector-set! new-data new-idx (f64vector-ref data i))))
+
+                (with-dtype dtype
+                            (elt-set! new-data new-idx (elt-ref data i)))
                 
                 (loop (+ i 1)))))
           
@@ -207,21 +209,18 @@
      ((add-to-grad! self delta)
       (when grad
         (let ((n (vector-length-for-dtype grad dtype)))
-          (case dtype
-            ((f32) (saxpy! n 1.0 delta grad))
-            ((f64) (daxpy! n 1.0 delta grad))))))
+          (with-dtype dtype (axpy! n 1.0 delta grad)))
+        ))
      
      ;; Gradient operations
      ((zero-grad! self)
       (when grad
         (let ((n (vector-length-for-dtype grad dtype)))
-          (case dtype
-            ((f32) (do ((i 0 (+ i 1)))
-                       ((= i n))
-                     (f32vector-set! grad i 0.0)))
-            ((f64) (do ((i 0 (+ i 1)))
-                       ((= i n))
-                     (f64vector-set! grad i 0.0)))))))
+          (with-dtype dtype
+            (do ((i 0 (+ i 1)))
+                ((= i n))
+              (elt-set! grad i 0.0))))
+        ))
 
      ;; Topological sort backward (correct for DAGs with shared nodes)
      ((backward! self)
@@ -294,20 +293,19 @@
     (and grad
          (let ((n (vector-length-for-dtype grad dtype)))
            (and (> n 0)
-                (case dtype
-                  ((f32) (not (= (f32vector-ref grad 0) 0.0)))
-                  ((f64) (not (= (f64vector-ref grad 0) 0.0))))))))
+                (with-dtype dtype
+                            (not (= (elt-ref grad 0) 0.0))))
+           ))
+    )
 
   (define (fill-ones! vec dtype)
     (let ((n (vector-length-for-dtype vec dtype)))
-      (case dtype
-        ((f32) (do ((i 0 (+ i 1)))
-                   ((= i n))
-                 (f32vector-set! vec i 1.0)))
-        ((f64) (do ((i 0 (+ i 1)))
-                   ((= i n))
-                 (f64vector-set! vec i 1.0))))))
-
+      (with-dtype dtype
+        (do ((i 0 (+ i 1)))
+            ((= i n))
+          (elt-set! vec i 1.0))))
+    )
+  
   ;;; ==================================================================
   ;;; Tensor constructors
   ;;; ==================================================================
@@ -329,26 +327,18 @@
            (data-a (tensor-data a))
            (data-b (tensor-data b))
            (n (vector-length-for-dtype data-a dtype))
-           (result-data (case dtype
-                          ((f32) (make-f32vector n 0.0))
-                          ((f64) (make-f64vector n 0.0))))
+           (result-data (with-dtype dtype (vec n 0.0)))
            (requires-grad? (or (tensor-requires-grad? a)
-                              (tensor-requires-grad? b))))
+                               (tensor-requires-grad? b))))
       
       ;; Forward: result = a + b
-      (case dtype
-        ((f32)
+      (with-dtype
+       dtype
          (do ((i 0 (+ i 1)))
              ((= i n))
-           (f32vector-set! result-data i
-                          (+ (f32vector-ref data-a i)
-                             (f32vector-ref data-b i)))))
-        ((f64)
-         (do ((i 0 (+ i 1)))
-             ((= i n))
-           (f64vector-set! result-data i
-                          (+ (f64vector-ref data-a i)
-                             (f64vector-ref data-b i))))))
+           (elt-set! result-data i
+                     (+ (elt-ref data-a i)
+                        (elt-ref data-b i)))))
       
       (let ((result (make-base-tensor result-data (tensor-shape a) dtype requires-grad?)))
         (when requires-grad?
@@ -370,26 +360,18 @@
            (data-a (tensor-data a))
            (data-b (tensor-data b))
            (n (vector-length-for-dtype data-a dtype))
-           (result-data (case dtype
-                          ((f32) (make-f32vector n 0.0))
-                          ((f64) (make-f64vector n 0.0))))
+           (result-data (with-dtype dtype (vec n 0.0)))
            (requires-grad? (or (tensor-requires-grad? a)
                               (tensor-requires-grad? b))))
       
       ;; Forward: result = a - b
-      (case dtype
-        ((f32)
+      (with-dtype
+       dtype
          (do ((i 0 (+ i 1)))
              ((= i n))
-           (f32vector-set! result-data i
-                          (- (f32vector-ref data-a i)
-                             (f32vector-ref data-b i)))))
-        ((f64)
-         (do ((i 0 (+ i 1)))
-             ((= i n))
-           (f64vector-set! result-data i
-                          (- (f64vector-ref data-a i)
-                             (f64vector-ref data-b i))))))
+           (elt-set! result-data i
+                     (- (elt-ref data-a i)
+                        (elt-ref data-b i)))))
       
       (let ((result (make-base-tensor result-data (tensor-shape a) dtype requires-grad?)))
         (when requires-grad?
@@ -400,12 +382,9 @@
                   (add-to-grad! a grad-out))
                 (when (tensor-requires-grad? b)
                   ;; Negate gradient for subtraction
-                  (let ((neg-grad (case dtype
-                                   ((f32) (make-f32vector n 0.0))
-                                   ((f64) (make-f64vector n 0.0)))))
-                    (case dtype
-                      ((f32) (saxpy! n -1.0 grad-out neg-grad))
-                      ((f64) (daxpy! n -1.0 grad-out neg-grad)))
+                  (let ((neg-grad (with-dtype dtype (vec n 0.0))))
+                    (with-dtype dtype
+                      (axpy! n -1.0 grad-out neg-grad))
                     (add-to-grad! b neg-grad)))))
             (list a b))
           )
@@ -418,26 +397,18 @@
            (data-a (tensor-data a))
            (data-b (tensor-data b))
            (n (vector-length-for-dtype data-a dtype))
-           (result-data (case dtype
-                          ((f32) (make-f32vector n 0.0))
-                          ((f64) (make-f64vector n 0.0))))
+           (result-data (with-dtype dtype (vec n 0.0)))
            (requires-grad? (or (tensor-requires-grad? a)
-                              (tensor-requires-grad? b))))
+                               (tensor-requires-grad? b))))
       
       ;; Forward: result = a * b (element-wise)
-      (case dtype
-        ((f32)
+      (with-dtype
+       dtype
          (do ((i 0 (+ i 1)))
              ((= i n))
-           (f32vector-set! result-data i
-                          (* (f32vector-ref data-a i)
-                             (f32vector-ref data-b i)))))
-        ((f64)
-         (do ((i 0 (+ i 1)))
-             ((= i n))
-           (f64vector-set! result-data i
-                          (* (f64vector-ref data-a i)
-                             (f64vector-ref data-b i))))))
+           (elt-set! result-data i
+                     (* (elt-ref data-a i)
+                        (elt-ref data-b i)))))
       
       (let ((result (make-base-tensor result-data (tensor-shape a) dtype requires-grad?)))
         (when requires-grad?
@@ -446,138 +417,90 @@
               (let ((grad-out (tensor-grad result)))
                 ;; d(a*b)/da = b
                 (when (tensor-requires-grad? a)
-                  (let ((grad-a (case dtype
-                                 ((f32) (make-f32vector n 0.0))
-                                 ((f64) (make-f64vector n 0.0)))))
-                    (case dtype
-                      ((f32)
+                  (let ((grad-a (with-dtype dtype (vec n 0.0))))
+                    (with-dtype dtype
                        (do ((i 0 (+ i 1)))
                            ((= i n))
-                         (f32vector-set! grad-a i
-                                        (* (f32vector-ref grad-out i)
-                                           (f32vector-ref data-b i)))))
-                      ((f64)
-                       (do ((i 0 (+ i 1)))
-                           ((= i n))
-                         (f64vector-set! grad-a i
-                                        (* (f64vector-ref grad-out i)
-                                           (f64vector-ref data-b i))))))
+                         (elt-set! grad-a i
+                                        (* (elt-ref grad-out i)
+                                           (elt-ref data-b i)))))
                     (add-to-grad! a grad-a)))
                 ;; d(a*b)/db = a
                 (when (tensor-requires-grad? b)
-                  (let ((grad-b (case dtype
-                                 ((f32) (make-f32vector n 0.0))
-                                 ((f64) (make-f64vector n 0.0)))))
-                    (case dtype
-                      ((f32)
-                       (do ((i 0 (+ i 1)))
-                           ((= i n))
-                         (f32vector-set! grad-b i
-                                        (* (f32vector-ref grad-out i)
-                                           (f32vector-ref data-a i)))))
-                      ((f64)
-                       (do ((i 0 (+ i 1)))
-                           ((= i n))
-                         (f64vector-set! grad-b i
-                                        (* (f64vector-ref grad-out i)
-                                           (f64vector-ref data-a i))))))
+                  (let ((grad-b (with-dtype dtype (vec n 0.0))))
+                    (with-dtype dtype
+                                (do ((i 0 (+ i 1)))
+                                    ((= i n))
+                                  (elt-set! grad-b i
+                                            (* (elt-ref grad-out i)
+                                               (elt-ref data-a i)))))
                     (add-to-grad! b grad-b)))))
           (list a b))
         result))))
 
   ;; Element-wise division
   (define (div a b)
-  "Element-wise division: z = a / b
+    "Element-wise division: z = a / b
    Gradients:
      dL/da = dL/dz * (1/b)
      dL/db = dL/dz * (-a/b^2)"
   
-  (assert (eq? (tensor-dtype a) (tensor-dtype b)))
+    (assert (eq? (tensor-dtype a) (tensor-dtype b)))
   
-  (let* ((dtype (tensor-dtype a))
-         (data-a (tensor-data a))
-         (data-b (tensor-data b))
-         (n (vector-length-for-dtype data-a dtype))
-         (result-data (case dtype
-                        ((f32) (make-f32vector n 0.0))
-                        ((f64) (make-f64vector n 0.0))))
-         (requires-grad? (or (tensor-requires-grad? a)
-                            (tensor-requires-grad? b))))
+    (let* ((dtype (tensor-dtype a))
+           (data-a (tensor-data a))
+           (data-b (tensor-data b))
+           (n (vector-length-for-dtype data-a dtype))
+           (result-data (with-dtype dtype (vec n 0.0)))
+           (requires-grad? (or (tensor-requires-grad? a)
+                               (tensor-requires-grad? b))))
     
-    ;; Check for shapes match
-    (unless (equal? (tensor-shape a) (tensor-shape b))
-      (error 'div "Shape mismatch: cannot divide tensors with different shapes"))
+      ;; Check for shapes match
+      (unless (equal? (tensor-shape a) (tensor-shape b))
+        (error 'div "Shape mismatch: cannot divide tensors with different shapes"))
     
-    ;; Forward: result = a / b (element-wise)
-    (case dtype
-      ((f32)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((b-val (f32vector-ref data-b i)))
-           (when (= b-val 0.0)
-             (error 'div "Division by zero"))
-           (f32vector-set! result-data i
-                          (/ (f32vector-ref data-a i) b-val)))))
-      ((f64)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((b-val (f64vector-ref data-b i)))
-           (when (= b-val 0.0)
-             (error 'div "Division by zero"))
-           (f64vector-set! result-data i
-                          (/ (f64vector-ref data-a i) b-val))))))
-    
-    (let ((result (make-base-tensor result-data (tensor-shape a) dtype requires-grad?)))
-      (when requires-grad?
-        (set-backward-fn! result
-          (lambda ()
-            (let ((grad-out (tensor-grad result)))
-              
-              ;; Gradient w.r.t. a: dL/da = dL/dz * (1/b)
-              (when (tensor-requires-grad? a)
-                (let ((grad-a (case dtype
-                               ((f32) (make-f32vector n 0.0))
-                               ((f64) (make-f64vector n 0.0)))))
-                  (case dtype
-                    ((f32)
-                     (do ((i 0 (+ i 1)))
-                         ((= i n))
-                       (f32vector-set! grad-a i
-                                      (/ (f32vector-ref grad-out i)
-                                         (f32vector-ref data-b i)))))
-                    ((f64)
-                     (do ((i 0 (+ i 1)))
-                         ((= i n))
-                       (f64vector-set! grad-a i
-                                      (/ (f64vector-ref grad-out i)
-                                         (f64vector-ref data-b i))))))
-                  (add-to-grad! a grad-a)))
-              
-              ;; Gradient w.r.t. b: dL/db = dL/dz * (-a/b²)
-              (when (tensor-requires-grad? b)
-                (let ((grad-b (case dtype
-                               ((f32) (make-f32vector n 0.0))
-                               ((f64) (make-f64vector n 0.0)))))
-                  (case dtype
-                    ((f32)
-                     (do ((i 0 (+ i 1)))
-                         ((= i n))
-                       (let ((b-val (f32vector-ref data-b i)))
-                         (f32vector-set! grad-b i
-                                        (* (f32vector-ref grad-out i)
-                                           (- (/ (f32vector-ref data-a i)
-                                                (* b-val b-val))))))))
-                    ((f64)
-                     (do ((i 0 (+ i 1)))
-                         ((= i n))
-                       (let ((b-val (f64vector-ref data-b i)))
-                         (f64vector-set! grad-b i
-                                        (* (f64vector-ref grad-out i)
-                                           (- (/ (f64vector-ref data-a i)
-                                                (* b-val b-val)))))))))
-                  (add-to-grad! b grad-b)))))
-          (list a b)))
-      result)))
+      ;; Forward: result = a / b (element-wise)
+      (with-dtype dtype
+                  (do ((i 0 (+ i 1)))
+                      ((= i n))
+                    (let ((b-val (elt-ref data-b i)))
+                      (when (= b-val 0.0)
+                        (error 'div "Division by zero"))
+                      (elt-set! result-data i
+                                (/ (elt-ref data-a i) b-val)))))
+      
+      (let ((result (make-base-tensor result-data (tensor-shape a) dtype requires-grad?)))
+        (when requires-grad?
+          (set-backward-fn!
+           result
+           (lambda ()
+             (let ((grad-out (tensor-grad result)))
+               
+               ;; Gradient w.r.t. a: dL/da = dL/dz * (1/b)
+               (when (tensor-requires-grad? a)
+                 (let ((grad-a (with-dtype dtype (vec n 0.0))))
+                   (with-dtype dtype
+                               (do ((i 0 (+ i 1)))
+                                   ((= i n))
+                                 (elt-set! grad-a i
+                                           (/ (elt-ref grad-out i)
+                                              (elt-ref data-b i)))))
+                   (add-to-grad! a grad-a)))
+               
+               ;; Gradient w.r.t. b: dL/db = dL/dz * (-a/b^2)
+               (when (tensor-requires-grad? b)
+                 (let ((grad-b (with-dtype dtype (vec n 0.0))))
+                   (with-dtype dtype
+                               (do ((i 0 (+ i 1)))
+                                   ((= i n))
+                                 (let ((b-val (elt-ref data-b i)))
+                                   (elt-set! grad-b i
+                                             (* (elt-ref grad-out i)
+                                                (- (/ (elt-ref data-a i)
+                                                      (* b-val b-val))))))))
+                   (add-to-grad! b grad-b)))))
+           (list a b)))
+        result)))
 
 
   (define (safe-div a b #!key (epsilon 1e-8))
@@ -586,22 +509,14 @@
     (let* ((dtype (tensor-dtype b))
            (data-b (tensor-data b))
            (n (vector-length-for-dtype data-b dtype))
-           (b-safe-data (case dtype
-                          ((f32) (make-f32vector n 0.0))
-                          ((f64) (make-f64vector n 0.0)))))
+           (b-safe-data (with-dtype dtype (vec n 0.0))))
       
       ;; Add epsilon to b
-      (case dtype
-        ((f32)
+      (with-dtype dtype
          (do ((i 0 (+ i 1)))
              ((= i n))
-           (f32vector-set! b-safe-data i
-                           (+ (f32vector-ref data-b i) epsilon))))
-        ((f64)
-         (do ((i 0 (+ i 1)))
-             ((= i n))
-           (f64vector-set! b-safe-data i
-                           (+ (f64vector-ref data-b i) epsilon)))))
+           (elt-set! b-safe-data i
+                     (+ (elt-ref data-b i) epsilon))))
       
       ;; Create safe denominator tensor
       (let ((b-safe (make-base-tensor b-safe-data 
@@ -658,52 +573,40 @@
         (cond
          ;; Case 1: Matrix @ Matrix using GEMM
          ((and is-a-matrix? is-b-matrix?)
-          (case dtype
-            ((f32) (sgemm! RowMajor NoTrans NoTrans 
-                          m n k 
-                          1.0 data-a      ; A: m*k, lda=k
-                          data-b          ; B: k*n, ldb=n
-                          0.0 result-data
-                          lda: k
-                          ldb: n
-                          ldc: n)) ; C: m*n, ldc=n
-            ((f64) (dgemm! RowMajor NoTrans NoTrans 
-                          m n k 
-                          1.0 data-a
-                          data-b
-                          0.0 result-data
-                          lda: k
-                          ldb: n
-                          ldc: n))))
+          (with-dtype dtype
+            (gemm! RowMajor NoTrans NoTrans 
+                   m n k 
+                   1.0 data-a      ; A: m*k, lda=k
+                   data-b          ; B: k*n, ldb=n
+                   0.0 result-data
+                   lda: k
+                   ldb: n
+                   ldc: n)) ; C: m*n, ldc=n
+          )
          
          ;; Case 2: Matrix @ Vector using GEMV
          ((and is-a-matrix? is-b-vector?)
-          (case dtype
-            ((f32) (sgemv! RowMajor NoTrans m k 
-                          1.0 data-a data-b 
-                          0.0 result-data))
-            ((f64) (dgemv! RowMajor NoTrans m k 
-                          1.0 data-a data-b 
-                          0.0 result-data))))
+          (with-dtype dtype
+            (gemv! RowMajor NoTrans m k 
+                   1.0 data-a data-b 
+                   0.0 result-data))
+          )
          
          ;; Case 3: Vector @ Matrix (treat as 1×k @ k×n)
          ((and (not is-a-matrix?) is-b-matrix?)
-          (case dtype
-            ((f32) (sgemv! RowMajor Trans n k 
-                          1.0 data-b data-a 
-                          0.0 result-data))
-            ((f64) (dgemv! RowMajor Trans n k 
-                          1.0 data-b data-a 
-                          0.0 result-data))))
+          (with-dtype dtype
+            (gemv! RowMajor Trans n k 
+                   1.0 data-b data-a 
+                   0.0 result-data))
+          )
          
          ;; Case 4: Vector @ Vector (dot product)
          (else
-          (let ((dot-result (case dtype
-                             ((f32) (sdot k data-a data-b))
-                             ((f64) (ddot k data-a data-b)))))
-            (case dtype
-              ((f32) (f32vector-set! result-data 0 dot-result))
-              ((f64) (f64vector-set! result-data 0 dot-result))))))
+          (let ((dot-result (with-dtype dtype
+                                        (dot k data-a data-b))))
+            (with-dtype dtype
+             (elt-set! result-data 0 dot-result)))
+          ))
         
         ;; Create result tensor
         (let ((result (make-base-tensor result-data result-shape dtype requires-grad?)))
@@ -714,163 +617,117 @@
                   
                   ;; Gradient w.r.t. A: dL/dA = dL/dC @ B^T
                   (when (tensor-requires-grad? a)
-                    (let ((grad-a (case dtype
-                                   ((f32) (make-f32vector (* m k) 0.0))
-                                   ((f64) (make-f64vector (* m k) 0.0)))))
+                    (let ((grad-a (with-dtype dtype (vec (* m k) 0.0))))
                       
                       (cond
                        ;; Matrix @ Matrix case
                        ((and is-a-matrix? is-b-matrix?)
                         ;; dL/dA = dL/dC @ B^T
                         ;; (m×n) @ (n×k) = (m×k)
-                        (case dtype
-                          ((f32) (sgemm! RowMajor NoTrans Trans
-                                        m k n
-                                        1.0 grad-out      ; dL/dC: m*n
-                                        data-b            ; B: k*n (transposed)
-                                        0.0 grad-a
-                                        lda: n
-                                        ldb: n
-                                        ldc: k))      ; dL/dA: m*k
-                          ((f64) (dgemm! RowMajor NoTrans Trans
-                                        m k n
-                                        1.0 grad-out
-                                        data-b
-                                        0.0 grad-a
-                                        lda: n
-                                        ldb: n
-                                        ldc: k))))
-                       
+                        (with-dtype dtype
+                          (gemm! RowMajor NoTrans Trans
+                                 m k n
+                                 1.0 grad-out      ; dL/dC: m*n
+                                 data-b            ; B: k*n (transposed)
+                                 0.0 grad-a
+                                 lda: n
+                                 ldb: n
+                                 ldc: k))      ; dL/dA: m*k
+                        )
                        ;; Matrix @ Vector case
                        ((and is-a-matrix? is-b-vector?)
                         ;; dL/dA = dL/dC ⊗ B (outer product)
                         ;; Each row i of dL/dA = (dL/dC)[i] * B
-                        (case dtype
-                          ((f32)
-                           (do ((i 0 (+ i 1)))
-                               ((= i m))
-                             (let ((scale (f32vector-ref grad-out i)))
-                               (do ((j 0 (+ j 1)))
-                                   ((= j k))
-                                 (f32vector-set! grad-a (+ (* i k) j)
-                                                (* scale (f32vector-ref data-b j)))))))
-                          ((f64)
-                           (do ((i 0 (+ i 1)))
-                               ((= i m))
-                             (let ((scale (f64vector-ref grad-out i)))
-                               (do ((j 0 (+ j 1)))
-                                   ((= j k))
-                                 (f64vector-set! grad-a (+ (* i k) j)
-                                                (* scale (f64vector-ref data-b j)))))))))
+                        (with-dtype
+                         dtype
+                         (do ((i 0 (+ i 1)))
+                             ((= i m))
+                           (let ((scale (elt-ref grad-out i)))
+                             (do ((j 0 (+ j 1)))
+                                 ((= j k))
+                               (elt-set! grad-a (+ (* i k) j)
+                                         (* scale (elt-ref data-b j)))))))
+                        )
                        
                        ;; Vector @ Matrix case
                        ((and (not is-a-matrix?) is-b-matrix?)
                         ;; dL/dA = B @ dL/dC (vector result)
-                        (case dtype
-                          ((f32) (sgemv! RowMajor NoTrans k n
-                                        1.0 data-b grad-out
-                                        0.0 grad-a))
-                          ((f64) (dgemv! RowMajor NoTrans k n
-                                        1.0 data-b grad-out
-                                        0.0 grad-a))))
+                        (with-dtype dtype
+                          (gemv! RowMajor NoTrans k n
+                                 1.0 data-b grad-out
+                                 0.0 grad-a))
+                        )
                        
                        ;; Vector @ Vector (dot product)
                        (else
                         ;; dL/dA = dL/dC * B (element-wise)
-                        (let ((scale (case dtype
-                                      ((f32) (f32vector-ref grad-out 0))
-                                      ((f64) (f64vector-ref grad-out 0)))))
-                          (case dtype
-                            ((f32) (do ((i 0 (+ i 1)))
-                                       ((= i k))
-                                     (f32vector-set! grad-a i
-                                                    (* scale (f32vector-ref data-b i)))))
-                            ((f64) (do ((i 0 (+ i 1)))
-                                       ((= i k))
-                                     (f64vector-set! grad-a i
-                                                    (* scale (f64vector-ref data-b i)))))))))
+                        (let ((scale (with-dtype dtype
+                                                (elt-ref grad-out 0))))
+                          (with-dtype dtype
+                            (do ((i 0 (+ i 1)))
+                                ((= i k))
+                              (elt-set! grad-a i
+                                        (* scale (elt-ref data-b i))))))
+                        ))
                       
                       (add-to-grad! a grad-a)))
                   
                   ;; Gradient w.r.t. B: dL/dB = A^T @ dL/dC
                   (when (tensor-requires-grad? b)
-                    (let ((grad-b (case dtype
-                                   ((f32) (make-f32vector (* k n) 0.0))
-                                   ((f64) (make-f64vector (* k n) 0.0)))))
+                    (let ((grad-b (with-dtype dtype (vec (* k n) 0.0))))
                       
                       (cond
                        ;; Matrix @ Matrix case
                        ((and is-a-matrix? is-b-matrix?)
                         ;; dL/dB = A^T @ dL/dC
                         ;; (k×m) @ (m×n) = (k×n)
-                        (case dtype
-                          ((f32) (sgemm! RowMajor Trans NoTrans
-                                        k n m
-                                        1.0 data-a        ; A: m*k (transposed)
-                                        grad-out          ; dL/dC: m*n
-                                        0.0 grad-b
-                                        lda: k
-                                        ldb: n
-                                        ldc: n))      ; dL/dB: k×n
-                          ((f64) (dgemm! RowMajor Trans NoTrans
-                                        k n m
-                                        1.0 data-a
-                                        grad-out
-                                        0.0 grad-b
-                                        lda: k
-                                        ldb: n
-                                        ldc: n))))
+                        (with-dtype dtype
+                          (gemm! RowMajor Trans NoTrans
+                                 k n m
+                                 1.0 data-a        ; A: m*k (transposed)
+                                 grad-out          ; dL/dC: m*n
+                                 0.0 grad-b
+                                 lda: k
+                                 ldb: n
+                                 ldc: n))      ; dL/dB: k×n
+                        )
                        
                        ;; Matrix @ Vector case
                        ((and is-a-matrix? is-b-vector?)
                         ;; dL/dB = A^T @ dL/dC
                         ;; (k×m) @ (m×1) = (k×1)
-                        (case dtype
-                          ((f32) (sgemv! RowMajor Trans m k
-                                        1.0 data-a grad-out
-                                        0.0 grad-b))
-                          ((f64) (dgemv! RowMajor Trans m k
-                                        1.0 data-a grad-out
-                                        0.0 grad-b))))
+                        (with-dtype dtype
+                          (gemv! RowMajor Trans m k
+                                 1.0 data-a grad-out
+                                 0.0 grad-b))
+                        )
                        
                        ;; Vector @ Matrix case
                        ((and (not is-a-matrix?) is-b-matrix?)
                         ;; dL/dB = A ⊗ dL/dC (outer product)
                         ;; Result is k×n matrix
-                        (case dtype
-                          ((f32)
-                           (do ((i 0 (+ i 1)))
-                               ((= i k))
-                             (let ((a-val (f32vector-ref data-a i)))
-                               (do ((j 0 (+ j 1)))
-                                   ((= j n))
-                                 (f32vector-set! grad-b (+ (* i n) j)
-                                                (* a-val (f32vector-ref grad-out j)))))))
-                          ((f64)
-                           (do ((i 0 (+ i 1)))
-                               ((= i k))
-                             (let ((a-val (f64vector-ref data-a i)))
-                               (do ((j 0 (+ j 1)))
-                                   ((= j n))
-                                 (f64vector-set! grad-b (+ (* i n) j)
-                                                (* a-val (f64vector-ref grad-out j)))))))))
+                        (with-dtype dtype
+                                    (do ((i 0 (+ i 1)))
+                                        ((= i k))
+                                      (let ((a-val (elt-ref data-a i)))
+                                        (do ((j 0 (+ j 1)))
+                                            ((= j n))
+                                          (elt-set! grad-b (+ (* i n) j)
+                                                    (* a-val (elt-ref grad-out j)))))))
+                        )
                        
                        ;; Vector @ Vector (dot product)
                        (else
                         ;; dL/dB = dL/dC * A
-                        (let ((scale (case dtype
-                                      ((f32) (f32vector-ref grad-out 0))
-                                      ((f64) (f64vector-ref grad-out 0)))))
-                          (case dtype
-                            ((f32) (do ((i 0 (+ i 1)))
-                                       ((= i k))
-                                     (f32vector-set! grad-b i
-                                                    (* scale (f32vector-ref data-a i)))))
-                            ((f64) (do ((i 0 (+ i 1)))
-                                       ((= i k))
-                                     (f64vector-set! grad-b i
-                                                    (* scale (f64vector-ref data-a i)))))))))
-                      
+                        (let ((scale (with-dtype dtype
+                                                 (elt-ref grad-out 0))))
+                          (with-dtype dtype
+                            (do ((i 0 (+ i 1)))
+                                ((= i k))
+                              (elt-set! grad-b i
+                                        (* scale (elt-ref data-a i)))))
+                          ))
+                       )
                       (add-to-grad! b grad-b)))))
               (list a b)))
           result)))))
@@ -881,48 +738,35 @@
     (let* ((dtype (tensor-dtype tensor))
            (data (tensor-data tensor))
            (n (vector-length-for-dtype data dtype))
-           (result-data (case dtype
-                          ((f32) (make-f32vector n 0.0))
-                          ((f64) (make-f64vector n 0.0))))
+           (result-data (with-dtype dtype (vec n 0.0)))
            (requires-grad? (tensor-requires-grad? tensor)))
       
       ;; Forward: copy and scale
-      (case dtype
-        ((f32)
-         (do ((i 0 (+ i 1)))
-             ((= i n))
-           (f32vector-set! result-data i (f32vector-ref data i)))
-         (sscal! n scalar result-data))
-        ((f64)
-         (do ((i 0 (+ i 1)))
-             ((= i n))
-           (f64vector-set! result-data i (f64vector-ref data i)))
-         (dscal! n scalar result-data)))
+      (with-dtype dtype
+                  (do ((i 0 (+ i 1)))
+                      ((= i n))
+                    (elt-set! result-data i (elt-ref data i)))
+                  (scal! n scalar result-data))
       
       (let ((result (make-base-tensor result-data (tensor-shape tensor) dtype requires-grad?)))
         (when requires-grad?
           (set-backward-fn! result
             (lambda ()
               (let ((grad-out (tensor-grad result))
-                    (grad-scaled (case dtype
-                                  ((f32) (make-f32vector n 0.0))
-                                  ((f64) (make-f64vector n 0.0)))))
-                (case dtype
-                  ((f32)
-                   (saxpy! n scalar grad-out grad-scaled))
-                  ((f64)
-                   (daxpy! n scalar grad-out grad-scaled)))
+                    (grad-scaled (with-dtype dtype (vec n 0.0))))
+
+                (with-dtype dtype
+                            (axpy! n scalar grad-out grad-scaled))
                 (add-to-grad! tensor grad-scaled)))
             (list tensor)))
         result)))
 
   (define (dot-op a b)
-    "Dot product (inner product): scalar = a · b
-   Uses BLAS sdot/ddot for efficient computation.
-   Gradients:
+    "Dot product (inner product): scalar = a . b
+     Uses BLAS sdot/ddot for efficient computation.
+     Gradients:
      dL/da = dL/dscalar * b
      dL/db = dL/dscalar * a"
-   
   
     (assert (eq? (tensor-dtype a) (tensor-dtype b)))
   
@@ -932,10 +776,10 @@
          (data-a (tensor-data a))
          (data-b (tensor-data b))
          (requires-grad? (or (tensor-requires-grad? a)
-                            (tensor-requires-grad? b))))
+                             (tensor-requires-grad? b))))
     
     (unless (and (= (length shape-a) 1)
-                (= (length shape-b) 1))
+                 (= (length shape-b) 1))
       (error 'dot-op "Both tensors must be 1D vectors"))
     
     (let ((n-a (car shape-a))
@@ -945,50 +789,35 @@
                (format #f "Vector length mismatch: ~A vs ~A" n-a n-b)))
       
       (let* ((n n-a)
-             (dot-result (case dtype
-                          ((f32) (sdot n data-a data-b))
-                          ((f64) (ddot n data-a data-b))))
-             (result-data (case dtype
-                           ((f32) (f32vector dot-result))
-                           ((f64) (f64vector dot-result)))))
+             (dot-result (with-dtype dtype (dot n data-a data-b)))
+             (result-data (with-dtype dtype (vec0 dot-result))))
         
         (let ((result (make-base-tensor result-data '(1) dtype requires-grad?)))
           (when requires-grad?
             (set-backward-fn! result
               (lambda ()
                 (let* ((grad-out (tensor-grad result))
-                       (grad-scalar (case dtype
-                                      ((f32) (f32vector-ref grad-out 0))
-                                      ((f64) (f64vector-ref grad-out 0)))))
+                       (grad-scalar (with-dtype dtype
+                                      (elt-ref grad-out 0))))
                   
                   ;; Gradient w.r.t. a: use BLAS for efficiency
                   (when (tensor-requires-grad? a)
-                    (let ((grad-a (case dtype
-                                   ((f32) (make-f32vector n 0.0))
-                                   ((f64) (make-f64vector n 0.0)))))
+                    (let ((grad-a (with-dtype dtype (vec n 0.0))))
                       ;; Copy b to grad-a, then scale by grad-scalar
-                      (case dtype
-                        ((f32)
-                         (sblit grad-a data-b)
-                         (sscal! n grad-scalar grad-a))
-                        ((f64)
-                         (dblit grad-a data-b)
-                         (dscal! n grad-scalar grad-a)))
+                      (with-dtype
+                       dtype
+                       (blit grad-a data-b)
+                       (scal! n grad-scalar grad-a))
                       (add-to-grad! a grad-a)))
                   
                   ;; Gradient w.r.t. b: use BLAS for efficiency
                   (when (tensor-requires-grad? b)
-                    (let ((grad-b (case dtype
-                                   ((f32) (make-f32vector n))
-                                   ((f64) (make-f64vector n)))))
+                    (let ((grad-b (with-dtype dtype (vec n))))
                       ;; Copy a to grad-b, then scale by grad-scalar
-                      (case dtype
-                        ((f32)
-                         (sblit grad-b data-a)
-                         (sscal! n grad-scalar grad-b))
-                        ((f64)
-                         (dblit grad-b data-a)
-                         (dscal! n grad-scalar grad-b)))
+                      (with-dtype
+                       dtype
+                       (blit grad-b data-a)
+                       (scal! n grad-scalar grad-b))
                       (add-to-grad! b grad-b)))))
               (list a b)))
           result)))))
@@ -1018,9 +847,7 @@
            (col-height (* C kernel-h kernel-w))
            (col-width (* OH OW))
            
-           (col-data (case dtype
-                       ((f32) (make-f32vector (* col-height col-width) 0.0))
-                       ((f64) (make-f64vector (* col-height col-width) 0.0))))
+           (col-data (with-dtype dtype (vec (* col-height col-width) 0.0)))
            )
     
       ;; Fill column matrix
@@ -1053,11 +880,10 @@
                         (let ((input-idx (+ (* c H W)
                                             (* ih W)
                                             iw)))
-                          (case dtype
-                            ((f32) (f32vector-set! col-data col-idx
-                                                   (f32vector-ref data input-idx)))
-                            ((f64) (f64vector-set! col-data col-idx
-                                                   (f64vector-ref data input-idx)))))
+                          (with-dtype dtype
+                            (elt-set! col-data col-idx
+                                      (elt-ref data input-idx)))
+                          )
                         ;; Padding: value is already 0
                         #f))))))))
       
@@ -1082,10 +908,8 @@
            (OW (+ 1 (quotient (+ W (* 2 pad-w) (- kernel-w)) stride-w)))
            (col-width (* OH OW))
            
-           (img-data (case dtype
-                       ((f32) (make-f32vector (* C H W) 0.0))
-                       ((f64) (make-f64vector (* C H W) 0.0)))))
-      
+           (img-data (with-dtype dtype (vec (* C H W) 0.0))))
+            
       ;; Accumulate values from column matrix
       (do ((c 0 (+ c 1)))
           ((= c C))
@@ -1114,13 +938,12 @@
                       (let ((img-idx (+ (* c H W)
                                         (* ih W)
                                         iw)))
-                        (case dtype
-                          ((f32) (f32vector-set! img-data img-idx
-                                                 (+ (f32vector-ref img-data img-idx)
-                                                    (f32vector-ref col-data col-idx))))
-                          ((f64) (f64vector-set! img-data img-idx
-                                                 (+ (f64vector-ref img-data img-idx)
-                                                    (f64vector-ref col-data col-idx))))))))))))))
+                        (with-dtype dtype
+                          (elt-set! img-data img-idx
+                                    (+ (elt-ref img-data img-idx)
+                                       (elt-ref col-data col-idx))))
+                        
+                        )))))))))
     
       (make-base-tensor img-data 
                         (list C H W)
@@ -1130,25 +953,16 @@
     )
 
 
-  (define (compensated-sum-f32vector vec start end)
-    "Compute sum of f32vector elements from start to end using compensated summation."
-    (let loop ((i start) (sum 0.0) (c 0.0))
-      (if (= i end)
-          sum
-          (let* ((y (- (f32vector-ref vec i) c))   ; Subtract compensation
-                 (t (+ sum y))                      ; New sum
-                 (new-c (- (- t sum) y)))           ; Update compensation
-            (loop (+ i 1) t new-c)))))
-
-  (define (compensated-sum-f64vector vec start end)
-    "Compute sum of f64vector elements from start to end using compensated summation."
-    (let loop ((i start) (sum 0.0) (c 0.0))
-      (if (= i end)
-          sum
-          (let* ((y (- (f64vector-ref vec i) c))
-                 (t (+ sum y))
-                 (new-c (- (- t sum) y)))
-            (loop (+ i 1) t new-c)))))
+  (define (compensated-sum dtype vec start end)
+    "Compute sum of vector elements from start to end using compensated summation."
+    (with-dtype dtype
+                (let loop ((i start) (sum 0.0) (c 0.0))
+                  (if (= i end)
+                      sum
+                      (let* ((y (- (elt-ref vec i) c))   ; Subtract compensation
+                             (t (+ sum y))                      ; New sum
+                             (new-c (- (- t sum) y)))           ; Update compensation
+                        (loop (+ i 1) t new-c))))))
   
   (define (conv2d input weight bias 
                   #!key 
@@ -1186,8 +1000,8 @@
          (OW (+ 1 (quotient (+ W (* 2 pad-w) (- KW)) stride-w)))
 
          (requires-grad? (or (tensor-requires-grad? input)
-                            (tensor-requires-grad? weight)
-                            (and bias (tensor-requires-grad? bias)))))
+                             (tensor-requires-grad? weight)
+                             (and bias (tensor-requires-grad? bias)))))
     
     (unless (= Cin Cin-w)
       (error 'conv2d "Input channels mismatch"))
@@ -1203,49 +1017,38 @@
            (weight-cols (* Cin KH KW))
            
            ;; 3. Matrix multiply: output = weight @ col
-           (output-data (case dtype
-                         ((f32) (make-f32vector (* Cout OH OW) 0.0))
-                         ((f64) (make-f64vector (* Cout OH OW) 0.0)))))
+           (output-data (with-dtype dtype (vec (* Cout OH OW) 0.0)))
+           )
 
-      (case dtype
-        ((f32) (sgemm! RowMajor NoTrans NoTrans
-                      weight-rows (* OH OW) weight-cols
-                      1.0 weight-data col-data 
-                      0.0 output-data lda: weight-cols
-                      ldb: (* OH OW)
-                      ldc: (* OH OW)))
-        ((f64) (dgemm! RowMajor NoTrans NoTrans
-                      weight-rows (* OH OW) weight-cols
-                      1.0 weight-data
-                      col-data 
-                      0.0 output-data
-                      lda: weight-cols
-                      ldb: (* OH OW)
-                      ldc: (* OH OW))))
-
+      (with-dtype dtype
+        (gemm! RowMajor NoTrans NoTrans
+               weight-rows (* OH OW) weight-cols
+               1.0 weight-data col-data 
+               0.0 output-data lda: weight-cols
+               ldb: (* OH OW)
+               ldc: (* OH OW)))
       
       ;; 4. Add bias if provided
       (when bias
         (let ((bias-data (tensor-data bias)))
-          (do ((cout 0 (+ cout 1)))
-              ((= cout Cout))
-            (let ((b (case dtype
-                      ((f32) (f32vector-ref bias-data cout))
-                      ((f64) (f64vector-ref bias-data cout)))))
-              (do ((i 0 (+ i 1)))
-                  ((= i (* OH OW)))
-                (let ((idx (+ (* cout OH OW) i)))
-                  (case dtype
-                    ((f32) (f32vector-set! output-data idx
-                                          (+ (f32vector-ref output-data idx) b)))
-                    ((f64) (f64vector-set! output-data idx
-                                          (+ (f64vector-ref output-data idx) b))))))))))
-      
+          (with-dtype dtype
+                      (do ((cout 0 (+ cout 1)))
+                          ((= cout Cout))
+                        (let ((b (elt-ref bias-data cout)))
+                          (do ((i 0 (+ i 1)))
+                              ((= i (* OH OW)))
+                            (let ((idx (+ (* cout OH OW) i)))
+                              (elt-set! output-data idx
+                                        (+ (elt-ref output-data idx) b))
+                              )))
+                        ))
+          ))
+          
       ;; Create result tensor
       (let ((result (make-base-tensor output-data 
-                                     (list Cout OH OW)
-                                     dtype
-                                     requires-grad?)))
+                                      (list Cout OH OW)
+                                      dtype
+                                      requires-grad?)))
 
         (when requires-grad?
           (set-backward-fn! result
@@ -1256,29 +1059,20 @@
                 (when (tensor-requires-grad? input)
                   ;; dL/dInput = weight^T @ dL/dOutput (in column form)
                   ;; Then apply col2im
-                  (let ((grad-col-data (case dtype
-                                        ((f32) (make-f32vector (* weight-cols OH OW) 0.0))
-                                        ((f64) (make-f64vector (* weight-cols OH OW) 0.0)))))
+                  (let ((grad-col-data (with-dtype dtype (vec (* weight-cols OH OW) 0.0))))
                     
-                    (case dtype
-                      ((f32) (sgemm! RowMajor Trans NoTrans
-                                    weight-cols (* OH OW) weight-rows
-                                    1.0 weight-data grad-out 
-                                    0.0 grad-col-data
-                                    lda: weight-cols
-                                    ldb: (* OH OW)
-                                    ldc: (* OH OW)))
-                      ((f64) (dgemm! RowMajor Trans NoTrans
-                                    weight-cols (* OH OW) weight-rows
-                                    1.0 weight-data grad-out 
-                                    0.0 grad-col-data
-                                    lda: weight-cols
-                                    ldb: (* OH OW)
-                                    ldc: (* OH OW))))
+                    (with-dtype dtype
+                      (gemm! RowMajor Trans NoTrans
+                             weight-cols (* OH OW) weight-rows
+                             1.0 weight-data grad-out 
+                             0.0 grad-col-data
+                             lda: weight-cols
+                             ldb: (* OH OW)
+                             ldc: (* OH OW)))
                     
                     (let* ((grad-col (make-base-tensor grad-col-data
-                                                      (list weight-cols (* OH OW))
-                                                      dtype #f))
+                                                       (list weight-cols (* OH OW))
+                                                       dtype #f))
                            (grad-input (col2im grad-col Cin H W 
                                                KH KW stride-h stride-w pad-h pad-w)))
                       (add-to-grad! input (tensor-data grad-input)))))
@@ -1287,53 +1081,34 @@
                 (when (tensor-requires-grad? weight)
                   ;; dL/dWeight = dL/dOutput @ col^T
                   ;; Reshape to (Cout, Cin*KH*KW)
-                  (let ((grad-weight-data (case dtype
-                                           ((f32) (make-f32vector (* Cout weight-cols) 0.0))
-                                           ((f64) (make-f64vector (* Cout weight-cols) 0.0)))))
-                    
-                    (case dtype
-                      ((f32) (sgemm! RowMajor NoTrans Trans
-                                    weight-rows weight-cols (* OH OW)
-                                    1.0 grad-out 
-                                    col-data 
-                                    0.0 grad-weight-data
-                                    lda: (* OH OW)
-                                    ldb: (* OH OW)
-                                    ldc: weight-cols))
-                      ((f64) (dgemm! RowMajor NoTrans Trans
-                                    weight-rows weight-cols (* OH OW)
-                                    1.0 grad-out 
-                                    col-data 
-                                    0.0 grad-weight-data
-                                    lda: (* OH OW)
-                                    ldb: (* OH OW)
-                                    ldc: weight-cols)))
+                  (let ((grad-weight-data (with-dtype dtype (vec (* Cout weight-cols) 0.0))))
+                    (with-dtype dtype
+                      (gemm! RowMajor NoTrans Trans
+                             weight-rows weight-cols (* OH OW)
+                             1.0 grad-out 
+                             col-data 
+                             0.0 grad-weight-data
+                             lda: (* OH OW)
+                             ldb: (* OH OW)
+                             ldc: weight-cols))
                     
                     (add-to-grad! weight grad-weight-data)))
                 
                 ;; Gradient w.r.t. bias
                 (when (and bias (tensor-requires-grad? bias))
                   ;; dL/dBias = sum of dL/dOutput over spatial dimensions
-                  (let ((grad-bias-data (case dtype
-                                         ((f32) (make-f32vector Cout 0.0))
-                                         ((f64) (make-f64vector Cout 0.0))))
-                        (vref (case dtype
-                                ((f32) f32vector-ref)
-                                ((f64) f64vector-ref))))
-                    
-                    (do ((cout 0 (+ cout 1)))
-                        ((= cout Cout))
-                      ;; Use compensated summation for better numerical accuracy
-                      (let ((start-idx (* cout OH OW))
-                            (end-idx (* (+ cout 1) OH OW)))
-        
-                        (case dtype
-                          ((f32)
-                           (let ((sum (compensated-sum-f32vector grad-out start-idx end-idx)))
-                             (f32vector-set! grad-bias-data cout sum)))
-                          ((f64)
-                           (let ((sum (compensated-sum-f64vector grad-out start-idx end-idx)))
-                             (f64vector-set! grad-bias-data cout sum))))))
+                  (let ((grad-bias-data (with-dtype dtype (vec Cout 0.0))))
+                    (with-dtype
+                     dtype
+                     (do ((cout 0 (+ cout 1)))
+                         ((= cout Cout))
+                       ;; Use compensated summation for better numerical accuracy
+                       (let ((start-idx (* cout OH OW))
+                             (end-idx (* (+ cout 1) OH OW)))
+                         
+                         (let ((sum (compensated-sum dtype grad-out start-idx end-idx)))
+                           (elt-set! grad-bias-data cout sum))))
+                     )
                     
                     (add-to-grad! bias grad-bias-data)))))
             
@@ -1352,48 +1127,32 @@
     (let* ((dtype (tensor-dtype tensor))
            (data (tensor-data tensor))
            (n (vector-length-for-dtype data dtype))
-           (result-data (case dtype
-                          ((f32) (make-f32vector n 0.0))
-                          ((f64) (make-f64vector n 0.0))))
+           (result-data (with-dtype dtype (vec n 0.0)))
            (requires-grad? (tensor-requires-grad? tensor)))
       
       ;; Forward: max(0, x)
-      (case dtype
-        ((f32)
+      (with-dtype dtype
          (do ((i 0 (+ i 1)))
              ((= i n))
-           (f32vector-set! result-data i
-                          (max 0.0 (f32vector-ref data i)))))
-        ((f64)
-         (do ((i 0 (+ i 1)))
-             ((= i n))
-           (f64vector-set! result-data i
-                          (max 0.0 (f64vector-ref data i))))))
+           (elt-set! result-data i
+                     (max 0.0 (elt-ref data i)))))
       
       (let ((result (make-base-tensor result-data (tensor-shape tensor) dtype requires-grad?)))
         (when requires-grad?
           (set-backward-fn! result
             (lambda ()
               (let ((grad-out (tensor-grad result))
-                    (grad-in (case dtype
-                              ((f32) (make-f32vector n 0.0))
-                              ((f64) (make-f64vector n 0.0)))))
+                    (grad-in (with-dtype dtype (vec n 0.0))))
+
                 ;; Gradient is 1 where x > 0, else 0
-                (case dtype
-                  ((f32)
+                (with-dtype dtype
                    (do ((i 0 (+ i 1)))
                        ((= i n))
-                     (f32vector-set! grad-in i
-                                    (if (> (f32vector-ref data i) 0.0)
-                                        (f32vector-ref grad-out i)
+                     (elt-set! grad-in i
+                                    (if (> (elt-ref data i) 0.0)
+                                        (elt-ref grad-out i)
                                         0.0))))
-                  ((f64)
-                   (do ((i 0 (+ i 1)))
-                       ((= i n))
-                     (f64vector-set! grad-in i
-                                    (if (> (f64vector-ref data i) 0.0)
-                                        (f64vector-ref grad-out i)
-                                        0.0)))))
+
                 (add-to-grad! tensor grad-in)))
              (list tensor)))
         result)))
@@ -1405,49 +1164,31 @@
   (let* ((dtype (tensor-dtype tensor))
          (data (tensor-data tensor))
          (n (vector-length-for-dtype data dtype))
-         (result-data (case dtype
-                        ((f32) (make-f32vector n 0.0))
-                        ((f64) (make-f64vector n 0.0))))
+         (result-data (with-dtype dtype (vec n 0.0)))
          (requires-grad? (tensor-requires-grad? tensor)))
     
     ;; Forward: apply tanh element-wise
-    (case dtype
-      ((f32)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (f32vector-set! result-data i
-                        (fptanh (f32vector-ref data i)))))
-      ((f64)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (f64vector-set! result-data i
-                        (fptanh (f64vector-ref data i))))))
+    (with-dtype dtype
+                (do ((i 0 (+ i 1)))
+                    ((= i n))
+                  (elt-set! result-data i
+                            (fptanh (elt-ref data i)))))
     
     (let ((result (make-base-tensor result-data (tensor-shape tensor) dtype requires-grad?)))
       (when requires-grad?
         (set-backward-fn! result
           (lambda ()
-            ;; Gradient: (1 - tanh²(x)) * grad_out
+            ;; Gradient: (1 - tanh^2(x)) * grad_out
             (let ((grad-out (tensor-grad result))
-                  (grad-in (case dtype
-                            ((f32) (make-f32vector n 0.0))
-                            ((f64) (make-f64vector n 0.0)))))
+                  (grad-in (with-dtype dtype (vec n 0.0))))
               
-              (case dtype
-                ((f32)
+              (with-dtype dtype
                  (do ((i 0 (+ i 1)))
                      ((= i n))
-                   (let ((tanh-val (f32vector-ref result-data i)))
-                     (f32vector-set! grad-in i
-                                    (* (f32vector-ref grad-out i)
+                   (let ((tanh-val (elt-ref result-data i)))
+                     (elt-set! grad-in i
+                                    (* (elt-ref grad-out i)
                                        (- 1.0 (* tanh-val tanh-val)))))))
-                ((f64)
-                 (do ((i 0 (+ i 1)))
-                     ((= i n))
-                   (let ((tanh-val (f64vector-ref result-data i)))
-                     (f64vector-set! grad-in i
-                                    (* (f64vector-ref grad-out i)
-                                       (- 1.0 (* tanh-val tanh-val))))))))
               
               (add-to-grad! tensor grad-in)))
           (list tensor)))
@@ -1464,53 +1205,33 @@
   (let* ((dtype (tensor-dtype tensor))
          (data (tensor-data tensor))
          (n (vector-length-for-dtype data dtype))
-         (result-data (case dtype
-                        ((f32) (make-f32vector n 0.0))
-                        ((f64) (make-f64vector n 0.0))))
+         (result-data (with-dtype dtype (vec n 0.0)))
          (requires-grad? (tensor-requires-grad? tensor)))
     
     ;; Forward: apply sigmoid element-wise
-    (case dtype
-      ((f32)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((x (f32vector-ref data i)))
-           (f32vector-set! result-data i
-                          (/ 1.0 (+ 1.0 (exp (- x))))))))
-      ((f64)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((x (f64vector-ref data i)))
-           (f64vector-set! result-data i
-                          (/ 1.0 (+ 1.0 (exp (- x)))))))))
+    (with-dtype dtype
+                (do ((i 0 (+ i 1)))
+                    ((= i n))
+                  (let ((x (elt-ref data i)))
+                    (elt-set! result-data i
+                                    (/ 1.0 (+ 1.0 (exp (- x))))))))
     
     (let ((result (make-base-tensor result-data (tensor-shape tensor) dtype requires-grad?)))
       (when requires-grad?
         (set-backward-fn! result
           (lambda ()
-            ;; Gradient: σ(x) * (1 - σ(x)) * grad_out
+            ;; Gradient: sigm(x) * (1 - sigm(x)) * grad_out
             (let ((grad-out (tensor-grad result))
-                  (grad-in (case dtype
-                            ((f32) (make-f32vector n 0.0))
-                            ((f64) (make-f64vector n 0.0)))))
+                  (grad-in (with-dtype dtype (vec n 0.0))))
               
-              (case dtype
-                ((f32)
+              (with-dtype dtype
                  (do ((i 0 (+ i 1)))
                      ((= i n))
-                   (let ((sig-val (f32vector-ref result-data i)))
-                     (f32vector-set! grad-in i
-                                    (* (f32vector-ref grad-out i)
-                                       sig-val
-                                       (- 1.0 sig-val))))))
-                ((f64)
-                 (do ((i 0 (+ i 1)))
-                     ((= i n))
-                   (let ((sig-val (f64vector-ref result-data i)))
-                     (f64vector-set! grad-in i
-                                    (* (f64vector-ref grad-out i)
-                                       sig-val
-                                       (- 1.0 sig-val)))))))
+                   (let ((sig-val (elt-ref result-data i)))
+                     (elt-set! grad-in i
+                               (* (elt-ref grad-out i)
+                                  sig-val
+                                  (- 1.0 sig-val))))))
               
               (add-to-grad! tensor grad-in)))
           (list tensor)))
@@ -1527,60 +1248,38 @@
   (let* ((dtype (tensor-dtype tensor))
          (data (tensor-data tensor))
          (n (vector-length-for-dtype data dtype))
-         (result-data (case dtype
-                        ((f32) (make-f32vector n 0.0))
-                        ((f64) (make-f64vector n 0.0))))
+         (result-data (with-dtype dtype (vec n 0.0)))         
          (requires-grad? (tensor-requires-grad? tensor)))
     
     ;; Forward: numerically stable sigmoid
-    (case dtype
-      ((f32)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((x (f32vector-ref data i)))
-           (f32vector-set! result-data i
-                          (if (>= x 0.0)
-                              ;; For x >= 0: sigm(x) = 1 / (1 + e^-x)
-                              (/ 1.0 (+ 1.0 (exp (- x))))
-                              ;; For x < 0: sigm(x) = e^x / (1 + e^x)
-                              (let ((exp-x (exp x)))
-                                (/ exp-x (+ 1.0 exp-x))))))))
-      ((f64)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((x (f64vector-ref data i)))
-           (f64vector-set! result-data i
-                          (if (>= x 0.0)
-                              (/ 1.0 (+ 1.0 (exp (- x))))
-                              (let ((exp-x (exp x)))
-                                (/ exp-x (+ 1.0 exp-x)))))))))
+    (with-dtype
+     dtype
+     (do ((i 0 (+ i 1)))
+         ((= i n))
+       (let ((x (elt-ref data i)))
+         (elt-set! result-data i
+                   (if (>= x 0.0)
+                       ;; For x >= 0: sigm(x) = 1 / (1 + e^-x)
+                       (/ 1.0 (+ 1.0 (exp (- x))))
+                       ;; For x < 0: sigm(x) = e^x / (1 + e^x)
+                       (let ((exp-x (exp x)))
+                         (/ exp-x (+ 1.0 exp-x))))))))
     
     (let ((result (make-base-tensor result-data (tensor-shape tensor) dtype requires-grad?)))
       (when requires-grad?
         (set-backward-fn! result
           (lambda ()
             (let ((grad-out (tensor-grad result))
-                  (grad-in (case dtype
-                            ((f32) (make-f32vector n 0.0))
-                            ((f64) (make-f64vector n 0.0)))))
+                  (grad-in (with-dtype dtype (vec n 0.0))))
               
-              (case dtype
-                ((f32)
+              (with-dtype dtype
                  (do ((i 0 (+ i 1)))
                      ((= i n))
-                   (let ((sig-val (f32vector-ref result-data i)))
-                     (f32vector-set! grad-in i
-                                    (* (f32vector-ref grad-out i)
+                   (let ((sig-val (elt-ref result-data i)))
+                     (elt-set! grad-in i
+                                    (* (elt-ref grad-out i)
                                        sig-val
                                        (- 1.0 sig-val))))))
-                ((f64)
-                 (do ((i 0 (+ i 1)))
-                     ((= i n))
-                   (let ((sig-val (f64vector-ref result-data i)))
-                     (f64vector-set! grad-in i
-                                    (* (f64vector-ref grad-out i)
-                                       sig-val
-                                       (- 1.0 sig-val)))))))
               
               (add-to-grad! tensor grad-in)))
           (list tensor)))
@@ -1595,50 +1294,31 @@
   (let* ((dtype (tensor-dtype tensor))
          (data (tensor-data tensor))
          (n (vector-length-for-dtype data dtype))
-         (result-data (case dtype
-                        ((f32) (make-f32vector n 0.0))
-                        ((f64) (make-f64vector n 0.0))))
+         (result-data (with-dtype dtype (vec n 0.0)))         
          (requires-grad? (tensor-requires-grad? tensor)))
     
-    (case dtype
-      ((f32)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((x (* beta (f32vector-ref data i))))
-           (f32vector-set! result-data i
-                          (/ (log (+ 1.0 (exp x))) beta)))))
-      ((f64)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((x (* beta (f64vector-ref data i))))
-           (f64vector-set! result-data i
-                          (/ (log (+ 1.0 (exp x))) beta))))))
+    (with-dtype dtype
+                (do ((i 0 (+ i 1)))
+                    ((= i n))
+                  (let ((x (* beta (elt-ref data i))))
+                    (elt-set! result-data i
+                              (/ (log (+ 1.0 (exp x))) beta)))))
     
     (let ((result (make-base-tensor result-data (tensor-shape tensor) dtype requires-grad?)))
       (when requires-grad?
         (set-backward-fn! result
           (lambda ()
             (let ((grad-out (tensor-grad result))
-                  (grad-in (case dtype
-                            ((f32) (make-f32vector n 0.0))
-                            ((f64) (make-f64vector n 0.0)))))
+                  (grad-in (with-dtype dtype (vec n 0.0))))
               
               ;; Gradient is sigmoid(beta*x)
-              (case dtype
-                ((f32)
-                 (do ((i 0 (+ i 1)))
-                     ((= i n))
-                   (let* ((x (* beta (f32vector-ref data i)))
-                          (sig (/ 1.0 (+ 1.0 (exp (- x))))))
-                     (f32vector-set! grad-in i
-                                    (* (f32vector-ref grad-out i) sig)))))
-                ((f64)
-                 (do ((i 0 (+ i 1)))
-                     ((= i n))
-                   (let* ((x (* beta (f64vector-ref data i)))
-                          (sig (/ 1.0 (+ 1.0 (exp (- x))))))
-                     (f64vector-set! grad-in i
-                                    (* (f64vector-ref grad-out i) sig))))))
+              (with-dtype dtype
+                          (do ((i 0 (+ i 1)))
+                              ((= i n))
+                            (let* ((x (* beta (elt-ref data i)))
+                                   (sig (/ 1.0 (+ 1.0 (exp (- x))))))
+                              (elt-set! grad-in i
+                                        (* (elt-ref grad-out i) sig)))))
               
               (add-to-grad! tensor grad-in)))
           (list tensor)))
@@ -1652,49 +1332,124 @@
   (let* ((dtype (tensor-dtype tensor))
          (data (tensor-data tensor))
          (n (vector-length-for-dtype data dtype))
-         (result-data (case dtype
-                        ((f32) (make-f32vector n 0.0))
-                        ((f64) (make-f64vector n 0.0))))
+         (result-data (with-dtype dtype (vec n 0.0)))
          (requires-grad? (tensor-requires-grad? tensor)))
     
-    (case dtype
-      ((f32)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((x (f32vector-ref data i)))
-           (f32vector-set! result-data i
-                          (if (> x 0.0) x (* alpha x))))))
-      ((f64)
-       (do ((i 0 (+ i 1)))
-           ((= i n))
-         (let ((x (f64vector-ref data i)))
-           (f64vector-set! result-data i
-                          (if (> x 0.0) x (* alpha x)))))))
+    (with-dtype dtype
+                (do ((i 0 (+ i 1)))
+                    ((= i n))
+                  (let ((x (elt-ref data i)))
+                    (elt-set! result-data i
+                              (if (> x 0.0) x (* alpha x))))))
     
     (let ((result (make-base-tensor result-data (tensor-shape tensor) dtype requires-grad?)))
       (when requires-grad?
         (set-backward-fn! result
           (lambda ()
             (let ((grad-out (tensor-grad result))
-                  (grad-in (case dtype
-                            ((f32) (make-f32vector n 0.0))
-                            ((f64) (make-f64vector n 0.0)))))
+                  (grad-in (with-dtype dtype (vec n 0.0))))
               
-              (case dtype
-                ((f32)
+              (with-dtype dtype
+                          (do ((i 0 (+ i 1)))
+                              ((= i n))
+                            (elt-set! grad-in i
+                                            (if (> (elt-ref data i) 0.0)
+                                                (elt-ref grad-out i)
+                                                (* alpha (elt-ref grad-out i))))))
+              (add-to-grad! tensor grad-in)))
+          (list tensor)))
+      result)))
+
+
+  ;; GeLU (Gaussian Error Linear Unit): x * \Phi(x)
+  ;; Using tanh approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x³)))
+  (define (gelu tensor)
+    "GeLU activation: x * \\Phi(x) where Phi is the standard normal CDF.
+     Uses tanh approximation for efficiency.
+     Gradient: \\Phi(x) + x * \\phi(x) where \\phi is the standard normal PDF"
+  
+  (let* ((dtype (tensor-dtype tensor))
+         (data (tensor-data tensor))
+         (n (vector-length-for-dtype data dtype))
+         (result-data (with-dtype dtype (vec n 0.0)))
+         (requires-grad? (tensor-requires-grad? tensor))
+         ;; Constants for GeLU approximation
+         (sqrt-2-over-pi 0.7978845608028654)  ; sqrt(2/pi)
+         (coeff 0.044715))
+    
+    ;; Forward: GeLU approximation
+    (with-dtype dtype
+       (do ((i 0 (+ i 1)))
+           ((= i n))
+         (let* ((x (elt-ref data i))
+                (x3 (* x x x))
+                (inner (* sqrt-2-over-pi (+ x (* coeff x3))))
+                (tanh-val (fptanh inner)))
+           (elt-set! result-data i
+                     (* 0.5 x (+ 1.0 tanh-val))))))
+    
+    (let ((result (make-base-tensor result-data (tensor-shape tensor) dtype requires-grad?)))
+      (when requires-grad?
+        (set-backward-fn! result
+          (lambda ()
+            (let ((grad-out (tensor-grad result))
+                  (grad-in (with-dtype dtype (vec n 0.0))))
+              
+              ;; Gradient computation using the approximation derivative
+              (with-dtype dtype
                  (do ((i 0 (+ i 1)))
                      ((= i n))
-                   (f32vector-set! grad-in i
-                                  (if (> (f32vector-ref data i) 0.0)
-                                      (f32vector-ref grad-out i)
-                                      (* alpha (f32vector-ref grad-out i))))))
-                ((f64)
+                   (let* ((x (elt-ref data i))
+                          (x2 (* x x))
+                          (x3 (* x x2))
+                          (inner (* sqrt-2-over-pi (+ x (* coeff x3))))
+                          (tanh-val (fptanh inner))
+                          (sech2 (- 1.0 (* tanh-val tanh-val)))
+                          (d-inner (* sqrt-2-over-pi (+ 1.0 (* 3.0 coeff x2))))
+                          (grad (* 0.5 (+ (+ 1.0 tanh-val)
+                                         (* x sech2 d-inner)))))
+                     (elt-set! grad-in i
+                               (* (elt-ref grad-out i) grad)))))
+              
+              (add-to-grad! tensor grad-in)))
+          (list tensor)))
+      result)))
+
+  ;; SiLU / Swish: x * sigmoid(x)
+  (define (silu tensor)
+  "SiLU (Sigmoid Linear Unit) activation, also known as Swish: x * sigmoid(x)
+   Gradient: sigmoid(x) * (1 + x * (1 - sigmoid(x)))"
+  
+  (let* ((dtype (tensor-dtype tensor))
+         (data (tensor-data tensor))
+         (n (vector-length-for-dtype data dtype))
+         (result-data (with-dtype dtype (vec n 0.0)))         
+         (requires-grad? (tensor-requires-grad? tensor)))
+    
+    ;; Forward: x * sigmoid(x)
+    (with-dtype dtype
+                (do ((i 0 (+ i 1)))
+                    ((= i n))
+                  (let* ((x (elt-ref data i))
+                         (sig (/ 1.0 (+ 1.0 (exp (- x))))))
+                    (elt-set! result-data i (* x sig)))))
+    
+    (let ((result (make-base-tensor result-data (tensor-shape tensor) dtype requires-grad?)))
+      (when requires-grad?
+        (set-backward-fn! result
+          (lambda ()
+            (let ((grad-out (tensor-grad result))
+                  (grad-in (with-dtype dtype (vec n 0.0))))
+              
+              ;; Gradient: sigmoid(x) * (1 + x - x * sigmoid(x))
+              (with-dtype dtype
                  (do ((i 0 (+ i 1)))
                      ((= i n))
-                   (f64vector-set! grad-in i
-                                  (if (> (f64vector-ref data i) 0.0)
-                                      (f64vector-ref grad-out i)
-                                      (* alpha (f64vector-ref grad-out i)))))))
+                   (let* ((x (elt-ref data i))
+                          (sig (/ 1.0 (+ 1.0 (exp (- x)))))
+                          (grad (* sig (+ 1.0 (* x (- 1.0 sig))))))
+                     (elt-set! grad-in i
+                               (* (elt-ref grad-out i) grad)))))
               
               (add-to-grad! tensor grad-in)))
           (list tensor)))
@@ -1713,44 +1468,29 @@
         (error 'softmax "Currently only supports 1D tensors"))
     
       (let* ((n (car shape-x))
-             (result-data (case dtype
-                            ((f32) (make-f32vector n 0.0))
-                            ((f64) (make-f64vector n 0.0)))))
+             (result-data (with-dtype dtype (vec n 0.0))))
       
         ;; Find max
-        (let ((max-val (case dtype
-                         ((f32) (f32vector-fold max -inf.0 data-x))
-                         ((f64) (f64vector-fold max -inf.0 data-x)))))
+        (let ((max-val (with-dtype dtype (fold max -inf.0 data-x))))
           
           ;; Compute exp(x - max) and sum with compensated summation
-          (let ((exp-sum (case dtype
-                           ((f32)
-                            (let loop ((i 0) (sum 0.0) (c 0.0))
-                              (if (= i n)
-                                  sum
-                                  (let* ((exp-val (exp (- (f32vector-ref data-x i) max-val)))
-                                         ;; Store exp value for later
-                                         (_ (f32vector-set! result-data i exp-val))
-                                         ;; compensated summation
-                                         (y (- exp-val c))
-                                         (t (+ sum y))
-                                         (new-c (- (- t sum) y)))
-                                    (loop (+ i 1) t new-c)))))
-                           ((f64)
-                            (let loop ((i 0) (sum 0.0) (c 0.0))
-                              (if (= i n)
-                                  sum
-                                  (let* ((exp-val (exp (- (f64vector-ref data-x i) max-val)))
-                                         (_ (f64vector-set! result-data i exp-val))
-                                         (y (- exp-val c))
-                                         (t (+ sum y))
-                                         (new-c (- (- t sum) y)))
-                                    (loop (+ i 1) t new-c))))))))
+          (let ((exp-sum
+                 (with-dtype dtype
+                             (let loop ((i 0) (sum 0.0) (c 0.0))
+                               (if (= i n)
+                                   sum
+                                   (let* ((exp-val (exp (- (elt-ref data-x i) max-val)))
+                                          ;; Store exp value for later
+                                          (_ (elt-set! result-data i exp-val))
+                                          ;; compensated summation
+                                          (y (- exp-val c))
+                                          (t (+ sum y))
+                                          (new-c (- (- t sum) y)))
+                                     (loop (+ i 1) t new-c)))))))
+
             
             ;; Normalize using BLAS scal
-            (case dtype
-              ((f32) (sscal! n (/ 1.0 exp-sum) result-data))
-              ((f64) (dscal! n (/ 1.0 exp-sum) result-data)))
+            (with-dtype dtype (scal! n (/ 1.0 exp-sum) result-data))
             
             (let ((result (make-base-tensor result-data shape-x dtype requires-grad?)))
               
@@ -1760,37 +1500,24 @@
                                     (let ((grad-out (tensor-grad result)))
                                       
                                       ;; Use BLAS dot for efficiency
-                                      (let* ((dot-prod (case dtype
-                                                         ((f32) (sdot n grad-out result-data))
-                                                         ((f64) (ddot n grad-out result-data))))
-                                             (grad-x (case dtype
-                                                       ((f32) (make-f32vector n 0.0))
-                                                       ((f64) (make-f64vector n 0.0)))))
+                                      (let* ((dot-prod (with-dtype dtype (dot n grad-out result-data)))
+                                             (grad-x (with-dtype dtype (vec n 0.0))))
                                         
                                         ;; Method using BLAS operations:
                                         ;; 1. grad_x = grad_out (copy)
                                         ;; 2. grad_x -= dot_prod (subtract scalar from all elements)
                                         ;; 3. grad_x *= softmax (element-wise multiply)
                       
-                                        (case dtype
-                                          ((f32)
+                                        (with-dtype dtype
                                            ;; Copy grad_out to grad_x
-                                           (sblit grad-x grad-out)
+                                           (blit grad-x grad-out)
                                            ;; Subtract dot_prod from each element and multiply by softmax
                                            (do ((i 0 (+ i 1)))
                                                ((= i n))
-                                             (f32vector-set! grad-x i
-                                                             (* (f32vector-ref result-data i)
-                                                                (- (f32vector-ref grad-x i)
-                                                                   dot-prod)))))
-                                          ((f64)
-                                           (dblit grad-x grad-out)
-                                           (do ((i 0 (+ i 1)))
-                                               ((= i n))
-                                             (f64vector-set! grad-x i
-                                                             (* (f64vector-ref result-data i)
-                                                                (- (f64vector-ref grad-x i)
-                                                                   dot-prod))))))
+                                             (elt-set! grad-x i
+                                                       (* (elt-ref result-data i)
+                                                          (- (elt-ref grad-x i)
+                                                             dot-prod)))))
                                         
                                         (add-to-grad! x grad-x))))
                                   
@@ -1815,54 +1542,34 @@
         (error 'log-softmax "Currently only supports 1D tensors"))
       
       (let* ((n (car shape-x))
-             (result-data (case dtype
-                            ((f32) (make-f32vector n 0.0))
-                            ((f64) (make-f64vector n 0.0)))))
+             (result-data (with-dtype dtype (vec n 0.0))))
       
         ;; Find max
-        (let ((max-val (case dtype
-                         ((f32) (f32vector-fold max -inf.0 data-x))
-                         ((f64) (f64vector-fold max -inf.0 data-x)))))
+        (let ((max-val (with-dtype dtype (fold max -inf.0 data-x))))
           
           ;; Compute sum of exp(x - max)
-          (let ((exp-sum (case dtype
-                           ((f32)
-                            (let loop ((i 0) (sum 0.0) (c 0.0))
-                              (if (= i n)
-                                  sum
-                                  (let* ((exp-val (exp (- (f32vector-ref data-x i) max-val)))
-                                         ;; Store exp value for later
-                                         (_ (f32vector-set! result-data i exp-val))
-                                         ;; compensated summation
-                                         (y (- exp-val c))
-                                         (t (+ sum y))
-                                         (new-c (- (- t sum) y)))
-                                    (loop (+ i 1) t new-c)))))
-                           ((f64)
-                            (let loop ((i 0) (sum 0.0) (c 0.0))
-                              (if (= i n)
-                                  sum
-                                  (let* ((exp-val (exp (- (f64vector-ref data-x i) max-val)))
-                                         (_ (f64vector-set! result-data i exp-val))
-                                         (y (- exp-val c))
-                                         (t (+ sum y))
-                                         (new-c (- (- t sum) y)))
-                                    (loop (+ i 1) t new-c))))))))
+          (let ((exp-sum
+                 (with-dtype dtype
+                             (let loop ((i 0) (sum 0.0) (c 0.0))
+                               (if (= i n)
+                                   sum
+                                   (let* ((exp-val (exp (- (elt-ref data-x i) max-val)))
+                                          ;; Store exp value for later
+                                          (_ (elt-set! result-data i exp-val))
+                                          ;; compensated summation
+                                          (y (- exp-val c))
+                                          (t (+ sum y))
+                                          (new-c (- (- t sum) y)))
+                                     (loop (+ i 1) t new-c)))))))
             
             (let ((log-sum-exp (log exp-sum)))
               
               ;; Compute: log_softmax[i] = x[i] - max - log_sum_exp
-              (case dtype
-                ((f32)
-                 (do ((i 0 (+ i 1)))
-                     ((= i n))
-                   (f32vector-set! result-data i
-                                   (- (f32vector-ref data-x i) max-val log-sum-exp))))
-                ((f64)
-                 (do ((i 0 (+ i 1)))
-                     ((= i n))
-                   (f64vector-set! result-data i
-                                   (- (f64vector-ref data-x i) max-val log-sum-exp)))))
+              (with-dtype dtype
+                          (do ((i 0 (+ i 1)))
+                              ((= i n))
+                            (elt-set! result-data i
+                                      (- (elt-ref data-x i) max-val log-sum-exp))))
               
               (let ((result (make-base-tensor result-data shape-x dtype requires-grad?)))
                 
@@ -1872,40 +1579,24 @@
                                       (let ((grad-out (tensor-grad result)))
                                         
                                         ;; Compute sum of grad_out
-                                        (let ((grad-sum (case dtype
-                                                          ((f32)
-                                                           (let loop ((i 0) (sum 0.0))
-                                                             (if (= i n)
-                                                                 sum
-                                                                 (loop (+ i 1) 
-                                                                       (+ sum (f32vector-ref grad-out i))))))
-                                                          ((f64)
-                                                           (let loop ((i 0) (sum 0.0))
-                                                             (if (= i n)
-                                                                 sum
-                                                                 (loop (+ i 1) 
-                                                                       (+ sum (f64vector-ref grad-out i)))))))))
+                                        (let ((grad-sum
+                                               (with-dtype dtype
+                                                          (let loop ((i 0) (sum 0.0))
+                                                            (if (= i n)
+                                                                sum
+                                                                (loop (+ i 1) 
+                                                                      (+ sum (elt-ref grad-out i))))))))
                                           
-                                          (let ((grad-x (case dtype
-                                                          ((f32) (make-f32vector n 0.0))
-                                                          ((f64) (make-f64vector n 0.0)))))
+                                          (let ((grad-x (with-dtype dtype (vec n 0.0))))
                                             
                                             ;; grad_x[i] = grad_out[i] - exp(log_softmax[i]) * grad_sum
-                                            (case dtype
-                                              ((f32)
+                                            (with-dtype dtype
                                                (do ((i 0 (+ i 1)))
                                                    ((= i n))
-                                                 (f32vector-set! grad-x i
-                                                                 (- (f32vector-ref grad-out i)
-                                                                    (* (exp (f32vector-ref result-data i))
-                                                                       grad-sum)))))
-                                              ((f64)
-                                               (do ((i 0 (+ i 1)))
-                                                   ((= i n))
-                                                 (f64vector-set! grad-x i
-                                                                 (- (f64vector-ref grad-out i)
-                                                                    (* (exp (f64vector-ref result-data i))
-                                                                       grad-sum))))))
+                                                 (elt-set! grad-x i
+                                                           (- (elt-ref grad-out i)
+                                                              (* (exp (elt-ref result-data i))
+                                                                 grad-sum)))))
                                             
                                             (add-to-grad! x grad-x)))))
                                     
@@ -1924,55 +1615,36 @@
            (data-pred (tensor-data pred))
            (data-target (tensor-data target))
            (n (vector-length-for-dtype data-pred dtype))
-           (requires-grad? (tensor-requires-grad? pred)))
-      
-      ;; Forward: L = (1/n) * \sum(pred - target)^2
-      (define loss-value
-        (case dtype
-          ((f32)
-           (let loop ((i 0) (sum 0.0))
-             (if (= i n) (/ sum (exact->inexact n))
-               (let ((diff (- (f32vector-ref data-pred i)
-                              (f32vector-ref data-target i))))
-                 (loop (+ i 1)
-                       (+ sum (* diff diff)))))))
-          ((f64)
-           (let loop ((i 0) (sum 0.0))
-             (if (= i n) (/ sum (exact->inexact n))
-                 (let ((diff (- (f64vector-ref data-pred i)
-                                (f64vector-ref data-target i))))
-                   (loop (+ i 1)
-                         (+ sum (* diff diff)))))))))
+           (requires-grad? (tensor-requires-grad? pred))
+           ;; Forward: L = (1/n) * \sum(pred - target)^2
+           (loss-value
+             (with-dtype dtype
+                         (let loop ((i 0) (sum 0.0))
+                           (if (= i n) (/ sum (exact->inexact n))
+                               (let ((diff (- (elt-ref data-pred i)
+                                              (elt-ref data-target i))))
+                                 (loop (+ i 1)
+                                       (+ sum (* diff diff))))))))
+           )
       
       ;; Create scalar tensor for loss
       (let ((loss-tensor (make-base-tensor
-                         (case dtype
-                           ((f32) (f32vector loss-value))
-                           ((f64) (f64vector loss-value)))
+                          (with-dtype dtype (vec0 loss-value))
                          '(1) dtype requires-grad?)))
         (when requires-grad?
           (set-backward-fn! loss-tensor
             (lambda ()
               ;; Gradient: dL/d pred_i = (2/n) * (pred_i - target_i)
-              (let ((grad-pred (case dtype
-                                ((f32) (make-f32vector n 0.0))
-                                ((f64) (make-f64vector n 0.0))))
+              (let ((grad-pred (with-dtype dtype (vec n 0.0)))
                     (scale-factor (/ 2.0 (exact->inexact n))))
-                (case dtype
-                  ((f32)
+                (with-dtype dtype
                    (do ((i 0 (+ i 1)))
                        ((= i n))
-                     (f32vector-set! grad-pred i
+                     (elt-set! grad-pred i
                                     (* scale-factor
-                                       (- (f32vector-ref data-pred i)
-                                          (f32vector-ref data-target i))))))
-                  ((f64)
-                   (do ((i 0 (+ i 1)))
-                       ((= i n))
-                     (f64vector-set! grad-pred i
-                                    (* scale-factor
-                                       (- (f64vector-ref data-pred i)
-                                          (f64vector-ref data-target i)))))))
+                                       (- (elt-ref data-pred i)
+                                          (elt-ref data-target i))))))
+
                 (add-to-grad! pred grad-pred)))
             (list pred)
             ))
@@ -1985,29 +1657,19 @@
            (data-pred (tensor-data pred))
            (data-target (tensor-data target))
            (n (vector-length-for-dtype data-pred dtype))
-           (requires-grad? (tensor-requires-grad? pred)))
-
-      
-      ;; Forward: L = -\sum(target * log(pred))
-      (define loss-value
-        (case dtype
-          ((f32)
-           (let loop ((i 0) (sum 0.0))
-             (if (= i n) (- sum)
-                 (loop (+ i 1)
-                       (+ sum (* (f32vector-ref data-target i)
-                                 (log (max 1e-10 (f32vector-ref data-pred i)))))))))
-          ((f64)
-           (let loop ((i 0) (sum 0.0))
-             (if (= i n) (- sum)
-                 (loop (+ i 1)
-                       (+ sum (* (f64vector-ref data-target i)
-                                 (log (max 1e-10 (f64vector-ref data-pred i)))))))))))
+           (requires-grad? (tensor-requires-grad? pred))
+           ;; Forward: L = -\sum(target * log(pred))
+           (loss-value
+             (with-dtype dtype
+                         (let loop ((i 0) (sum 0.0))
+                           (if (= i n) (- sum)
+                               (loop (+ i 1)
+                                     (+ sum (* (elt-ref data-target i)
+                                               (log (max 1e-10 (elt-ref data-pred i))))))))))
+           )
       
       (let ((loss-tensor (make-base-tensor
-                         (case dtype
-                           ((f32) (f32vector loss-value))
-                           ((f64) (f64vector loss-value)))
+                         (with-dtype dtype (vec0 loss-value))
                          '(1) dtype requires-grad?)))
         (when requires-grad?
           (set-backward-fn!
@@ -2015,22 +1677,13 @@
            (lambda ()
                               
               ;; Gradient: dL/dpred_i = -target_i / pred_i
-              (let ((grad-pred (case dtype
-                                ((f32) (make-f32vector n 0.0))
-                                ((f64) (make-f64vector n 0.0)))))
-                (case dtype
-                  ((f32)
-                   (do ((i 0 (+ i 1)))
-                       ((= i n))
-                     (f32vector-set! grad-pred i
-                                    (- (/ (f32vector-ref data-target i)
-                                          (max 1e-10 (f32vector-ref data-pred i)))))))
-                  ((f64)
-                   (do ((i 0 (+ i 1)))
-                       ((= i n))
-                     (f64vector-set! grad-pred i
-                                    (- (/ (f64vector-ref data-target i)
-                                          (max 1e-10 (f64vector-ref data-pred i))))))))
+              (let ((grad-pred (with-dtype dtype (vec n 0.0))))
+                (with-dtype dtype
+                            (do ((i 0 (+ i 1)))
+                                ((= i n))
+                              (elt-set! grad-pred i
+                                        (- (/ (elt-ref data-target i)
+                                              (max 1e-10 (elt-ref data-pred i)))))))
                 (add-to-grad! pred grad-pred)
                 ))
             (list pred)))
@@ -2053,47 +1706,29 @@
            (requires-grad? (or (tensor-requires-grad? x)
                                (tensor-requires-grad? weight))))
       
-      (let* ((n (case dtype
-                  ((f32) (f32vector-length data-x))
-                  ((f64) (f64vector-length data-x))))
+      (let* ((n (vector-length-for-dtype data-x dtype))
              
              ;; Compute RMS using BLAS dot
-             (x-dot-x (case dtype
-                        ((f32) (sdot n data-x data-x))
-                        ((f64) (ddot n data-x data-x))))
+             (x-dot-x (with-dtype dtype (dot n data-x data-x)))
              (rms (sqrt (+ epsilon (/ x-dot-x (exact->inexact n)))))
              (inv-rms (/ 1.0 rms))
              
-             (result-data (case dtype
-                            ((f32) (make-f32vector n 0.0))
-                            ((f64) (make-f64vector n 0.0))))
-             (normalized-data (case dtype
-                                ((f32) (make-f32vector n 0.0))
-                                ((f64) (make-f64vector n 0.0)))))
+             (result-data (with-dtype dtype (vec n 0.0)))
+             (normalized-data (with-dtype dtype (vec n 0.0)))
+             )
         
-        ;; Copy and scale: normalized = x / rms (using BLAS)
-        (case dtype
-          ((f32)
-           (sblit normalized-data data-x)
-           (sscal! n inv-rms normalized-data))
-          ((f64)
-           (dblit normalized-data data-x)
-           (dscal! n inv-rms normalized-data)))
+        ;; Copy and scale: normalized = x / rms
+        (with-dtype dtype
+           (blit normalized-data data-x)
+           (scal! n inv-rms normalized-data))
         
         ;; Element-wise multiply with weight
-        (case dtype
-          ((f32)
+        (with-dtype dtype
            (do ((i 0 (+ i 1)))
                ((= i n))
-             (f32vector-set! result-data i
-                             (* (f32vector-ref normalized-data i)
-                                (f32vector-ref data-w i)))))
-          ((f64)
-           (do ((i 0 (+ i 1)))
-               ((= i n))
-             (f64vector-set! result-data i
-                             (* (f64vector-ref normalized-data i)
-                                (f64vector-ref data-w i))))))
+             (elt-set! result-data i
+                       (* (elt-ref normalized-data i)
+                          (elt-ref data-w i)))))
         
         (let ((result (make-base-tensor result-data (tensor-shape x) dtype requires-grad?)))
           
@@ -2104,68 +1739,39 @@
                                   
                                   ;; Gradient for weight
                                   (when (tensor-requires-grad? weight)
-                                    (let ((grad-weight (case dtype
-                                                         ((f32) (make-f32vector n 0.0))
-                                                         ((f64) (make-f64vector n 0.0)))))
-                                      (case dtype
-                                        ((f32)
+                                    (let ((grad-weight (with-dtype dtype (vec n 0.0))))
+                                      (with-dtype dtype
                                          (do ((i 0 (+ i 1)))
                                              ((= i n))
-                                           (f32vector-set! grad-weight i
-                                                           (* (f32vector-ref grad-out i)
-                                                              (f32vector-ref normalized-data i)))))
-                                        ((f64)
-                                         (do ((i 0 (+ i 1)))
-                                             ((= i n))
-                                           (f64vector-set! grad-weight i
-                                                           (* (f64vector-ref grad-out i)
-                                                              (f64vector-ref normalized-data i))))))
+                                           (elt-set! grad-weight i
+                                                     (* (elt-ref grad-out i)
+                                                              (elt-ref normalized-data i)))))
                                       (add-to-grad! weight grad-weight)))
                                   
                                   ;; Gradient for x
                                   (when (tensor-requires-grad? x)
-                                    (let ((grad-normalized (case dtype
-                                                             ((f32) (make-f32vector n 0.0))
-                                                             ((f64) (make-f64vector n 0.0)))))
+                                    (let ((grad-normalized (with-dtype dtype (vec n 0.0))))
                                       
                                       ;; grad_normalized = grad_out * weight
-                                      (case dtype
-                                        ((f32)
+                                      (with-dtype dtype
                                          (do ((i 0 (+ i 1)))
                                              ((= i n))
-                                           (f32vector-set! grad-normalized i
-                                                           (* (f32vector-ref grad-out i)
-                                                              (f32vector-ref data-w i)))))
-                                        ((f64)
-                                         (do ((i 0 (+ i 1)))
-                                             ((= i n))
-                                           (f64vector-set! grad-normalized i
-                                                           (* (f64vector-ref grad-out i)
-                                                              (f64vector-ref data-w i))))))
+                                           (elt-set! grad-normalized i
+                                                           (* (elt-ref grad-out i)
+                                                              (elt-ref data-w i)))))
                                       
-                                      ;; Use BLAS for dot product
-                                      (let* ((dot-prod (case dtype
-                                                         ((f32) (sdot n grad-normalized data-x))
-                                                         ((f64) (ddot n grad-normalized data-x))))
+                                      (let* ((dot-prod (with-dtype dtype (dot n grad-normalized data-x)))
                                              (mean-term (/ dot-prod (exact->inexact n)))
-                                             (grad-x (case dtype
-                                                       ((f32) (make-f32vector n 0.0))
-                                                       ((f64) (make-f64vector n 0.0)))))
+                                             (grad-x (with-dtype dtype (vec n 0.0))))
                                         
                                         ;; Compute: grad_x = (grad_normalized - normalized * mean_term) / rms
-                                        ;; Use BLAS for subtraction: grad_x = grad_normalized
-                                        (case dtype
-                                          ((f32)
-                                           (sblit grad-x grad-normalized)
+                                        (with-dtype dtype
+                                           (blit grad-x grad-normalized)
                                            ;; Subtract: grad_x -= normalized * mean_term
-                                           (saxpy! n (- mean-term) normalized-data grad-x)
+                                           (axpy! n (- mean-term) normalized-data grad-x)
                                            ;; Scale: grad_x /= rms
-                                           (sscal! n inv-rms grad-x))
-                                          ((f64)
-                                           (dblit grad-x grad-normalized)
-                                           (daxpy! n (- mean-term) normalized-data grad-x)
-                                           (dscal! n inv-rms grad-x)))
-                                        
+                                           (scal! n inv-rms grad-x))
+
                                         (add-to-grad! x grad-x)))))
                                 )
                                 
@@ -2185,24 +1791,16 @@
            
            ;; Extract scalar values
            (dtype (tensor-dtype a))
-           (ab (case dtype
-                 ((f32) (f32vector-ref (tensor-data dot-ab) 0))
-                 ((f64) (f64vector-ref (tensor-data dot-ab) 0))))
-           (aa (case dtype
-                 ((f32) (f32vector-ref (tensor-data dot-aa) 0))
-                 ((f64) (f64vector-ref (tensor-data dot-aa) 0))))
-           (bb (case dtype
-                 ((f32) (f32vector-ref (tensor-data dot-bb) 0))
-                 ((f64) (f64vector-ref (tensor-data dot-bb) 0))))
+           (ab (with-dtype dtype (elt-ref (tensor-data dot-ab) 0)))
+           (aa (with-dtype dtype (elt-ref (tensor-data dot-aa) 0)))
+           (bb (with-dtype dtype (elt-ref (tensor-data dot-bb) 0)))
            
            ;; Compute cosine similarity
            (norm-a (sqrt aa))
            (norm-b (sqrt bb))
            (cos-sim (/ ab (* norm-a norm-b)))
            
-           (result-data (case dtype
-                          ((f32) (f32vector cos-sim))
-                          ((f64) (f64vector cos-sim)))))
+           (result-data (with-dtype dtype (vec0 cos-sim))))
       
       (make-base-tensor result-data '(1) dtype #f)))
 
@@ -2211,14 +1809,10 @@
     "L2 normalization: x / ||x||"
     (let* ((dot-self (dot-op tensor tensor))
            (dtype (tensor-dtype tensor))
-           (norm-squared (case dtype
-                           ((f32) (f32vector-ref (tensor-data dot-self) 0))
-                           ((f64) (f64vector-ref (tensor-data dot-self) 0))))
+           (norm-squared (with-dtype dtype (elt-ref (tensor-data dot-self) 0)))
            (norm (sqrt (+ norm-squared epsilon)))
            (n (vector-length-for-dtype (tensor-data tensor) dtype))
-           (norm-tensor-data (case dtype
-                               ((f32) (make-f32vector n norm))
-                               ((f64) (make-f64vector n norm))))
+           (norm-tensor-data (with-dtype dtype (vec n norm)))
            (norm-tensor (make-base-tensor norm-tensor-data
                                           (tensor-shape tensor)
                                           dtype
