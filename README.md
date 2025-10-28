@@ -11,7 +11,7 @@ operations and a clean functional API.
 - **YASOS Object System**: Clean, polymorphic object-oriented abstractions
 - **Mixed Precision**: Support for both 32-bit (f32) and 64-bit (f64) floating-point
 - **Neural Network Layers**: Dense layers, convolutional layers, and sequential containers
-- **Activation Functions**: ReLU, Tanh, Sigmoid, Softmax, LeakyReLU, Softplus
+- **Activation Functions**: ReLU, Tanh, Sigmoid, Softmax, LeakyReLU, Softplus, SiLU, GeLU
 - **Optimizers**: SGD (with momentum), Adam, RMSprop
 - **Loss Functions**: MSE, Cross-Entropy
 - **Advanced Operations**: Convolution, RMSNorm, Layer Normalization
@@ -177,6 +177,8 @@ chicken-install
 (sigmoid-stable tensor)    ; Numerically stable sigmoid
 (softmax tensor)           ; Softmax normalization
 (log-softmax tensor)       ; Log-softmax
+(silu tensor)              ; SiLU
+(gelu tensor)              ; GeLU
 (leaky-relu tensor #:key (alpha 0.01))
 (softplus tensor #:key (beta 1.0))
 ```
@@ -225,6 +227,8 @@ chicken-install
 (make-relu)                ; ReLU activation
 (make-tanh)                ; Tanh activation
 (make-sigmoid)             ; Sigmoid activation
+(make-silu)                ; SiLU activation
+(make-gelu)                ; GeLU activation
 (make-identity)            ; No activation
 ```
 

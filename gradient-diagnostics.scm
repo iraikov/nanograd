@@ -36,30 +36,25 @@
    nanograd-autograd
    )
 
+  ;; Hygienic macro for dtype-based operation dispatch
+  (include "with-dtype.scm")
+
   ;;; ==================================================================
   ;;; Gradient Statistics
   ;;; ==================================================================
 
   (define (gradient-l2-norm grad dtype)
     "Compute L2 norm (Euclidean norm) of gradient vector"
-    (let ((n (case dtype
-               ((f32) (f32vector-length grad))
-               ((f64) (f64vector-length grad)))))
-      (sqrt (case dtype
-              ((f32) (sdot n grad grad))
-              ((f64) (ddot n grad grad))))))
+    (let ((n (vector-length-for-dtype grad dtype)))
+      (sqrt (with-dtype dtype (dot n grad grad)))))
 
   (define (gradient-inf-norm grad dtype)
     "Compute infinity norm (max absolute value) of gradient"
-    (let ((n (case dtype
-               ((f32) (f32vector-length grad))
-               ((f64) (f64vector-length grad)))))
+    (let ((n (vector-length-for-dtype grad dtype)))
       (let loop ((i 0) (max-val 0.0))
         (if (= i n)
             max-val
-            (let ((val (abs (case dtype
-                             ((f32) (f32vector-ref grad i))
-                             ((f64) (f64vector-ref grad i))))))
+            (let ((val (abs (with-dtype dtype (elt-ref grad i)))))
               (loop (+ i 1) (max max-val val)))))))
 
   (define (compute-gradient-norm parameters #!key (norm-type 'l2))
@@ -107,19 +102,11 @@
          (let ((grad (tensor-grad param)))
            (when grad
              (let* ((dtype (tensor-dtype param))
-                    (n (case dtype
-                         ((f32) (f32vector-length grad))
-                         ((f64) (f64vector-length grad))))
+                    (n (vector-length-for-dtype grad dtype))
                     (l2 (gradient-l2-norm grad dtype))
                     (inf (gradient-inf-norm grad dtype))
                     ;; Compute mean
-                    (sum (let loop ((i 0) (s 0.0))
-                           (if (= i n)
-                               s
-                               (loop (+ i 1)
-                                     (+ s (abs (case dtype
-                                                ((f32) (f32vector-ref grad i))
-                                                ((f64) (f64vector-ref grad i)))))))))
+                    (sum (with-dtype dtype (fold + 0.0 grad)))
                     (mean (/ sum n)))
                
                (set! layer-stats
@@ -374,12 +361,9 @@
              (let ((grad (tensor-grad param)))
                (when grad
                  (let* ((dtype (tensor-dtype param))
-                        (n (case dtype
-                             ((f32) (f32vector-length grad))
-                             ((f64) (f64vector-length grad)))))
-                   (case dtype
-                     ((f32) (sscal! n scale grad))
-                     ((f64) (dscal! n scale grad)))))))
+                        (n (vector-length-for-dtype grad dtype)))
+                   (with-dtype dtype (scal! n scale grad))))
+               ))
            parameters)
           
           (printf "  Gradient clipping applied (scale: ~A)\n" scale)

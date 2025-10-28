@@ -38,6 +38,8 @@
    make-base-tensor
    tensor->list print-tensor
    vector-length-for-dtype
+   f32vector-fold
+   f64vector-fold
    )
   
   (import

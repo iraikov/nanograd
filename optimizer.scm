@@ -25,6 +25,10 @@
    nanograd-autograd
    )
 
+  ;; Hygienic macro for dtype-based operation dispatch
+  (include "with-dtype.scm")
+
+  
   ;;; ==================================================================
   ;;; Optimizer Base Operations
   ;;; ==================================================================
@@ -62,12 +66,9 @@
          (lambda (param)
            (let* ((dtype (tensor-dtype param))
                   (data (tensor-data param))
-                  (n (case dtype
-                       ((f32) (f32vector-length data))
-                       ((f64) (f64vector-length data))))
-                  (v (case dtype
-                       ((f32) (make-f32vector n 0.0))
-                       ((f64) (make-f64vector n 0.0)))))
+                  (n (vector-length-for-dtype data dtype))
+                  (v (with-dtype dtype (vec n 0.0))))
+
              (hash-table-set! velocity-buffers param v)))
          parameters))
       
@@ -94,48 +95,34 @@
            (let* ((dtype (tensor-dtype param))
                   (data (tensor-data param))
                   (grad (tensor-grad param))
-                  (n (case dtype
-                       ((f32) (f32vector-length data))
-                       ((f64) (f64vector-length data)))))
+                  (n (vector-length-for-dtype data dtype)))
              
              (when grad
                ;; Apply weight decay if specified
                (when (> wd 0.0)
-                 (case dtype
-                   ((f32) (saxpy! n wd data grad))
-                   ((f64) (daxpy! n wd data grad))))
+                 (with-dtype dtype
+                   (axpy! n wd data grad)))
                
                (if (> mom 0.0)
                    ;; SGD with momentum
                    (let ((v (hash-table-ref velocity-buffers param)))
-                     (case dtype
-                       ((f32)
+                     (with-dtype dtype
                         ;; v = momentum * v + grad
-                        (sscal! n mom v)
-                        (saxpy! n 1.0 grad v)
+                        (scal! n mom v)
+                        (axpy! n 1.0 grad v)
                         
                         (if use-nesterov
                             ;; Nesterov: param = param - lr * (momentum * v + grad)
-                            (let ((update (make-f32vector n)))
-                              (saxpy! n mom v update)
-                              (saxpy! n 1.0 grad update)
-                              (saxpy! n (- lr) update data))
+                            (let ((update (vec n 0.0)))
+                              (axpy! n mom v update)
+                              (axpy! n 1.0 grad update)
+                              (axpy! n (- lr) update data))
                             ;; Standard: param = param - lr * v
-                            (saxpy! n (- lr) v data)))
-                       ((f64)
-                        (dscal! n mom v)
-                        (daxpy! n 1.0 grad v)
-                        (if use-nesterov
-                            (let ((update (make-f64vector n)))
-                              (daxpy! n mom v update)
-                              (daxpy! n 1.0 grad update)
-                              (daxpy! n (- lr) update data))
-                            (daxpy! n (- lr) v data)))))
+                            (axpy! n (- lr) v data))))
                    
                    ;; Standard SGD: param = param - lr * grad
-                   (case dtype
-                     ((f32) (saxpy! n (- lr) grad data))
-                     ((f64) (daxpy! n (- lr) grad data)))))))
+                   (with-dtype dtype (axpy! n (- lr) grad data)))
+               )))
          parameters)))))
 
   ;;; ==================================================================
@@ -149,6 +136,7 @@
                      (beta2 0.999)
                      (epsilon 1e-8)
                      (weight-decay 0.0))
+    
     (let ((lr learning-rate)
           (b1 beta1)
           (b2 beta2)
@@ -165,15 +153,9 @@
        (lambda (param)
          (let* ((dtype (tensor-dtype param))
                 (data (tensor-data param))
-                (n (case dtype
-                     ((f32) (f32vector-length data))
-                     ((f64) (f64vector-length data))))
-                (m (case dtype
-                     ((f32) (make-f32vector n 0.0))
-                     ((f64) (make-f64vector n 0.0))))
-                (v (case dtype
-                     ((f32) (make-f32vector n 0.0))
-                     ((f64) (make-f64vector n 0.0)))))
+                (n (vector-length-for-dtype data dtype))
+                (m (with-dtype dtype (vec n 0.0)))
+                (v (with-dtype dtype (vec n 0.0))))
            (hash-table-set! m-buffers param m)
            (hash-table-set! v-buffers param v)))
        parameters)
@@ -209,66 +191,42 @@
              (let* ((dtype (tensor-dtype param))
                     (data (tensor-data param))
                     (grad (tensor-grad param))
-                    (n (case dtype
-                         ((f32) (f32vector-length data))
-                         ((f64) (f64vector-length data)))))
+                    (n (vector-length-for-dtype data dtype)))
 
                (when grad
                  ;; Apply weight decay
                  (when (> wd 0.0)
-                   (case dtype
-                     ((f32) (saxpy! n wd data grad))
-                     ((f64) (daxpy! n wd data grad))))
+                   (with-dtype dtype (axpy! n wd data grad)))
                  
                  (let ((m (hash-table-ref m-buffers param))
                        (v (hash-table-ref v-buffers param)))
                    
-                   (case dtype
-                     ((f32)
+                   (with-dtype dtype
                       ;; Update biased first moment: m = beta1 * m + (1-beta1) * grad
-                      (sscal! n b1 m)
-                      (saxpy! n (- 1.0 b1) grad m)
+                      (scal! n b1 m)
+                      (axpy! n (- 1.0 b1) grad m)
                       
                       ;; Update biased second moment: v = beta2 * v + (1-beta2) * grad^2
-                      (sscal! n b2 v)
+                      (scal! n b2 v)
                       (do ((i 0 (+ i 1)))
                           ((= i n))
-                        (let ((g (f32vector-ref grad i)))
-                          (f32vector-set! v i
-                                         (+ (f32vector-ref v i)
-                                            (* (- 1.0 b2) g g)))))
+                        (let ((g (elt-ref grad i)))
+                          (elt-set! v i
+                                    (+ (elt-ref v i)
+                                       (* (- 1.0 b2) g g)))))
                       
                       ;; Compute bias-corrected step
                       (do ((i 0 (+ i 1)))
                           ((= i n))
-                        (let ((m-hat (/ (f32vector-ref m i) bias-correction1))
-                              (v-hat (/ (f32vector-ref v i) bias-correction2)))
-                          (f32vector-set! data i
-                                          (- (f32vector-ref data i)
+                        (let ((m-hat (/ (elt-ref m i) bias-correction1))
+                              (v-hat (/ (elt-ref v i) bias-correction2)))
+                          (elt-set! data i
+                                          (- (elt-ref data i)
                                              (/ (* lr m-hat)
                                                 (+ (sqrt v-hat) eps))))))
-                      )
-                     
-                     ((f64)
-                      ;; Similar for f64
-                      (dscal! n b1 m)
-                      (daxpy! n (- 1.0 b1) grad m)
-                      (dscal! n b2 v)
-                      (do ((i 0 (+ i 1)))
-                          ((= i n))
-                        (let ((g (f64vector-ref grad i)))
-                          (f64vector-set! v i
-                                         (+ (f64vector-ref v i)
-                                            (* (- 1.0 b2) g g)))))
-                      (let ((step-size (* lr (/ (sqrt bias-correction2) bias-correction1))))
-                        (do ((i 0 (+ i 1)))
-                            ((= i n))
-                          (let ((m-hat (/ (f64vector-ref m i) bias-correction1))
-                                (v-hat (/ (f64vector-ref v i) bias-correction2)))
-                            (f64vector-set! data i
-                                           (- (f64vector-ref data i)
-                                              (/ (* step-size m-hat)
-                                                 (+ (sqrt v-hat) eps)))))))))))))
+                      ))
+                   ))
+                 )
            parameters))))))
 
   ;;; ==================================================================
@@ -282,6 +240,7 @@
                         (epsilon 1e-8)
                         (weight-decay 0.0)
                         (momentum 0.0))
+    
     (let ((lr learning-rate)
           (a alpha)
           (eps epsilon)
@@ -297,17 +256,11 @@
        (lambda (param)
          (let* ((dtype (tensor-dtype param))
                 (data (tensor-data param))
-                (n (case dtype
-                     ((f32) (f32vector-length data))
-                     ((f64) (f64vector-length data))))
-                (v (case dtype
-                     ((f32) (make-f32vector n 0.0))
-                     ((f64) (make-f64vector n 0.0)))))
+                (n (vector-length-for-dtype data dtype))
+                (v (with-dtype dtype (vec n 0.0))))
            (hash-table-set! v-buffers param v)
            (when (> momentum 0.0)
-             (let ((m (case dtype
-                        ((f32) (make-f32vector n 0.0))
-                        ((f64) (make-f64vector n 0.0)))))
+             (let ((m (with-dtype dtype (vec n 0.0))))
                (hash-table-set! m-buffers param m)))))
        parameters)
       
@@ -335,84 +288,49 @@
            (let* ((dtype (tensor-dtype param))
                   (data (tensor-data param))
                   (grad (tensor-grad param))
-                  (n (case dtype
-                       ((f32) (f32vector-length data))
-                       ((f64) (f64vector-length data)))))
+                  (n (vector-length-for-dtype data dtype)))
              
              (when grad
                ;; Apply weight decay
                (when (> wd 0.0)
-                 (case dtype
-                   ((f32) (saxpy! n wd data grad))
-                   ((f64) (daxpy! n wd data grad))))
+                 (with-dtype dtype (axpy! n wd data grad)))
                
                (let ((v (hash-table-ref v-buffers param)))
-                 (case dtype
-                   ((f32)
+                 (with-dtype dtype
                     ;; Update running average: v = alpha * v + (1-alpha) * grad^2
-                    (sscal! n a v)
+                    (scal! n a v)
                     (do ((i 0 (+ i 1)))
                         ((= i n))
-                      (let ((g (f32vector-ref grad i)))
-                        (f32vector-set! v i
-                                       (+ (f32vector-ref v i)
-                                          (* (- 1.0 a) g g)))))
+                      (let ((g (elt-ref grad i)))
+                        (elt-set! v i
+                                  (+ (elt-ref v i)
+                                     (* (- 1.0 a) g g)))))
                     
                     (if (> mom 0.0)
                         ;; With momentum
                         (let ((m (hash-table-ref m-buffers param)))
                           (do ((i 0 (+ i 1)))
                               ((= i n))
-                            (let* ((g (f32vector-ref grad i))
-                                   (avg (f32vector-ref v i))
-                                   (buf (f32vector-ref m i))
+                            (let* ((g (elt-ref grad i))
+                                   (avg (elt-ref v i))
+                                   (buf (elt-ref m i))
                                    (new-buf (+ (* mom buf)
                                               (/ (* lr g)
                                                  (+ (sqrt avg) eps)))))
-                              (f32vector-set! m i new-buf)
-                              (f32vector-set! data i
-                                             (- (f32vector-ref data i) new-buf)))))
+                              (elt-set! m i new-buf)
+                              (elt-set! data i
+                                             (- (elt-ref data i) new-buf)))))
                         ;; Without momentum
                         (do ((i 0 (+ i 1)))
                             ((= i n))
-                          (let ((g (f32vector-ref grad i))
-                                (avg (f32vector-ref v i)))
-                            (f32vector-set! data i
-                                           (- (f32vector-ref data i)
+                          (let ((g (elt-ref grad i))
+                                (avg (elt-ref v i)))
+                            (elt-set! data i
+                                           (- (elt-ref data i)
                                               (/ (* lr g)
                                                  (+ (sqrt avg) eps))))))))
                    
-                   ((f64)
-                    ;; Similar for f64
-                    (dscal! n a v)
-                    (do ((i 0 (+ i 1)))
-                        ((= i n))
-                      (let ((g (f64vector-ref grad i)))
-                        (f64vector-set! v i
-                                       (+ (f64vector-ref v i)
-                                          (* (- 1.0 a) g g)))))
-                    (if (> mom 0.0)
-                        (let ((m (hash-table-ref m-buffers param)))
-                          (do ((i 0 (+ i 1)))
-                              ((= i n))
-                            (let* ((g (f64vector-ref grad i))
-                                   (avg (f64vector-ref v i))
-                                   (buf (f64vector-ref m i))
-                                   (new-buf (+ (* mom buf)
-                                              (/ (* lr g)
-                                                 (+ (sqrt avg) eps)))))
-                              (f64vector-set! m i new-buf)
-                              (f64vector-set! data i
-                                             (- (f64vector-ref data i) new-buf)))))
-                        (do ((i 0 (+ i 1)))
-                            ((= i n))
-                          (let ((g (f64vector-ref grad i))
-                                (avg (f64vector-ref v i)))
-                            (f64vector-set! data i
-                                           (- (f64vector-ref data i)
-                                              (/ (* lr g)
-                                                 (+ (sqrt avg) eps))))))))
-                    )))))
+                    ))))
          parameters)))))
 
 ) ;; end module

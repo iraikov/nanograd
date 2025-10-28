@@ -21,6 +21,7 @@
    
    ;; Activation functions (as objects)
    make-relu make-tanh make-sigmoid make-identity
+   make-gelu make-silu
    activation? activation-name activation-forward
 
    
@@ -40,6 +41,10 @@
    s11n
    nanograd-autograd
    )
+
+
+  ;; Hygienic macro for dtype-based operation dispatch
+  (include "with-dtype.scm")
 
   ;;; ==================================================================
   ;;; Activation Functions as YASOS Objects
@@ -75,6 +80,20 @@
      ((activation? self) #t)
      ((activation-name self) "Identity")
      ((activation-forward self x) x)))
+
+  ;; GeLU Activation
+  (define (make-gelu)
+    (object
+     ((activation? self) #t)
+     ((activation-name self) "GeLU")
+     ((activation-forward self x) (gelu x))))
+
+  ;; SiLU / Swish Activation
+  (define (make-silu)
+    (object
+     ((activation? self) #t)
+     ((activation-name self) "SiLU")
+     ((activation-forward self x) (silu x))))
 
   ;;; ==================================================================
   ;;; Layer Base Operations
@@ -141,6 +160,8 @@
        ((string=? name "Tanh") (make-tanh))
        ((string=? name "Sigmoid") (make-sigmoid))
        ((string=? name "Identity") (make-identity))
+       ((string=? name "GeLU") (make-gelu))
+       ((string=? name "SiLU") (make-silu))
        (else (error 'serializable->activation 
                     (format #f "Unknown activation function: ~A" name))))))
 
@@ -396,26 +417,16 @@
            (init-scale (sqrt (/ 2.0 (+ input-size output-size))))
            
            ;; Initialize weights with small random values
-           (weight-data (case dtype
-                         ((f32)
-                          (let ((vec (make-f32vector weight-size 0.0)))
+           (weight-data (with-dtype dtype
+                          (let ((w (vec weight-size 0.0)))
                             (do ((i 0 (+ i 1)))
-                                ((= i weight-size) vec)
-                              (f32vector-set! vec i
-                                             (* init-scale
-                                                (- (pseudo-random-real) 0.5))))))
-                         ((f64)
-                          (let ((vec (make-f64vector weight-size 0.0)))
-                            (do ((i 0 (+ i 1)))
-                                ((= i weight-size) vec)
-                              (f64vector-set! vec i
-                                             (* init-scale
-                                                (- (pseudo-random-real) 0.5))))))))
+                                ((= i weight-size) w)
+                              (elt-set! w i
+                                        (* init-scale
+                                           (- (pseudo-random-real) 0.5)))))))
            
            ;; Initialize biases to zero
-           (bias-data (case dtype
-                       ((f32) (make-f32vector output-size 0.0))
-                       ((f64) (make-f64vector output-size 0.0))))
+           (bias-data (with-dtype dtype (vec output-size 0.0)))
            
            ;; Create parameter tensors
            (weights (case dtype
@@ -535,49 +546,30 @@
       
       ;; Compute mean and variance
       (define (compute-stats)
-        (let ((sum (case dtype
-                     ((f32)
-                      (let loop ((i 0) (sum 0.0))
-                        (if (= i n) sum
-                            (loop (+ i 1) (+ sum (f32vector-ref data-x i))))))
-                     ((f64)
-                      (let loop ((i 0) (sum 0.0))
-                        (if (= i n) sum
-                            (loop (+ i 1) (+ sum (f64vector-ref data-x i)))))))))
+        (let ((sum (with-dtype dtype
+                               (let loop ((i 0) (sum 0.0))
+                                 (if (= i n) sum
+                                     (loop (+ i 1) (+ sum (elt-ref data-x i))))))))
           (let* ((mean (/ sum (exact->inexact n)))
-                 (var-sum (case dtype
-                            ((f32)
-                             (let loop ((i 0) (var-sum 0.0))
-                               (if (= i n) var-sum
-                                   (let ((diff (- (f32vector-ref data-x i) mean)))
-                                     (loop (+ i 1) (+ var-sum (* diff diff)))))))
-                            ((f64)
-                             (let loop ((i 0) (var-sum 0.0))
-                               (if (= i n) var-sum
-                                   (let ((diff (- (f64vector-ref data-x i) mean)))
-                                     (loop (+ i 1) (+ var-sum (* diff diff))))))))))
+                 (var-sum (with-dtype dtype
+                                      (let loop ((i 0) (var-sum 0.0))
+                                        (if (= i n) var-sum
+                                            (let ((diff (- (elt-ref data-x i) mean)))
+                                              (loop (+ i 1) (+ var-sum (* diff diff)))))))))
             (values mean (/ var-sum (exact->inexact n))))))
       
       (let-values (((mean variance) (compute-stats)))
-        (let ((std (sqrt (+ variance epsilon))))
-          ;; Normalize, scale, shift
-          (define normalized
-            (let ((norm-data (case dtype
-                              ((f32) (make-f32vector n 0.0))
-                              ((f64) (make-f64vector n 0.0)))))
-              (case dtype
-                ((f32)
-                 (do ((i 0 (+ i 1)))
-                     ((= i n))
-                   (f32vector-set! norm-data i
-                                  (/ (- (f32vector-ref data-x i) mean) std))))
-                ((f64)
-                 (do ((i 0 (+ i 1)))
-                     ((= i n))
-                   (f64vector-set! norm-data i
-                                  (/ (- (f64vector-ref data-x i) mean) std)))))
-              (make-base-tensor norm-data (tensor-shape x) dtype
-                              (tensor-requires-grad? x))))
+        (let* ((std (sqrt (+ variance epsilon)))
+               ;; Normalize, scale, shift
+               (normalized
+                (let ((norm-data (with-dtype dtype (vec n 0.0))))
+                  (with-dtype dtype
+                              (do ((i 0 (+ i 1)))
+                                  ((= i n))
+                                (elt-set! norm-data i
+                                          (/ (- (elt-ref data-x i) mean) std))))
+                  (make-base-tensor norm-data (tensor-shape x) dtype
+                                    (tensor-requires-grad? x)))))
           
           ;; scaled = normalized * gamma
           (define scaled (mul normalized gamma))
@@ -610,26 +602,16 @@
          
          ;; Initialize weights: (out_channels, in_channels, KH, KW)
          (weight-size (* out-channels in-channels KH KW))
-         (weight-data (case dtype
-                       ((f32)
-                        (let ((vec (make-f32vector weight-size 0.0)))
+         (weight-data (with-dtype dtype
+                        (let ((w (vec weight-size 0.0)))
                           (do ((i 0 (+ i 1)))
-                              ((= i weight-size) vec)
-                            (f32vector-set! vec i
-                                           (* init-scale
-                                              (- (* 2.0 (pseudo-random-real)) 1.0))))))
-                       ((f64)
-                        (let ((vec (make-f64vector weight-size 0.0)))
-                          (do ((i 0 (+ i 1)))
-                              ((= i weight-size) vec)
-                            (f64vector-set! vec i
-                                           (* init-scale
-                                              (- (* 2.0 (pseudo-random-real)) 1.0))))))))
+                              ((= i weight-size) w)
+                            (elt-set! w i
+                                      (* init-scale
+                                         (- (* 2.0 (pseudo-random-real)) 1.0)))))))
          
          ;; Initialize biases
-         (bias-data (case dtype
-                     ((f32) (make-f32vector out-channels 0.0))
-                     ((f64) (make-f64vector out-channels 0.0))))
+         (bias-data (with-dtype dtype (vec out-channels 0.0)))
          
          ;; Create parameter tensors
          (weights (case dtype
@@ -722,46 +704,42 @@
            (OH (+ 1 (quotient (- H KH) stride-val)))
            (OW (+ 1 (quotient (- W KW) stride-val)))
            
-           (output-data (case dtype
-                          ((f32) (make-f32vector (* C OH OW) 0.0))
-                          ((f64) (make-f64vector (* C OH OW) 0.0))))
+           (output-data (with-dtype dtype (vec (* C OH OW) 0.0)))
            
            ;; Store indices for backward pass
            (max-indices (make-vector (* C OH OW))))
     
       ;; Forward: find max in each window
-      (do ((c 0 (+ c 1)))
-          ((= c C))
-        (do ((oh 0 (+ oh 1)))
-            ((= oh OH))
-          (do ((ow 0 (+ ow 1)))
-              ((= ow OW))
-            
-            (let ((max-val -inf.0)
-                  (max-idx 0))
+      (with-dtype
+       dtype
+       (do ((c 0 (+ c 1)))
+           ((= c C))
+         (do ((oh 0 (+ oh 1)))
+             ((= oh OH))
+           (do ((ow 0 (+ ow 1)))
+               ((= ow OW))
+             
+             (let ((max-val -inf.0)
+                   (max-idx 0))
+               
+               ;; Find max in kernel window
+               (do ((kh 0 (+ kh 1)))
+                   ((= kh KH))
+                 (do ((kw 0 (+ kw 1)))
+                     ((= kw KW))
+                   
+                   (let* ((ih (+ (* oh stride-val) kh))
+                          (iw (+ (* ow stride-val) kw))
+                          (input-idx (+ (* c H W) (* ih W) iw))
+                          (val (elt-ref data input-idx)))
+                     
+                     (when (> val max-val)
+                       (set! max-val val)
+                       (set! max-idx input-idx)))))
               
-              ;; Find max in kernel window
-              (do ((kh 0 (+ kh 1)))
-                  ((= kh KH))
-                (do ((kw 0 (+ kw 1)))
-                    ((= kw KW))
-                  
-                  (let* ((ih (+ (* oh stride-val) kh))
-                         (iw (+ (* ow stride-val) kw))
-                         (input-idx (+ (* c H W) (* ih W) iw))
-                         (val (case dtype
-                                ((f32) (f32vector-ref data input-idx))
-                                ((f64) (f64vector-ref data input-idx)))))
-                    
-                    (when (> val max-val)
-                      (set! max-val val)
-                      (set! max-idx input-idx)))))
-              
-              (let ((output-idx (+ (* c OH OW) (* oh OW) ow)))
-                (case dtype
-                  ((f32) (f32vector-set! output-data output-idx max-val))
-                  ((f64) (f64vector-set! output-data output-idx max-val)))
-                (vector-set! max-indices output-idx max-idx))))))
+               (let ((output-idx (+ (* c OH OW) (* oh OW) ow)))
+                 (elt-set! output-data output-idx max-val)
+                 (vector-set! max-indices output-idx max-idx)))))))
     
       (let ((result (make-base-tensor output-data 
                                       (list C OH OW)
@@ -772,24 +750,19 @@
           (set-backward-fn! result
                             (lambda ()
                               (let ((grad-out (tensor-grad result))
-                                    (grad-in (case dtype
-                                               ((f32) (make-f32vector (* C H W) 0.0))
-                                               ((f64) (make-f64vector (* C H W) 0.0)))))
+                                    (grad-in (with-dtype dtype (vec (* C H W) 0.0))))
                                 
                                 ;; Gradient flows only to max positions
-                                (do ((i 0 (+ i 1)))
-                                    ((= i (* C OH OW)))
-                                  (let ((max-pos (vector-ref max-indices i))
-                                        (grad-val (case dtype
-                                                    ((f32) (f32vector-ref grad-out i))
-                                                    ((f64) (f64vector-ref grad-out i)))))
-                                    (case dtype
-                                      ((f32) (f32vector-set! grad-in max-pos
-                                                             (+ (f32vector-ref grad-in max-pos)
-                                                                grad-val)))
-                                      ((f64) (f64vector-set! grad-in max-pos
-                                                             (+ (f64vector-ref grad-in max-pos)
-                                                                grad-val))))))
+                                (with-dtype
+                                 dtype
+                                 (do ((i 0 (+ i 1)))
+                                     ((= i (* C OH OW)))
+                                   (let ((max-pos (vector-ref max-indices i))
+                                         (grad-val (elt-ref grad-out i)))
+                                     (elt-set! grad-in max-pos
+                                               (+ (elt-ref grad-in max-pos)
+                                                  grad-val))))
+                                 )
                                 
                                 (add-to-grad! input grad-in)))
                             (list input)))
