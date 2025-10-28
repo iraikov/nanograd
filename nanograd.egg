@@ -16,10 +16,17 @@
 
  (synopsis "Minimalistic automatic differentiation framework.")
 
- (components (extension nanograd-autograd (source "autograd.scm") (csc-options "-O3" "-d1"))
-             (extension nanograd-layer (source "layer.scm") (csc-options "-O3" "-d1"))
-             (extension nanograd-optimizer (source "optimizer.scm") (csc-options "-O3" "-d1"))
-             (extension nanograd-diagnostics (source "gradient-diagnostics.scm") (csc-options "-O3" "-d1"))
+ (components (extension nanograd-autograd (source "autograd.scm")
+                        (csc-options "-O3" "-d1"))
+             (extension nanograd-layer (source "layer.scm")
+                        (csc-options "-O3" "-d1")
+                        (component-dependencies nanograd-autograd))
+             (extension nanograd-optimizer (source "optimizer.scm")
+                        (csc-options "-O3" "-d1")
+                        (component-dependencies nanograd-autograd))
+             (extension nanograd-diagnostics (source "gradient-diagnostics.scm")
+                        (csc-options "-O3" "-d1")
+                        (component-dependencies nanograd-autograd))
              )
 
  (test-dependencies test)
