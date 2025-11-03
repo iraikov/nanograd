@@ -437,8 +437,8 @@
                                             (* (elt-ref grad-out i)
                                                (elt-ref data-a i)))))
                     (add-to-grad! b grad-b)))))
-          (list a b))
-        result))))
+          (list a b)))
+        result)))
 
   ;; Element-wise division
   (define (div a b)
