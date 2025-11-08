@@ -10,7 +10,7 @@
        ;; Map generic operation to type-specific operation
        (define (map-operation op dtype)
          (cond
-          ((compare op 'sub)
+          ((compare op 'subvec)
            (case dtype
              ((f32) 'ssub)
              ((f64) 'dsub)
@@ -61,6 +61,11 @@
              ((f64) 'f64vector)
              (else op)))
           ((compare op 'blit)
+           (case dtype
+             ((f32) 'sblit)
+             ((f64) 'dblit)
+             (else op)))
+          ((compare op 'copy-to)
            (case dtype
              ((f32) 'sblit)
              ((f64) 'dblit)

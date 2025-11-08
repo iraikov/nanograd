@@ -33,6 +33,7 @@
    ;; Utilities
    reshape
    flatten-tensor
+   slice-tensor
    rmsnorm conv2d
    l2-normalize cosine-similarity
    make-base-tensor
@@ -40,6 +41,7 @@
    vector-length-for-dtype
    f32vector-fold
    f64vector-fold
+   dsub ssub dblit sblit
    )
   
   (import
@@ -808,7 +810,7 @@
                       ;; Copy b to grad-a, then scale by grad-scalar
                       (with-dtype
                        dtype
-                       (blit grad-a data-b)
+                       (copy-to grad-a data-b)
                        (scal! n grad-scalar grad-a))
                       (add-to-grad! a grad-a)))
                   
@@ -818,7 +820,7 @@
                       ;; Copy a to grad-b, then scale by grad-scalar
                       (with-dtype
                        dtype
-                       (blit grad-b data-a)
+                       (copy-to grad-b data-a)
                        (scal! n grad-scalar grad-b))
                       (add-to-grad! b grad-b)))))
               (list a b)))
@@ -1512,7 +1514,7 @@
                       
                                         (with-dtype dtype
                                            ;; Copy grad_out to grad_x
-                                           (blit grad-x grad-out)
+                                           (copy-to grad-x grad-out)
                                            ;; Subtract dot_prod from each element and multiply by softmax
                                            (do ((i 0 (+ i 1)))
                                                ((= i n))
@@ -1721,7 +1723,7 @@
         
         ;; Copy and scale: normalized = x / rms
         (with-dtype dtype
-           (blit normalized-data data-x)
+           (copy-to normalized-data data-x)
            (scal! n inv-rms normalized-data))
         
         ;; Element-wise multiply with weight
@@ -1768,7 +1770,7 @@
                                         
                                         ;; Compute: grad_x = (grad_normalized - normalized * mean_term) / rms
                                         (with-dtype dtype
-                                           (blit grad-x grad-normalized)
+                                           (copy-to grad-x grad-normalized)
                                            ;; Subtract: grad_x -= normalized * mean_term
                                            (axpy! n (- mean-term) normalized-data grad-x)
                                            ;; Scale: grad_x /= rms
@@ -1842,6 +1844,63 @@
     (let* ((shape (tensor-shape tensor))
            (total-size (apply * shape)))
       (reshape tensor (list total-size))))
+
+  (define (slice-tensor tensor start length)
+    "Extract a slice of a tensor along the first dimension.
+     
+     Args:
+       tensor: Input tensor with shape (n, ...)
+       start: Starting index
+       length: Number of elements to extract
+       
+     Returns:
+       Tensor with shape (length, ...)"
+    
+    (let* ((dtype (tensor-dtype tensor))
+           (shape (tensor-shape tensor))
+           (n (car shape))
+           (rest-shape (cdr shape))
+           (rest-size (apply * rest-shape)))
+      
+      (unless (and (>= start 0) (< start n))
+        (error 'sub (format #f "Start index ~A out of bounds [0, ~A)" start n)))
+      
+      (unless (and (> length 0) (<= (+ start length) n))
+        (error 'sub (format #f "Slice [~A:~A] out of bounds for dimension ~A" 
+                           start (+ start length) n)))
+      
+      (let* ((slice-size (* length rest-size))
+             (start-offset (* start rest-size))
+             (data (tensor-data tensor))
+             (slice-data (with-dtype dtype (vec slice-size 0.0)))
+             (requires-grad? (tensor-requires-grad? tensor)))
+        
+        ;; Copy slice
+        (with-dtype dtype
+                    (copy-to slice-data data Xoffset: start-offset))
+        
+        (let ((result (make-base-tensor slice-data 
+                                        (cons length rest-shape)
+                                        dtype
+                                        requires-grad?)))
+          
+          ;; Set up gradient backpropagation
+          (when requires-grad?
+            (set-backward-fn! result
+                              (lambda ()
+                (let ((grad-out (tensor-grad result))
+                      (grad-in (with-dtype dtype 
+                                           (vec (vector-length-for-dtype data dtype) 0.0))))
+                  
+                  ;; Copy gradients back to original positions
+                  (with-dtype dtype
+                              (copy-to grad-in grad-out Xoffset: start-offset))
+                  
+                  (add-to-grad! tensor grad-in)))
+                              (list tensor)))
+          
+          result))
+      ))
 
   (define (print-tensor tensor)
     (printf "Tensor(dtype=~a, shape=~a, requires_grad=~a)\n"
