@@ -5,3 +5,6 @@
 (include-relative "optimizer.scm")
 (include-relative "network.scm")
 (include-relative "serialization.scm")
+(include-relative "test-gelu-silu.scm")
+(include-relative "test-batchnorm.scm")
+(include-relative "test-tensor-slice.scm")

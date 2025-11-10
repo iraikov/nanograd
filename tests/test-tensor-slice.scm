@@ -41,10 +41,10 @@
     (if (<= diff tolerance)
         (begin
           (set! *test-passed* (+ *test-passed* 1))
-          (printf "  ✓ ~A\n" name))
+          (printf "  O ~A\n" name))
         (begin
           (set! *test-failed* (+ *test-failed* 1))
-          (printf "  ✗ ~A\n" name)
+          (printf "  X ~A\n" name)
           (printf "    Expected: ~A, Got: ~A, Diff: ~A\n" 
                   expected actual diff)))))
 
@@ -53,29 +53,29 @@
   (if condition
       (begin
         (set! *test-passed* (+ *test-passed* 1))
-        (printf "  ✓ ~A\n" name))
+        (printf "  O ~A\n" name))
       (begin
         (set! *test-failed* (+ *test-failed* 1))
-        (printf "  ✗ ~A\n" name))))
+        (printf "  X ~A\n" name))))
 
 (define (assert-shape-equal actual-shape expected-shape name)
   (set! *test-count* (+ *test-count* 1))
   (if (equal? actual-shape expected-shape)
       (begin
         (set! *test-passed* (+ *test-passed* 1))
-        (printf "  ✓ ~A\n" name))
+        (printf "  O ~A\n" name))
       (begin
         (set! *test-failed* (+ *test-failed* 1))
-        (printf "  ✗ ~A\n" name)
+        (printf "  X ~A\n" name)
         (printf "    Expected shape: ~A, Got: ~A\n" 
                 expected-shape actual-shape))))
 
 ;;; ==================================================================
-;;; Test 1: Basic Slicing - Shape and Data
+;;; Basic Slicing - Shape and Data
 ;;; ==================================================================
 
 (define (test-basic-slicing)
-  (printf "\n=== Test 1: Basic Slicing ===\n")
+  (printf "\n=== Basic Slicing ===\n")
   
   ;; Create a simple 1D-like tensor (3, 1)
   (define input (make-tensor32 
@@ -110,11 +110,11 @@
                "Slice [2:3] second element is 6.0"))
 
 ;;; ==================================================================
-;;; Test 2: Multi-row Slicing
+;;; Multi-row Slicing
 ;;; ==================================================================
 
 (define (test-multirow-slicing)
-  (printf "\n=== Test 2: Multi-row Slicing ===\n")
+  (printf "\n=== Multi-row Slicing ===\n")
   
   (define input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0)
@@ -152,11 +152,11 @@
                "Slice [2:4] element [1,1] is 8.0"))
 
 ;;; ==================================================================
-;;; Test 3: Gradient Flow - Simple Case
+;;; Gradient Flow - Simple Case
 ;;; ==================================================================
 
 (define (test-simple-gradient)
-  (printf "\n=== Test 3: Simple Gradient Flow ===\n")
+  (printf "\n=== Simple Gradient Flow ===\n")
   
   ;; Create input with gradient tracking
   (define input (make-tensor32
@@ -194,11 +194,11 @@
                  "Gradient at position [2,1] is 0 (not sliced)")))
 
 ;;; ==================================================================
-;;; Test 4: Gradient Accumulation
+;;; Gradient Accumulation
 ;;; ==================================================================
 
 (define (test-gradient-accumulation)
-  (printf "\n=== Test 4: Gradient Accumulation ===\n")
+  (printf "\n=== Gradient Accumulation ===\n")
   
   ;; Create input
   (define input (make-tensor32
@@ -241,11 +241,11 @@
                  "Gradient at [2,1] from second slice")))
 
 ;;; ==================================================================
-;;; Test 5: Multiple Operations on Slice
+;;; Multiple Operations on Slice
 ;;; ==================================================================
 
 (define (test-operations-on-slice)
-  (printf "\n=== Test 5: Operations on Slices ===\n")
+  (printf "\n=== Operations on Slices ===\n")
   
   (define input (make-tensor32
                  (f32vector 2.0 4.0 6.0 8.0 10.0 12.0)
@@ -300,11 +300,11 @@
                  "Row 2 not affected")))
 
 ;;; ==================================================================
-;;; Test 6: 3D Tensor Slicing
+;;; 3D Tensor Slicing
 ;;; ==================================================================
 
 (define (test-3d-slicing)
-  (printf "\n=== Test 6: 3D Tensor Slicing ===\n")
+  (printf "\n=== 3D Tensor Slicing ===\n")
   
   ;; Create 3D tensor (channels, height, width) like (2, 2, 2)
   (define input (make-tensor32
@@ -350,11 +350,11 @@
                  "Channel 1 has zero gradient")))
 
 ;;; ==================================================================
-;;; Test 7: Edge Cases
+;;; Edge Cases
 ;;; ==================================================================
 
 (define (test-edge-cases)
-  (printf "\n=== Test 7: Edge Cases ===\n")
+  (printf "\n=== Edge Cases ===\n")
   
   ;; Test slicing entire tensor
   (define input (make-tensor32
@@ -380,11 +380,11 @@
                "Last row slice correct"))
 
 ;;; ==================================================================
-;;; Test 8: Chain of Slices
+;;; Chain of Slices
 ;;; ==================================================================
 
 (define (test-chain-slices)
-  (printf "\n=== Test 8: Chain of Slices ===\n")
+  (printf "\n=== Chain of Slices ===\n")
   
   (define input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0)
@@ -408,8 +408,8 @@
   (assert-equal (f32vector-ref (tensor-data sum1) 1) 6.0 1e-6
                "Sum [1] = 2.0 + 4.0 = 6.0")
   
-  (let ((target (make-tensor32 (f32vector 10.0 20.0) '(2)))
-        (loss (mse-loss sum1 target)))
+  (let* ((target (make-tensor32 (f32vector 10.0 20.0) '(2)))
+         (loss (mse-loss sum1 target)))
     (backward! loss)
     
     ;; Check gradients flow to both source rows
@@ -421,13 +421,13 @@
                   "Row 1 has gradient from sum"))))
 
 ;;; ==================================================================
-;;; Test 9: Numerical Gradient Check
+;;; Numerical Gradient Check
 ;;; ==================================================================
 
 (define (test-numerical-gradient)
-  (printf "\n=== Test 9: Numerical Gradient Check ===\n")
+  (printf "\n=== Numerical Gradient Check ===\n")
   
-  (define epsilon 1e-4)
+  (define epsilon 1e-3)
   
   (define input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0 5.0 6.0)
@@ -438,13 +438,9 @@
   (define (compute-loss x)
     (let* ((slice (slice-tensor x 1 1))
            (slice-flat (reshape slice '(2)))
-           (squared (mul slice-flat slice-flat))
-           (sum-squared (add (scale-op squared 1.0)
-                           (make-tensor32 (f32vector 0.0) '(1)))))
+           (squared (mul slice-flat slice-flat)))
       ;; Sum elements
-      (let ((s (+ (f32vector-ref (tensor-data squared) 0)
-                  (f32vector-ref (tensor-data squared) 1))))
-        (make-tensor32 (f32vector s) '(1)))))
+      (sum-tensor squared)))
   
   ;; Compute analytical gradient
   (let ((loss (compute-loss input)))
@@ -456,27 +452,27 @@
         (do ((i 0 (+ i 1)))
             ((= i 6))
           (let ((input-plus (make-tensor32
-                            (f32vector-copy (tensor-data input))
-                            '(3 2)))
+                             (scopy (tensor-data input))
+                             '(3 2)))
                 (input-minus (make-tensor32
-                             (f32vector-copy (tensor-data input))
-                             '(3 2))))
+                              (scopy (tensor-data input))
+                              '(3 2))))
             
             ;; Perturb +epsilon
             (f32vector-set! (tensor-data input-plus) i
-                           (+ (f32vector-ref (tensor-data input) i) epsilon))
+                            (+ (f32vector-ref (tensor-data input) i) epsilon))
             
             ;; Perturb -epsilon
             (f32vector-set! (tensor-data input-minus) i
-                           (- (f32vector-ref (tensor-data input) i) epsilon))
+                            (- (f32vector-ref (tensor-data input) i) epsilon))
             
             ;; Compute numerical gradient
             (let ((loss-plus (f32vector-ref 
-                             (tensor-data (compute-loss input-plus)) 0))
+                              (tensor-data (compute-loss input-plus)) 0))
                   (loss-minus (f32vector-ref
-                              (tensor-data (compute-loss input-minus)) 0)))
+                               (tensor-data (compute-loss input-minus)) 0)))
               (f32vector-set! numerical-grad i
-                            (/ (- loss-plus loss-minus) (* 2.0 epsilon))))))
+                              (/ (- loss-plus loss-minus) (* 2.0 epsilon))))))
         
         ;; Compare analytical vs numerical
         (do ((i 0 (+ i 1)))

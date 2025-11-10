@@ -144,8 +144,8 @@
       
       ;; Initial loss should be high
       (let ((initial-loss (compute-loss model x target)))
-        (assert-equal initial-loss 9.0 1e-5
-                      "Initial loss = (0-3)^2 = 9.0")
+        (assert-equal initial-loss 4.5 1e-5
+                      "Initial loss = 1/2*(0-3)^2 = 4.5")
         
         ;; Train for several steps
         (let loop ((step 0) (losses '()))

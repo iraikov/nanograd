@@ -328,10 +328,10 @@
   (let* ((pred (make-tensor32 (f32vector 1.0 2.0) '(2)))
          (target (make-tensor32 (f32vector 0.0 0.0) '(2)))
          (loss (mse-loss pred target))
-         ;; MSE = (1² + 2²)/2 = 5/2 = 2.5
-         (expected 2.5))
+         ;; MSE = 1/2*(1^2 + 2^2)/2 = 5/4 = 1.25
+         (expected 1.25))
     (assert-equal (f32vector-ref (tensor-data loss) 0) expected 1e-5
-                  "MSE loss = 2.5")))
+                  "MSE loss = 1.25")))
 
 ;;; ==================================================================
 ;;; Unit Tests: Advanced Operations

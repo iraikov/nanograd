@@ -13,7 +13,16 @@
    forward parameters zero-grad-layer!
    layer-input-size layer-output-size
    layer-activation layer-name layer-norm
+   set-training-mode!
+   set-eval-mode!
    
+   ;; Batch Normalization
+   make-batch-norm-2d
+   batch-norm-2d?
+   
+   ;; Global Average Pooling
+   global-avg-pool2d
+
    ;; Serialization operations
    layer->serializable serializable->layer
    save-layer load-layer
@@ -24,7 +33,6 @@
    make-gelu make-silu
    activation? activation-name activation-forward
 
-   
    ;; Network utilities
    print-layer summary
    )
@@ -110,6 +118,9 @@
   (define-operation (layer-output-size layer))
   (define-operation (layer-activation layer))
   (define-operation (layer-name layer))
+
+  (define-operation (set-training-mode! layer training?))
+  (define-operation (set-eval-mode! layer))
 
   ;; operations for layer serialization
   (define-operation (save-layer layer filepath))
@@ -471,6 +482,12 @@
        ((zero-grad-layer! self)
         (zero-grad! weights)
         (zero-grad! biases))
+       
+       ((set-training-mode! self train?)
+        (begin))
+       
+       ((set-eval-mode! self)
+        (begin))
 
        ((layer->serializable self)
         `((type . dense-layer)
@@ -660,6 +677,12 @@
       (zero-grad! weights)
       (zero-grad! biases))
 
+     ((set-training-mode! self train?)
+      (begin))
+     
+     ((set-eval-mode! self)
+      (begin))
+
      ((layer->serializable self)
       `((type . conv2d-layer)
         (name . ,name)
@@ -770,6 +793,242 @@
         result)))
 
 
+
+  ;;; ==================================================================
+  ;;; Batch Normalization 2D
+  ;;; ==================================================================
+  
+  (define-predicate batch-norm-2d?)
+  
+  (define (make-batch-norm-2d num-features 
+                             #!key 
+                             (epsilon 1e-5)
+                             (momentum 0.1)
+                             (dtype 'f32)
+                             (name "BatchNorm2d"))
+    "Batch Normalization for 2D convolutions.
+     
+     Normalizes activations across batch dimension:
+     y = gamma * (x - mu) / sqrt(sigma^2 + epsilon) + beta
+     
+     Args:
+       num-features: Number of channels (C)
+       epsilon: Small constant for numerical stability
+       momentum: Momentum for running statistics
+       dtype: Data type
+       
+     Input shape: (C, H, W) or (N, C, H, W)
+     Output shape: Same as input"
+    
+    (let* (;; Learnable parameters
+           (gamma (case dtype
+                   ((f32) (make-tensor32 (make-f32vector num-features 1.0)
+                                        (list num-features)))
+                   ((f64) (make-tensor64 (make-f64vector num-features 1.0)
+                                        (list num-features)))))
+           (beta (case dtype
+                  ((f32) (make-tensor32 (make-f32vector num-features 0.0)
+                                       (list num-features)))
+                  ((f64) (make-tensor64 (make-f64vector num-features 0.0)
+                                       (list num-features)))))
+           
+           ;; Running statistics (not trainable)
+           (running-mean (with-dtype dtype (vec num-features 0.0)))
+           (running-var (with-dtype dtype (vec num-features 1.0)))
+           
+           ;; Training mode flag
+           (training? #t))
+      
+      (object
+       ((layer? self) #t)
+       ((batch-norm-2d? self) #t)
+       ((layer-name self) name)
+       
+       ;; Mode control
+       ((set-training-mode! self train?)
+        (set! training? train?))
+       
+       ((set-eval-mode! self)
+        (set! training? #f))
+       
+       ((forward self input)
+        "Forward pass through batch normalization.
+         
+         During training: Uses batch statistics
+         During eval: Uses running statistics"
+        
+        (let* ((input-shape (tensor-shape input))
+               (C num-features)
+               (H (if (= (length input-shape) 3)
+                      (cadr input-shape)
+                      (caddr input-shape)))
+               (W (if (= (length input-shape) 3)
+                      (caddr input-shape)
+                      (cadddr input-shape)))
+               (spatial-size (* H W))
+               (input-data (tensor-data input)))
+          
+          (if training?
+              ;; Training mode: compute batch statistics
+              (let ((means (with-dtype dtype (vec C 0.0)))
+                    (vars (with-dtype dtype (vec C 0.0))))
+
+                ;; Compute mean for each channel
+                (with-dtype dtype
+                            (do ((c 0 (+ c 1)))
+                                ((= c C))
+                              (let ((sum (let loop ((sum 0.0) (i 0))
+                                           (if (= i spatial-size)
+                                               sum
+                                               (loop (let ((idx (+ (* c spatial-size) i)))
+                                                       (+ sum (elt-ref input-data idx)))
+                                                     (+ i 1)))
+                                           )))
+                                (elt-set! means c (/ sum spatial-size)))
+                              ))
+                
+                ;; Compute variance for each channel
+                (with-dtype dtype
+                            (do ((c 0 (+ c 1)))
+                                ((= c C))
+                              (let* ((mean (elt-ref means c))
+                                     (sum-sq (let loop ((sum-sq 0.0) (i 0))
+                                               (if (= i spatial-size)
+                                                   sum-sq
+                                                   (loop (let* ((idx (+ (* c spatial-size) i))
+                                                                (val (elt-ref input-data idx))
+                                                                (diff (- val mean)))
+                                                           (+ sum-sq (* diff diff)))
+                                                         (+ i 1)))
+                                               )))
+                                (elt-set! vars c (/ sum-sq spatial-size)))
+                              ))
+                
+                ;; Update running statistics
+                (do ((c 0 (+ c 1)))
+                    ((= c C))
+                  (with-dtype dtype
+                    (let ((new-mean (elt-ref means c))
+                          (new-var (elt-ref vars c))
+                          (old-mean (elt-ref running-mean c))
+                          (old-var (elt-ref running-var c)))
+                      (elt-set! running-mean c
+                               (+ (* (- 1.0 momentum) old-mean)
+                                  (* momentum new-mean)))
+                      (elt-set! running-var c
+                               (+ (* (- 1.0 momentum) old-var)
+                                  (* momentum new-var))))))
+                
+                ;; Normalize using batch statistics
+                (let ((normalized-data (with-dtype dtype (vec (* C spatial-size) 0.0))))
+                  (do ((c 0 (+ c 1)))
+                      ((= c C))
+                    (let ((mean (with-dtype dtype (elt-ref means c)))
+                          (var (with-dtype dtype (elt-ref vars c)))
+                          (gamma-val (with-dtype dtype 
+                                       (elt-ref (tensor-data gamma) c)))
+                          (beta-val (with-dtype dtype
+                                      (elt-ref (tensor-data beta) c))))
+                      (let ((std (sqrt (+ var epsilon))))
+                        (do ((i 0 (+ i 1)))
+                            ((= i spatial-size))
+                          (let ((idx (+ (* c spatial-size) i)))
+                            (with-dtype dtype
+                              (let ((normalized (/ (- (elt-ref input-data idx) mean)
+                                                  std)))
+                                (elt-set! normalized-data idx
+                                         (+ (* gamma-val normalized) beta-val)))))))))
+                  
+                  (make-base-tensor normalized-data input-shape dtype
+                                   (tensor-requires-grad? input))))
+              
+              ;; Eval mode: use running statistics
+              (let ((normalized-data (with-dtype dtype (vec (* C spatial-size) 0.0))))
+                (with-dtype dtype
+                            (do ((c 0 (+ c 1)))
+                                ((= c C))
+                              (let ((mean (elt-ref running-mean c))
+                                    (var (elt-ref running-var c))
+                                    (gamma-val (elt-ref (tensor-data gamma) c))
+                                    (beta-val (elt-ref (tensor-data beta) c)))
+                                (let ((std (sqrt (+ var epsilon))))
+                                  (do ((i 0 (+ i 1)))
+                                      ((= i spatial-size))
+                                    (let ((idx (+ (* c spatial-size) i)))
+                                      (let ((normalized (/ (- (elt-ref input-data idx) mean)
+                                                           std)))
+                                        (elt-set! normalized-data idx
+                                                  (+ (* gamma-val normalized) beta-val))))
+                                    ))
+                                ))
+                            )
+                
+                (make-base-tensor normalized-data input-shape dtype #f)))))
+       
+       ((parameters self)
+        (list gamma beta))
+       
+       ((zero-grad-layer! self)
+        (zero-grad! gamma)
+        (zero-grad! beta)))))
+
+  ;;; ==================================================================
+  ;;; Global Average Pooling
+  ;;; ==================================================================
+  
+  (define (global-avg-pool2d input)
+    "Global average pooling over spatial dimensions.
+     
+     Input shape: (C, H, W)
+     Output shape: (C,)"
+    
+    (let* ((dtype (tensor-dtype input))
+           (shape (tensor-shape input))
+           (C (car shape))
+           (H (cadr shape))
+           (W (caddr shape))
+           (spatial-size (* H W))
+           (data (tensor-data input))
+           (output-data (with-dtype dtype (vec C 0.0))))
+      
+      ;; Average over spatial dimensions for each channel
+      (with-dtype dtype
+                  (do ((c 0 (+ c 1)))
+                      ((= c C))
+                    (let ((sum
+                           (let loop ((sum 0.0) (i 0))
+                             (if (< i spatial-size)
+                                 (let ((idx (+ (* c spatial-size) i)))
+                                   (loop (+ sum (elt-ref data idx))
+                                         (+ i 1)))
+                                 sum))))
+                      (elt-set! output-data c (/ sum spatial-size)))))
+      
+      (let ((result (make-base-tensor output-data (list C) dtype
+                                      (tensor-requires-grad? input))))
+        
+        ;; Backward pass
+        (when (tensor-requires-grad? input)
+          (set-backward-fn! result
+            (lambda ()
+              (let ((grad-out (tensor-grad result))
+                    (grad-in (with-dtype dtype (vec (* C H W) 0.0))))
+                
+                ;; Distribute gradient equally over spatial dimensions
+                (with-dtype dtype
+                            (do ((c 0 (+ c 1)))
+                                ((= c C))
+                              (let* ((grad-val (elt-ref grad-out c))
+                                     (grad-per-pixel (/ grad-val spatial-size)))
+                                (do ((i 0 (+ i 1)))
+                                    ((= i spatial-size))
+                                  (let ((idx (+ (* c spatial-size) i)))
+                                    (elt-set! grad-in idx grad-per-pixel))))))
+                
+                (add-to-grad! input grad-in)))
+            (list input)))
+        
+        result)))
   
   ;;; ==================================================================
   ;;; Utilities

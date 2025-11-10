@@ -29,6 +29,12 @@
    
    ;; Loss functions
    mse-loss cross-entropy-loss
+
+   ;; Reduction operators
+   reduce-tensor
+   sum-tensor
+   product-tensor
+   mean-tensor
    
    ;; Utilities
    reshape
@@ -37,11 +43,14 @@
    rmsnorm conv2d
    l2-normalize cosine-similarity
    make-base-tensor
+   compensated-sum
    tensor->list print-tensor
    vector-length-for-dtype
    f32vector-fold
    f64vector-fold
-   dsub ssub dblit sblit
+   dsub ssub
+   dblit sblit
+   dcopy scopy
    )
   
   (import
@@ -1620,11 +1629,13 @@
            (data-target (tensor-data target))
            (n (vector-length-for-dtype data-pred dtype))
            (requires-grad? (tensor-requires-grad? pred))
-           ;; Forward: L = (1/n) * \sum(pred - target)^2
+           ;; Forward: L = 0.5 * (1/n) * \sum(pred - target)^2
            (loss-value
              (with-dtype dtype
                          (let loop ((i 0) (sum 0.0))
-                           (if (= i n) (/ sum (exact->inexact n))
+                           (if (= i n)
+                               ;; Multiply by 0.5 for cleaner gradients
+                               (* 0.5 (/ sum (exact->inexact n)))
                                (let ((diff (- (elt-ref data-pred i)
                                               (elt-ref data-target i))))
                                  (loop (+ i 1)
@@ -1638,16 +1649,17 @@
         (when requires-grad?
           (set-backward-fn! loss-tensor
             (lambda ()
-              ;; Gradient: dL/d pred_i = (2/n) * (pred_i - target_i)
+              ;; Gradient: dL/d pred_i = (1/n) * (pred_i - target_i)
+              ;; The 0.5 coefficient in forward pass cancels the factor of 2 from d/dx[x^2]
               (let ((grad-pred (with-dtype dtype (vec n 0.0)))
-                    (scale-factor (/ 2.0 (exact->inexact n))))
+                    (scale-factor (/ 1.0 (exact->inexact n))))
                 (with-dtype dtype
                    (do ((i 0 (+ i 1)))
                        ((= i n))
                      (elt-set! grad-pred i
-                                    (* scale-factor
-                                       (- (elt-ref data-pred i)
-                                          (elt-ref data-target i))))))
+                               (* scale-factor
+                                  (- (elt-ref data-pred i)
+                                     (elt-ref data-target i))))))
 
                 (add-to-grad! pred grad-pred)))
             (list pred)
@@ -1693,7 +1705,115 @@
             (list pred)))
         loss-tensor)))
 
+
+;;; ==================================================================
+;;; Reduction Operations (Gradient-Aware Fold)
+;;; ==================================================================
+
+  (define (reduce-tensor tensor reducer #!key (compute-gradient #f))
+    "Generic reduction operation that maintains gradient flow.
+   
+     Args:
+     tensor: Input tensor to reduce
+     reducer: Function (element accumulator) -> new-accumulator
+              Applied to each element in forward pass
+     compute-gradient: Optional function (grad-out index value all-values) -> grad-in
+                       Computes gradient for element at index
+                       If not provided, assumes uniform distribution (like sum)
+   
+     Returns:
+     Scalar tensor with reduced value
+   
+     Example:
+     (reduce-tensor x +)                     ; Sum
+     (reduce-tensor x *)                     ; Product  
+     (reduce-tensor x + compute-gradient: ...) ; Custom gradient"
   
+    (let* ((dtype (tensor-dtype tensor))
+           (data (tensor-data tensor))
+           (n (vector-length-for-dtype data dtype))
+           (requires-grad? (tensor-requires-grad? tensor)))
+      
+      ;; Forward pass: apply reducer
+      (let ((result-val 
+             (with-dtype dtype
+                         (let loop ((i 1) (acc (elt-ref data 0)))
+                           (if (= i n) acc
+                               (loop (+ i 1) 
+                                     (reducer (elt-ref data i) acc)))))))
+        
+        (let* ((result-data (with-dtype dtype (vec0 result-val)))
+               (result (make-base-tensor result-data '(1) dtype requires-grad?)))
+          
+          (when requires-grad?
+            (set-backward-fn!
+             result
+             (lambda ()
+               (let* ((grad-out (tensor-grad result))
+                      (grad-scalar (with-dtype dtype (elt-ref grad-out 0)))
+                      (grad-in (with-dtype dtype (vec n 0.0))))
+                 
+                 (if compute-gradient
+                     ;; Custom gradient distribution
+                     (let ((all-values (with-dtype
+                                        dtype
+                                        (let loop ((i 0) (acc '()))
+                                          (if (= i n) (reverse acc)
+                                              (loop (+ i 1) 
+                                                    (cons (elt-ref data i) acc)))))))
+                       (with-dtype dtype
+                                   (do ((i 0 (+ i 1)))
+                                       ((= i n))
+                                     (let ((grad-contrib 
+                                            (compute-gradient grad-scalar i 
+                                                              (elt-ref data i) 
+                                                              all-values)))
+                                       (elt-set! grad-in i grad-contrib)))))
+                     
+                     ;; Default: uniform distribution (sum-like)
+                     (with-dtype dtype
+                                 (do ((i 0 (+ i 1)))
+                                     ((= i n))
+                                   (elt-set! grad-in i grad-scalar))))
+                 
+                 (add-to-grad! tensor grad-in)))
+             (list tensor)))
+          
+          result))
+      ))
+
+
+;;; Specialized reductions with proper gradients
+
+  (define (sum-tensor tensor)
+    "Sum all elements in tensor (gradient: uniform distribution)"
+    (reduce-tensor tensor +))
+
+  (define (mean-tensor tensor)
+    "Mean of all elements in tensor"
+    (let* ((dtype (tensor-dtype tensor))
+           (data (tensor-data tensor))
+           (n (vector-length-for-dtype data dtype))
+           (sum (reduce-tensor tensor +)))
+      ;; mean = sum / n
+      (scale-op sum (/ 1.0 (exact->inexact n)))))
+  
+  (define (product-tensor tensor)
+    "Product of all elements (gradient uses product rule)"
+    (reduce-tensor tensor *
+                   compute-gradient:
+                   (lambda (grad-scalar idx val all-values)
+                     ;; d(prod)/dx_i = prod / x_i
+                     ;; grad_i = grad_out * (prod / x_i)
+                     (let ((prod (fold * 1.0 all-values)))
+                       (if (> val 0.0) ;; Avoid division by zero
+                           (* grad-scalar (/ prod val)) 
+                           0.0))
+                     ))
+    )
+
+
+
   ;;; ==================================================================
   ;;; Utilities
   ;;; ==================================================================
@@ -1876,8 +1996,7 @@
              (requires-grad? (tensor-requires-grad? tensor)))
         
         ;; Copy slice
-        (with-dtype dtype
-                    (copy-to slice-data data Xoffset: start-offset))
+        (with-dtype dtype (copy-to slice-data data Xoffset: start-offset size: slice-size))
         
         (let ((result (make-base-tensor slice-data 
                                         (cons length rest-shape)
@@ -1894,7 +2013,8 @@
                   
                   ;; Copy gradients back to original positions
                   (with-dtype dtype
-                              (copy-to grad-in grad-out Xoffset: start-offset))
+                              (copy-to grad-in grad-out Yoffset: start-offset
+                                       size: slice-size))
                   
                   (add-to-grad! tensor grad-in)))
                               (list tensor)))
