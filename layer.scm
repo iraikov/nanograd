@@ -22,7 +22,8 @@
    
    ;; Global Average Pooling
    global-avg-pool2d
-
+   maxpool2d
+   
    ;; Serialization operations
    layer->serializable serializable->layer
    save-layer load-layer
@@ -418,72 +419,133 @@
   ;;; Dense (Fully Connected) Layer
   ;;; ==================================================================
 
-  (define (make-dense-layer input-size output-size 
-                           #!key 
-                           (activation (make-identity))
-                           (dtype 'f32)
-                           (name "Dense"))
-    (let* ((weight-size (* input-size output-size))
-           ;; Xavier/Glorot initialization
-           (init-scale (sqrt (/ 2.0 (+ input-size output-size))))
-           
-           ;; Initialize weights with small random values
-           (weight-data (with-dtype dtype
-                          (let ((w (vec weight-size 0.0)))
-                            (do ((i 0 (+ i 1)))
-                                ((= i weight-size) w)
-                              (elt-set! w i
-                                        (* init-scale
-                                           (- (pseudo-random-real) 0.5)))))))
-           
-           ;; Initialize biases to zero
-           (bias-data (with-dtype dtype (vec output-size 0.0)))
-           
-           ;; Create parameter tensors
-           (weights (case dtype
-                     ((f32) (make-tensor32 weight-data (list output-size input-size)))
-                     ((f64) (make-tensor64 weight-data (list output-size input-size)))))
-           
-           (biases (case dtype
-                    ((f32) (make-tensor32 bias-data (list output-size)))
-                    ((f64) (make-tensor64 bias-data (list output-size))))))
-      
+  ;; Efficient dense layer that handles both 1D and 2D inputs
+  ;; Uses BLAS GEMM for batch operations
+
+  (define (make-dense-layer input-dim output-dim 
+                            #!key 
+                            (activation (make-identity))
+                            (use-bias #t)
+                            (dtype 'f32)
+                            (name "Dense"))
+    "Dense layer supporting both single vectors and batches.
+   
+     Input shapes:
+     1D: (input_dim,) -> output: (output_dim,)
+     2D: (batch_size, input_dim) -> output: (batch_size, output_dim)"
+
+  
+    (let* ((weight-data (with-dtype dtype
+                                    (let ((w (vec (* output-dim input-dim) 0.0)))
+                                      ;; Initialize with small random values
+                                      (do ((i 0 (+ i 1)))
+                                          ((= i (* output-dim input-dim)) w)
+                                        (elt-set! w i 
+                                                  (* (sqrt (/ 2.0 input-dim))
+                                                     (- (pseudo-random-real) 0.5)))))))
+           (weight (case dtype
+                     ((f32) (make-tensor32 weight-data (list output-dim input-dim)))
+                     ((f64) (make-tensor64 weight-data (list output-dim input-dim)))))
+         
+           (bias (if use-bias
+                     (case dtype
+                       ((f32) (make-tensor32 (make-f32vector output-dim 0.0)
+                                             (list output-dim)))
+                       ((f64) (make-tensor64 (make-f64vector output-dim 0.0)
+                                             (list output-dim))))
+                     #f)))
+    
       (object
-       ;; Type predicates
-       ((layer? self) #t)
-       ((dense-layer? self) #t)
        
-       ;; Layer info
+       ((layer? self) #t)
        ((layer-name self) name)
-       ((layer-input-size self) input-size)
-       ((layer-output-size self) output-size)
+       ((dense-layer? self) #t)
+
+       ((layer-input-size self) input-dim)   ; Returns feature dimension
+       ((layer-output-size self) output-dim) ; Returns feature dimension
        ((layer-activation self) activation)
        
-       ;; Forward pass
        ((forward self input)
-        ;; Check input size
-        (let ((input-shape (tensor-shape input)))
-          (unless (= (car input-shape) input-size)
-            (error 'forward 
-                   (format #f "Input size mismatch: expected ~A, got ~A"
-                           input-size (car input-shape)))))
+        (let* ((input-shape (tensor-shape input))
+               (ndim (length input-shape)))
+          
+          (cond
+           ;; Case 1: 1D input (single vector)
+           ((= ndim 1)
+            (let ((in-dim (car input-shape)))
+              (unless (= in-dim input-dim)
+                (error 'forward 
+                       (format #f "Input size mismatch: expected ~A, got ~A"
+                               input-dim in-dim)))
+              
+              ;; Standard matrix-vector multiplication
+              (let ((output (matmul-op weight input)))
+                (if bias
+                    (activation-forward activation (add output bias))
+                    (activation-forward activation output)))))
+           
+           ;; Case 2: 2D input (batch of vectors)
+           ((= ndim 2)
+            (let ((batch-size (car input-shape))
+                  (in-dim (cadr input-shape)))
+              (unless (= in-dim input-dim)
+                (error 'forward
+                       (format #f "Input size mismatch: expected ~A, got ~A"
+                               input-dim in-dim)))
+              
+              ;; Batch matrix multiplication using GEMM
+              ;; W @ X^T where W is (output_dim, input_dim) and X is (batch_size, input_dim)
+              (let ((output-data (with-dtype dtype 
+                                             (vec (* batch-size output-dim) 0.0))))
+                
+                (with-dtype dtype
+                            ;; GEMM: C = alpha * A * B + beta * C
+                            ;; We want: output = W @ X^T
+                            ;; In row-major: output[i,j] = sum_k W[i,k] * X^T[k,j] = sum_k W[i,k] * X[j,k]
+                            (gemm! RowMajor NoTrans Trans
+                                   output-dim batch-size input-dim
+                                   1.0 (tensor-data weight) (tensor-data input)
+                                   0.0 output-data
+                                   lda: input-dim
+                                   ldb: input-dim
+                                   ldc: batch-size))
+              
+                (let ((output (make-base-tensor output-data 
+                                                (list batch-size output-dim)
+                                                dtype #t)))
+                
+                  ;; Add bias if present (broadcast across batch)
+                  (let ((output-with-bias
+                         (if bias
+                             (let ((bias-data (tensor-data bias)))
+                               ;; Add bias to each row
+                               (with-dtype dtype
+                                           (do ((i 0 (+ i 1)))
+                                               ((= i batch-size))
+                                             (let ((row-offset (* i output-dim)))
+                                               (axpy! output-dim 1.0 bias-data
+                                                      output-data offset-y: row-offset))))
+                               output)
+                             output)))
+                    
+                    ;; Apply activation
+                    (activation-forward activation output-with-bias))))))
+            
+            (else
+             (error 'forward 
+                    (format #f "Dense layer only supports 1D or 2D inputs, got ~AD"
+                            ndim))))))
+     
+        ((parameters self)
+         (if bias
+             (list weight bias)
+             (list weight)))
         
-        ;; Linear transformation: output = W @ input + b
-        (let* ((linear-output (matmul-op weights input))
-               (output-with-bias (add linear-output biases)))
-          ;; Apply activation function
-          (activation-forward activation output-with-bias)))
-       
-       ;; Get all parameters (for optimizer)
-       ((parameters self)
-        (list weights biases))
-       
-       ;; Zero gradients
-       ((zero-grad-layer! self)
-        (zero-grad! weights)
-        (zero-grad! biases))
-       
-       ((set-training-mode! self train?)
+        ((zero-grad-layer! self)
+         (zero-grad! weight)
+         (when bias (zero-grad! bias)))
+
+        ((set-training-mode! self train?)
         (begin))
        
        ((set-eval-mode! self)
@@ -492,16 +554,15 @@
        ((layer->serializable self)
         `((type . dense-layer)
           (name . ,name)
-          (input-size . ,input-size)
-          (output-size . ,output-size)
+          (input-size . ,input-dim)
+          (output-size . ,output-dim)
           (dtype . ,dtype)
-          (weights . ,(tensor->serializable weights))
-          (biases . ,(tensor->serializable biases))
+          (weights . ,(tensor->serializable weight))
+          (biases . ,(if use-bias (tensor->serializable bias) #f))
           (activation . ,(activation->serializable activation))))
        
        ((save-layer self filepath)
         (save-layer-to-file self filepath))
-
        ))
     )
 

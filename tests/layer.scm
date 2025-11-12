@@ -7,6 +7,7 @@
         (srfi 1)
         (srfi 4)
         blas
+        yasos
         nanograd-autograd
         nanograd-layer)
 
@@ -192,6 +193,35 @@
                    "Weight gradients computed")
       (assert-true (not (equal? (tensor-grad (cadr params)) #f))
                    "Bias gradients computed"))))
+
+(define (test-dense-layer-dimensions)
+  (printf "\n=== Testing Dense Layer Dimensions ===\n")
+  
+  (let ((dense (make-dense-layer 512 256 dtype: 'f32)))
+    
+    ;; Test dimension queries
+    (assert-equal (layer-input-size dense) 512 1e-5
+                 "layer-input-size returns feature dimension")
+    
+    (assert-equal (layer-output-size dense) 256 1e-5
+                 "layer-output-size returns feature dimension")
+    
+    ;; Test with 1D input
+    (let* ((input-1d (make-tensor32 (make-f32vector 512 1.0) '(512)))
+           (output-1d (forward dense input-1d)))
+      (assert-shape-equal output-1d '(256)
+                         "1D output shape matches layer-output-size"))
+    
+    ;; Test with 2D input (batch)
+    (let* ((input-2d (make-tensor32 (make-f32vector (* 128 512) 1.0) '(128 512)))
+           (output-2d (forward dense input-2d)))
+      (assert-shape-equal output-2d '(128 256)
+                         "2D output has batch dimension preserved")
+      
+      ;; Verify output feature dimension matches layer-output-size
+      (assert-equal (cadr (tensor-shape output-2d)) 
+                    (layer-output-size dense) 1e-5
+                    "2D output feature dim matches layer-output-size"))))
 
 ;;; ==================================================================
 ;;; Unit Tests: Sequential Container
@@ -453,6 +483,7 @@
   (test-dense-layer-construction)
   (test-dense-layer-forward)
   (test-dense-layer-gradient)
+  (test-dense-layer-dimensions)
   (test-sequential)
   (test-conv2d-layer-construction)
   (test-conv2d-layer-forward)

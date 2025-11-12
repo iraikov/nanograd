@@ -19,7 +19,7 @@
  (components (extension nanograd-autograd (source "autograd.scm")
                         (csc-options "-O3" "-d1"))
              (extension nanograd-layer (source "layer.scm")
-                        (csc-options "-O3" "-d1")
+                        (csc-options "-O0" "-d2")
                         (component-dependencies nanograd-autograd))
              (extension nanograd-optimizer (source "optimizer.scm")
                         (csc-options "-O3" "-d1")

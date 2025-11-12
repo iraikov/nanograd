@@ -38,6 +38,7 @@
    
    ;; Utilities
    reshape
+   transpose-tensor
    flatten-tensor
    slice-tensor
    rmsnorm conv2d
@@ -91,7 +92,6 @@
   (define-operation (reshape tensor new-shape))
   (define-operation (transpose-tensor tensor axes))
   (define-operation (get-strides tensor))
-
   
   (define-operation (set-grad! obj grad))
   (define-operation (set-backward-fn! obj fn input-tensors))
