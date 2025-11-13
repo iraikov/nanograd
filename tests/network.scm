@@ -114,7 +114,7 @@
   )
 
 ;;; ==================================================================
-;;; Test 1: Linear Regression with SGD
+;;; Linear Regression with SGD
 ;;; ==================================================================
 
 (define (test-linear-regression-sgd)
@@ -185,7 +185,7 @@
                       "Prediction for x=3 is near 11.0"))))
 
 ;;; ==================================================================
-;;; Test 2: Linear Regression Optimizer Comparison
+;;; Linear Regression Optimizer Comparison
 ;;; ==================================================================
 
 (define (test-optimizer-comparison)
@@ -255,7 +255,7 @@
                  (cons 0.0 0.1)))
 
 ;;; ==================================================================
-;;; Test 3: Binary Classification
+;;; Binary Classification
 ;;; ==================================================================
 
 (define (test-binary-classification)
@@ -331,7 +331,7 @@
       (printf "    Final accuracy: ~A%\n" accuracy))))
 
 ;;; ==================================================================
-;;; Test 4: Multi-class Classification (XOR-like)
+;;; Multi-class Classification (XOR-like)
 ;;; ==================================================================
 
 (define (test-multiclass-classification)
@@ -413,7 +413,7 @@
       (printf "    Final accuracy: ~A%\n" accuracy))))
 
 ;;; ==================================================================
-;;; Test 5: Learning Rate Decay
+;;; Learning Rate Decay
 ;;; ==================================================================
 
 (define (test-learning-rate-decay)
@@ -470,7 +470,7 @@
                    "Learning rate matches decay formula"))))
 
 ;;; ==================================================================
-;;; Test 6: Batch Training vs Sequential
+;;; Batch Training vs Sequential
 ;;; ==================================================================
 
 (define (test-batch-training)
@@ -529,7 +529,7 @@
                        "Batch training achieves low loss on XOR"))))
 
 ;;; ==================================================================
-;;; Test 7: Overfitting Detection
+;;; Overfitting Detection
 ;;; ==================================================================
 
 (define (test-overfitting-detection)
@@ -599,7 +599,7 @@
                 "good generalization"))))
 
 ;;; ==================================================================
-;;; Test 8: Convergence Speed Comparison
+;;; Convergence Speed Comparison
 ;;; ==================================================================
 
 (define (test-convergence-speed)
@@ -672,7 +672,7 @@
               (/ (exact->inexact sgd-epochs) adam-epochs)))))
 
 ;;; ==================================================================
-;;; Test 9: Gradient Clipping Integration
+;;; Gradient Clipping Integration
 ;;; ==================================================================
 
 (define (test-gradient-clipping-integration)
@@ -731,7 +731,7 @@
                 "Gradients remain finite during training")))
 
 ;;; ==================================================================
-;;; Test 10: Model Persistence (Parameter Extraction)
+;;; Model Persistence (Parameter Extraction)
 ;;; ==================================================================
 
 (define (test-parameter-extraction)

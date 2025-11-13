@@ -112,7 +112,7 @@
   (define-predicate dense-layer?)
   (define-predicate sequential?)
   
-  (define-operation (forward layer input))
+  (define-operation (forward layer . rest))
   (define-operation (parameters layer))
   (define-operation (zero-grad-layer! layer))
   (define-operation (layer-input-size layer))
@@ -274,6 +274,8 @@
                (out-channels (cdr (assq 'out-channels serializable-repr)))
                (kernel-size (cdr (assq 'kernel-size serializable-repr)))
                (dtype (cdr (assq 'dtype serializable-repr)))
+               (stride (cdr (assq 'stride serializable-repr)))
+               (padding (cdr (assq 'padding serializable-repr)))
                (weights-ser (cdr (assq 'weights serializable-repr)))
                (biases-ser (cdr (assq 'biases serializable-repr)))
                (activation-ser (cdr (assq 'activation serializable-repr)))
@@ -322,8 +324,8 @@
                                in-channels (car ishape)))))
             
             (let* ((conv-output (conv2d input weights biases
-                                        stride: 1
-                                        padding: 0)))
+                                        stride: stride
+                                        padding: padding)))
               (activation-forward activation conv-output)))
            
            ;; Get parameters
@@ -421,151 +423,227 @@
 
   ;; Efficient dense layer that handles both 1D and 2D inputs
   ;; Uses BLAS GEMM for batch operations
+  ;; Replace the make-dense-layer in layer.scm with this corrected version
+;; The key fix: use the correct GEMM operation to get (batch-size, output-dim) layout
 
-  (define (make-dense-layer input-dim output-dim 
-                            #!key 
-                            (activation (make-identity))
-                            (use-bias #t)
-                            (dtype 'f32)
-                            (name "Dense"))
-    "Dense layer supporting both single vectors and batches.
+(define (make-dense-layer input-dim output-dim 
+                          #!key 
+                          (activation (make-identity))
+                          (use-bias #t)
+                          (dtype 'f32)
+                          (name "Dense"))
+  "Dense layer supporting both single vectors and batches.
    
-     Input shapes:
-     1D: (input_dim,) -> output: (output_dim,)
-     2D: (batch_size, input_dim) -> output: (batch_size, output_dim)"
+   Input shapes:
+   1D: (input_dim,) -> output: (output_dim,)
+   2D: (batch_size, input_dim) -> output: (batch_size, output_dim)"
 
+  (let* ((weight-data (with-dtype dtype
+                                  (let ((w (vec (* output-dim input-dim) 0.0)))
+                                    ;; Initialize with small random values
+                                    (do ((i 0 (+ i 1)))
+                                        ((= i (* output-dim input-dim)) w)
+                                      (elt-set! w i 
+                                                (* (sqrt (/ 2.0 input-dim))
+                                                   (- (pseudo-random-real) 0.5)))))))
+         (weight (case dtype
+                   ((f32) (make-tensor32 weight-data (list output-dim input-dim)))
+                   ((f64) (make-tensor64 weight-data (list output-dim input-dim)))))
+       
+         (bias (if use-bias
+                   (case dtype
+                     ((f32) (make-tensor32 (make-f32vector output-dim 0.0)
+                                           (list output-dim)))
+                     ((f64) (make-tensor64 (make-f64vector output-dim 0.0)
+                                           (list output-dim))))
+                   #f)))
   
-    (let* ((weight-data (with-dtype dtype
-                                    (let ((w (vec (* output-dim input-dim) 0.0)))
-                                      ;; Initialize with small random values
-                                      (do ((i 0 (+ i 1)))
-                                          ((= i (* output-dim input-dim)) w)
-                                        (elt-set! w i 
-                                                  (* (sqrt (/ 2.0 input-dim))
-                                                     (- (pseudo-random-real) 0.5)))))))
-           (weight (case dtype
-                     ((f32) (make-tensor32 weight-data (list output-dim input-dim)))
-                     ((f64) (make-tensor64 weight-data (list output-dim input-dim)))))
-         
-           (bias (if use-bias
-                     (case dtype
-                       ((f32) (make-tensor32 (make-f32vector output-dim 0.0)
-                                             (list output-dim)))
-                       ((f64) (make-tensor64 (make-f64vector output-dim 0.0)
-                                             (list output-dim))))
-                     #f)))
-    
-      (object
-       
-       ((layer? self) #t)
-       ((layer-name self) name)
-       ((dense-layer? self) #t)
-
-       ((layer-input-size self) input-dim)   ; Returns feature dimension
-       ((layer-output-size self) output-dim) ; Returns feature dimension
-       ((layer-activation self) activation)
-       
-       ((forward self input)
-        (let* ((input-shape (tensor-shape input))
-               (ndim (length input-shape)))
-          
-          (cond
-           ;; Case 1: 1D input (single vector)
-           ((= ndim 1)
-            (let ((in-dim (car input-shape)))
-              (unless (= in-dim input-dim)
-                (error 'forward 
-                       (format #f "Input size mismatch: expected ~A, got ~A"
-                               input-dim in-dim)))
-              
-              ;; Standard matrix-vector multiplication
-              (let ((output (matmul-op weight input)))
-                (if bias
-                    (activation-forward activation (add output bias))
-                    (activation-forward activation output)))))
-           
-           ;; Case 2: 2D input (batch of vectors)
-           ((= ndim 2)
-            (let ((batch-size (car input-shape))
-                  (in-dim (cadr input-shape)))
-              (unless (= in-dim input-dim)
-                (error 'forward
-                       (format #f "Input size mismatch: expected ~A, got ~A"
-                               input-dim in-dim)))
-              
-              ;; Batch matrix multiplication using GEMM
-              ;; W @ X^T where W is (output_dim, input_dim) and X is (batch_size, input_dim)
-              (let ((output-data (with-dtype dtype 
-                                             (vec (* batch-size output-dim) 0.0))))
-                
-                (with-dtype dtype
-                            ;; GEMM: C = alpha * A * B + beta * C
-                            ;; We want: output = W @ X^T
-                            ;; In row-major: output[i,j] = sum_k W[i,k] * X^T[k,j] = sum_k W[i,k] * X[j,k]
-                            (gemm! RowMajor NoTrans Trans
-                                   output-dim batch-size input-dim
-                                   1.0 (tensor-data weight) (tensor-data input)
-                                   0.0 output-data
-                                   lda: input-dim
-                                   ldb: input-dim
-                                   ldc: batch-size))
-              
-                (let ((output (make-base-tensor output-data 
-                                                (list batch-size output-dim)
-                                                dtype #t)))
-                
-                  ;; Add bias if present (broadcast across batch)
-                  (let ((output-with-bias
-                         (if bias
-                             (let ((bias-data (tensor-data bias)))
-                               ;; Add bias to each row
-                               (with-dtype dtype
-                                           (do ((i 0 (+ i 1)))
-                                               ((= i batch-size))
-                                             (let ((row-offset (* i output-dim)))
-                                               (axpy! output-dim 1.0 bias-data
-                                                      output-data offset-y: row-offset))))
-                               output)
-                             output)))
-                    
-                    ;; Apply activation
-                    (activation-forward activation output-with-bias))))))
-            
-            (else
-             (error 'forward 
-                    (format #f "Dense layer only supports 1D or 2D inputs, got ~AD"
-                            ndim))))))
+    (object
      
-        ((parameters self)
-         (if bias
-             (list weight bias)
-             (list weight)))
+     ((layer? self) #t)
+     ((layer-name self) name)
+     ((dense-layer? self) #t)
+
+     ((layer-input-size self) input-dim)
+     ((layer-output-size self) output-dim)
+     ((layer-activation self) activation)
+     
+     ((forward self input)
+      (let* ((input-shape (tensor-shape input))
+             (ndim (length input-shape))
+             (requires-grad? (or (tensor-requires-grad? input)
+                                (tensor-requires-grad? weight)
+                                (and bias (tensor-requires-grad? bias)))))
         
-        ((zero-grad-layer! self)
-         (zero-grad! weight)
-         (when bias (zero-grad! bias)))
+        (cond
+         ;; Case 1: 1D input (single vector)
+         ((= ndim 1)
+          (let ((in-dim (car input-shape)))
+            (unless (= in-dim input-dim)
+              (error 'forward 
+                     (format #f "Input size mismatch: expected ~A, got ~A"
+                             input-dim in-dim)))
+            
+            ;; Standard matrix-vector multiplication
+            (let ((output (matmul-op weight input)))
+              (if bias
+                  (activation-forward activation (add output bias))
+                  (activation-forward activation output)))))
+         
+         ;; Case 2: 2D input (batch of vectors)
+         ((= ndim 2)
+          (let ((batch-size (car input-shape))
+                (in-dim (cadr input-shape)))
+            (unless (= in-dim input-dim)
+              (error 'forward
+                     (format #f "Input size mismatch: expected ~A, got ~A"
+                             input-dim in-dim)))
+            
+            ;; Compute output = X @ W^T to get (batch-size, output-dim) directly
+            ;; X: (batch-size, input-dim)
+            ;; W: (output-dim, input-dim) - will be transposed to (input-dim, output-dim)
+            ;; Result: (batch-size, output-dim)
+            (let ((output-data (with-dtype dtype 
+                                           (vec (* batch-size output-dim) 0.0))))
+              
+              (with-dtype dtype
+                (gemm! RowMajor NoTrans Trans
+                       batch-size output-dim input-dim  ; m, n, k
+                       1.0 (tensor-data input) (tensor-data weight)
+                       0.0 output-data
+                       lda: input-dim     ; Leading dimension of X
+                       ldb: input-dim     ; Leading dimension of W (before transpose)
+                       ldc: output-dim))  ; Leading dimension of output
+            
+              (let ((output (make-base-tensor output-data 
+                                              (list batch-size output-dim)
+                                              dtype requires-grad?)))
+              
+                (when requires-grad?
+                  (set-backward-fn!
+                   output
+                   (lambda ()
+                     (let ((grad-out (tensor-grad output))
+                           (data-weight (tensor-data weight))
+                           (data-input (tensor-data input)))
+                       
+                       ;; Gradient w.r.t. input: grad_X = grad_out @ W
+                       ;; grad_out: (batch-size, output-dim)
+                       ;; W: (output-dim, input-dim)
+                       ;; Result: (batch-size, input-dim)
+                       (when (tensor-requires-grad? input)
+                         (let ((grad-input (with-dtype dtype 
+                                                       (vec (* batch-size input-dim) 0.0))))
+                           (with-dtype dtype
+                             (gemm! RowMajor NoTrans NoTrans
+                                    batch-size input-dim output-dim  ; m, n, k
+                                    1.0 grad-out data-weight
+                                    0.0 grad-input
+                                    lda: output-dim   ; Leading dim of grad-out
+                                    ldb: input-dim    ; Leading dim of W
+                                    ldc: input-dim))  ; Leading dim of grad-input
+                           (add-to-grad! input grad-input)))
+                       
+                       ;; Gradient w.r.t. weight: grad_W = grad_out^T @ X
+                       ;; grad_out^T: (output-dim, batch-size)
+                       ;; X: (batch-size, input-dim)
+                       ;; Result: (output-dim, input-dim)
+                       (when (tensor-requires-grad? weight)
+                         (let ((grad-weight (with-dtype dtype 
+                                                        (vec (* output-dim input-dim) 0.0))))
+                           (with-dtype dtype
+                             (gemm! RowMajor Trans NoTrans
+                                    output-dim input-dim batch-size  ; m, n, k
+                                    1.0 grad-out data-input
+                                    0.0 grad-weight
+                                    lda: output-dim   ; Leading dim of grad-out (before transpose)
+                                    ldb: input-dim    ; Leading dim of X
+                                    ldc: input-dim))  ; Leading dim of grad-weight
+                           (add-to-grad! weight grad-weight)))))
+                   (list input weight)))
+              
+                ;; Add bias if present (broadcast across batch)
+                (let ((output-with-bias
+                       (if bias
+                           (let ((bias-data (tensor-data bias))
+                                 (biased-data (with-dtype dtype 
+                                                          (vec (* batch-size output-dim) 0.0))))
+                             ;; Copy output data
+                             (with-dtype dtype
+                               (copy-to biased-data output-data 
+                                        size: (* batch-size output-dim)))
+                             
+                             ;; Add bias to each row
+                             (with-dtype dtype
+                               (do ((i 0 (+ i 1)))
+                                   ((= i batch-size))
+                                 (let ((row-offset (* i output-dim)))
+                                   (axpy! output-dim 1.0 bias-data
+                                          biased-data offsetY: row-offset))))
+                             
+                             (let ((biased-output (make-base-tensor biased-data
+                                                                    (list batch-size output-dim)
+                                                                    dtype requires-grad?)))
+                               (when requires-grad?
+                                 (set-backward-fn!
+                                  biased-output
+                                  (lambda ()
+                                    (let ((grad-biased (tensor-grad biased-output)))
+                                      ;; Gradient flows back to pre-bias output
+                                      (when (tensor-requires-grad? output)
+                                        (add-to-grad! output grad-biased))
+                                      
+                                      ;; Gradient w.r.t. bias: sum across batch dimension
+                                      (when (and bias (tensor-requires-grad? bias))
+                                        (let ((grad-bias (with-dtype dtype (vec output-dim 0.0))))
+                                          (with-dtype dtype
+                                            (do ((i 0 (+ i 1)))
+                                                ((= i batch-size))
+                                              (let ((row-offset (* i output-dim)))
+                                                (axpy! output-dim 1.0 grad-biased
+                                                       grad-bias offsetX: row-offset))))
+                                          (add-to-grad! bias grad-bias)))))
+                                  (list output bias)))
+                               biased-output))
+                           output)))
+                  
+                  ;; Apply activation
+                  (activation-forward activation output-with-bias))))))
+          
+          (else
+           (error 'forward 
+                  (format #f "Dense layer only supports 1D or 2D inputs, got ~AD"
+                          ndim))))))
+   
+      ((parameters self)
+       (if bias
+           (list weight bias)
+           (list weight)))
+      
+      ((zero-grad-layer! self)
+       (zero-grad! weight)
+       (when bias (zero-grad! bias)))
 
-        ((set-training-mode! self train?)
-        (begin))
-       
-       ((set-eval-mode! self)
-        (begin))
+      ((set-training-mode! self train?)
+       (begin))
+     
+      ((set-eval-mode! self)
+       (begin))
 
-       ((layer->serializable self)
-        `((type . dense-layer)
-          (name . ,name)
-          (input-size . ,input-dim)
-          (output-size . ,output-dim)
-          (dtype . ,dtype)
-          (weights . ,(tensor->serializable weight))
-          (biases . ,(if use-bias (tensor->serializable bias) #f))
-          (activation . ,(activation->serializable activation))))
-       
-       ((save-layer self filepath)
-        (save-layer-to-file self filepath))
-       ))
-    )
-
+      ((layer->serializable self)
+       `((type . dense-layer)
+         (name . ,name)
+         (input-size . ,input-dim)
+         (output-size . ,output-dim)
+         (dtype . ,dtype)
+         (weights . ,(tensor->serializable weight))
+         (biases . ,(if use-bias (tensor->serializable bias) #f))
+         (activation . ,(activation->serializable activation))))
+     
+      ((save-layer self filepath)
+       (save-layer-to-file self filepath))
+      )))
+  
   ;;; ==================================================================
   ;;; Sequential Container (chains layers)
   ;;; ==================================================================
@@ -661,6 +739,7 @@
   ;;; ==================================================================
 
   (define-predicate conv2d-layer?)
+
   
   (define (make-conv2d-layer in-channels out-channels kernel-size
                              #!key
@@ -669,98 +748,118 @@
                              (activation (make-identity))
                              (dtype 'f32)
                              (name "Conv2D"))
-    "Create a 2D convolutional layer"
-  
-  (let* ((KH kernel-size)
-         (KW kernel-size)
-         
-         ;; He initialization for conv layers
-         (fan-in (* in-channels KH KW))
-         (init-scale (sqrt (/ 2.0 fan-in)))
-         
-         ;; Initialize weights: (out_channels, in_channels, KH, KW)
-         (weight-size (* out-channels in-channels KH KW))
-         (weight-data (with-dtype dtype
-                        (let ((w (vec weight-size 0.0)))
-                          (do ((i 0 (+ i 1)))
-                              ((= i weight-size) w)
-                            (elt-set! w i
-                                      (* init-scale
-                                         (- (* 2.0 (pseudo-random-real)) 1.0)))))))
-         
-         ;; Initialize biases
-         (bias-data (with-dtype dtype (vec out-channels 0.0)))
-         
-         ;; Create parameter tensors
-         (weights (case dtype
-                   ((f32) (make-tensor32 weight-data 
-                                        (list out-channels in-channels KH KW)))
-                   ((f64) (make-tensor64 weight-data 
-                                        (list out-channels in-channels KH KW)))))
-         
-         (biases (case dtype
-                  ((f32) (make-tensor32 bias-data (list out-channels)))
-                  ((f64) (make-tensor64 bias-data (list out-channels))))))
-    
-    (object
-     ;; Type predicates
-     ((layer? self) #t)
-     ((conv2d-layer? self) #t)
-     
-     ;; Layer info
-     ((layer-name self) name)
-     ((layer-input-size self) in-channels)
-     ((layer-output-size self) out-channels)
-     ((layer-activation self) activation)
-     
-     ;; Forward pass
-     ((forward self input)
-      ;; Input should be (C, H, W)
-      (let ((ishape (tensor-shape input)))
-        (unless (= (car ishape) in-channels)
-          (error 'forward 
-                 (format #f "Input channel mismatch: expected ~A, got ~A"
-                         in-channels (car ishape)))))
-      ;; Apply convolution
-      (let* ((conv-output (conv2d input weights biases
-                                  stride: stride
-                                  padding: padding
-                                  )))
-        ;; Apply activation
-        (activation-forward activation conv-output)))
-     
-     ;; Get parameters
-     ((parameters self)
-      (list weights biases))
-     
-     ;; Zero gradients
-     ((zero-grad-layer! self)
-      (zero-grad! weights)
-      (zero-grad! biases))
+    "2D convolutional layer with batch support
+   
+     Input shapes:
+       3D: (C, H, W) - single image
+       4D: (N, C, H, W) - batched images"
 
-     ((set-training-mode! self train?)
-      (begin))
-     
-     ((set-eval-mode! self)
-      (begin))
-
-     ((layer->serializable self)
-      `((type . conv2d-layer)
-        (name . ,name)
-        (in-channels . ,in-channels)
-        (out-channels . ,out-channels)
-        (kernel-size . ,kernel-size)
-        (dtype . ,dtype)
-        (weights . ,(tensor->serializable weights))
-        (biases . ,(tensor->serializable biases))
-        (activation . ,(activation->serializable activation)))
-      )
-
-     ((save-layer self filepath)
-      (save-layer-to-file self filepath))
-     
-     ))
-  )
+    (let* ((KH kernel-size)
+           (KW kernel-size)
+           
+           ;; He initialization for conv layers
+           (fan-in (* in-channels KH KW))
+           (init-scale (sqrt (/ 2.0 fan-in)))
+           
+           ;; Initialize weights: (out_channels, in_channels, KH, KW)
+           (weight-size (* out-channels in-channels KH KW))
+           (weight-data (with-dtype
+                         dtype
+                         (let ((w (vec weight-size 0.0)))
+                           (do ((i 0 (+ i 1)))
+                               ((= i weight-size) w)
+                             (elt-set! w i
+                                       (* init-scale
+                                          (- (* 2.0 (pseudo-random-real)) 1.0)))))))
+           
+           ;; Initialize biases
+           (bias-data (with-dtype dtype (vec out-channels 0.0)))
+           
+           ;; Create parameter tensors
+           (weights (case dtype
+                      ((f32) (make-tensor32 weight-data 
+                                            (list out-channels in-channels KH KW)))
+                      ((f64) (make-tensor64 weight-data 
+                                            (list out-channels in-channels KH KW)))))
+           
+           (biases (case dtype
+                     ((f32) (make-tensor32 bias-data (list out-channels)))
+                     ((f64) (make-tensor64 bias-data (list out-channels))))))
+      
+      (object
+       ;; Type predicates
+       ((layer? self) #t)
+       ((conv2d-layer? self) #t)
+       
+       ;; Layer info
+       ((layer-name self) name)
+       ((layer-input-size self) in-channels)
+       ((layer-output-size self) out-channels)
+       ((layer-activation self) activation)
+       
+       ;; Forward pass with proper batch support
+       ((forward self input)
+        (let* ((ishape (tensor-shape input))
+               (ndim (length ishape)))
+          
+          ;; Check input dimensions and validate channel count
+          (cond
+           ;; 3D input: (C, H, W)
+           ((= ndim 3)
+            (unless (= (car ishape) in-channels)
+              (error 'forward 
+                     (format #f "Input channel mismatch: expected ~A, got ~A"
+                             in-channels (car ishape)))))
+           
+           ;; 4D input: (N, C, H, W)
+           ((= ndim 4)
+            (unless (= (cadr ishape) in-channels)
+              (error 'forward 
+                     (format #f "Input channel mismatch: expected ~A, got ~A (batch shape: ~A)"
+                             in-channels (cadr ishape) ishape))))
+           
+           (else
+            (error 'forward 
+                   (format #f "Conv2D expects 3D (C,H,W) or 4D (N,C,H,W) input, got ~AD" 
+                           ndim))))
+          
+          ;; Apply convolution (conv2d handles both 3D and 4D)
+          (let ((conv-output (conv2d input weights biases
+                                     stride: stride
+                                     padding: padding)))
+            ;; Apply activation
+            (activation-forward activation conv-output))))
+       
+       ;; Get parameters
+       ((parameters self)
+        (list weights biases))
+       
+       ;; Zero gradients
+       ((zero-grad-layer! self)
+        (zero-grad! weights)
+        (zero-grad! biases))
+       
+       ((set-training-mode! self train?)
+        (begin))
+       
+       ((set-eval-mode! self)
+        (begin))
+       
+       ((layer->serializable self)
+        `((type . conv2d-layer)
+          (name . ,name)
+          (in-channels . ,in-channels)
+          (out-channels . ,out-channels)
+          (kernel-size . ,kernel-size)
+          (stride . ,stride)
+          (padding . ,padding)
+          (dtype . ,dtype)
+          (weights . ,(tensor->serializable weights))
+          (biases . ,(tensor->serializable biases))
+          (activation . ,(activation->serializable activation))))
+       
+       ((save-layer self filepath)
+        (save-layer-to-file self filepath)))))
 
 
   
@@ -861,37 +960,39 @@
   
   (define-predicate batch-norm-2d?)
   
+  
   (define (make-batch-norm-2d num-features 
-                             #!key 
-                             (epsilon 1e-5)
-                             (momentum 0.1)
-                             (dtype 'f32)
-                             (name "BatchNorm2d"))
-    "Batch Normalization for 2D convolutions.
-     
+                              #!key 
+                              (epsilon 1e-5)
+                              (momentum 0.1)
+                              (dtype 'f32)
+                              (name "BatchNorm2d"))
+    "Batch Normalization for 2D convolutions with proper batch support.
+   
      Normalizes activations across batch dimension:
      y = gamma * (x - mu) / sqrt(sigma^2 + epsilon) + beta
-     
+   
      Args:
        num-features: Number of channels (C)
        epsilon: Small constant for numerical stability
        momentum: Momentum for running statistics
        dtype: Data type
-       
-     Input shape: (C, H, W) or (N, C, H, W)
-     Output shape: Same as input"
-    
+     
+     Input shapes:
+       3D: (C, H, W) - treated as batch of 1
+       4D: (N, C, H, W) - standard batch"
+  
     (let* (;; Learnable parameters
            (gamma (case dtype
-                   ((f32) (make-tensor32 (make-f32vector num-features 1.0)
-                                        (list num-features)))
-                   ((f64) (make-tensor64 (make-f64vector num-features 1.0)
-                                        (list num-features)))))
+                    ((f32) (make-tensor32 (make-f32vector num-features 1.0)
+                                          (list num-features)))
+                    ((f64) (make-tensor64 (make-f64vector num-features 1.0)
+                                          (list num-features)))))
            (beta (case dtype
-                  ((f32) (make-tensor32 (make-f32vector num-features 0.0)
-                                       (list num-features)))
-                  ((f64) (make-tensor64 (make-f64vector num-features 0.0)
-                                       (list num-features)))))
+                   ((f32) (make-tensor32 (make-f32vector num-features 0.0)
+                                         (list num-features)))
+                   ((f64) (make-tensor64 (make-f64vector num-features 0.0)
+                                         (list num-features)))))
            
            ;; Running statistics (not trainable)
            (running-mean (with-dtype dtype (vec num-features 0.0)))
@@ -914,121 +1015,154 @@
        
        ((forward self input)
         "Forward pass through batch normalization.
-         
+       
          During training: Uses batch statistics
          During eval: Uses running statistics"
-        
+      
         (let* ((input-shape (tensor-shape input))
-               (C num-features)
-               (H (if (= (length input-shape) 3)
-                      (cadr input-shape)
-                      (caddr input-shape)))
-               (W (if (= (length input-shape) 3)
-                      (caddr input-shape)
-                      (cadddr input-shape)))
-               (spatial-size (* H W))
-               (input-data (tensor-data input)))
+               (ndim (length input-shape))
+               (C num-features))
           
-          (if training?
-              ;; Training mode: compute batch statistics
-              (let ((means (with-dtype dtype (vec C 0.0)))
-                    (vars (with-dtype dtype (vec C 0.0))))
-
-                ;; Compute mean for each channel
-                (with-dtype dtype
-                            (do ((c 0 (+ c 1)))
-                                ((= c C))
-                              (let ((sum (let loop ((sum 0.0) (i 0))
-                                           (if (= i spatial-size)
-                                               sum
-                                               (loop (let ((idx (+ (* c spatial-size) i)))
-                                                       (+ sum (elt-ref input-data idx)))
-                                                     (+ i 1)))
-                                           )))
-                                (elt-set! means c (/ sum spatial-size)))
-                              ))
-                
-                ;; Compute variance for each channel
-                (with-dtype dtype
-                            (do ((c 0 (+ c 1)))
-                                ((= c C))
-                              (let* ((mean (elt-ref means c))
-                                     (sum-sq (let loop ((sum-sq 0.0) (i 0))
-                                               (if (= i spatial-size)
-                                                   sum-sq
-                                                   (loop (let* ((idx (+ (* c spatial-size) i))
-                                                                (val (elt-ref input-data idx))
-                                                                (diff (- val mean)))
-                                                           (+ sum-sq (* diff diff)))
-                                                         (+ i 1)))
-                                               )))
-                                (elt-set! vars c (/ sum-sq spatial-size)))
-                              ))
-                
-                ;; Update running statistics
-                (do ((c 0 (+ c 1)))
-                    ((= c C))
-                  (with-dtype dtype
-                    (let ((new-mean (elt-ref means c))
-                          (new-var (elt-ref vars c))
-                          (old-mean (elt-ref running-mean c))
-                          (old-var (elt-ref running-var c)))
-                      (elt-set! running-mean c
-                               (+ (* (- 1.0 momentum) old-mean)
-                                  (* momentum new-mean)))
-                      (elt-set! running-var c
-                               (+ (* (- 1.0 momentum) old-var)
-                                  (* momentum new-var))))))
-                
-                ;; Normalize using batch statistics
-                (let ((normalized-data (with-dtype dtype (vec (* C spatial-size) 0.0))))
-                  (do ((c 0 (+ c 1)))
-                      ((= c C))
-                    (let ((mean (with-dtype dtype (elt-ref means c)))
-                          (var (with-dtype dtype (elt-ref vars c)))
-                          (gamma-val (with-dtype dtype 
-                                       (elt-ref (tensor-data gamma) c)))
-                          (beta-val (with-dtype dtype
-                                      (elt-ref (tensor-data beta) c))))
-                      (let ((std (sqrt (+ var epsilon))))
-                        (do ((i 0 (+ i 1)))
-                            ((= i spatial-size))
-                          (let ((idx (+ (* c spatial-size) i)))
-                            (with-dtype dtype
-                              (let ((normalized (/ (- (elt-ref input-data idx) mean)
-                                                  std)))
-                                (elt-set! normalized-data idx
-                                         (+ (* gamma-val normalized) beta-val)))))))))
-                  
-                  (make-base-tensor normalized-data input-shape dtype
-                                   (tensor-requires-grad? input))))
+          ;; Extract dimensions based on input shape
+          (let-values (((N H W)
+                        (cond
+                         ;; 3D input: (C, H, W) - treat as batch of 1
+                         ((= ndim 3)
+                          (values 1 (cadr input-shape) (caddr input-shape)))
+                         
+                         ;; 4D input: (N, C, H, W)
+                         ((= ndim 4)
+                          (values (car input-shape) 
+                                  (caddr input-shape) 
+                                  (cadddr input-shape)))
+                         
+                         (else
+                          (error 'batch-norm-2d 
+                                 (format #f "Expected 3D or 4D input, got ~AD" ndim))))))
+          
+            (let ((spatial-size (* H W))
+                  (batch-spatial (* N H W))
+                  (input-data (tensor-data input)))
               
-              ;; Eval mode: use running statistics
-              (let ((normalized-data (with-dtype dtype (vec (* C spatial-size) 0.0))))
-                (with-dtype dtype
-                            (do ((c 0 (+ c 1)))
-                                ((= c C))
-                              (let ((mean (elt-ref running-mean c))
-                                    (var (elt-ref running-var c))
-                                    (gamma-val (elt-ref (tensor-data gamma) c))
-                                    (beta-val (elt-ref (tensor-data beta) c)))
-                                (let ((std (sqrt (+ var epsilon))))
-                                  (do ((i 0 (+ i 1)))
-                                      ((= i spatial-size))
-                                    (let ((idx (+ (* c spatial-size) i)))
-                                      (let ((normalized (/ (- (elt-ref input-data idx) mean)
-                                                           std)))
-                                        (elt-set! normalized-data idx
-                                                  (+ (* gamma-val normalized) beta-val))))
-                                    ))
-                                ))
-                            )
+              (if training?
+                  ;; Training mode: compute batch statistics
+                  (let ((means (with-dtype dtype (vec C 0.0)))
+                        (vars (with-dtype dtype (vec C 0.0))))
+                    
+                    ;; Compute mean for each channel across batch and spatial dims
+                    (with-dtype dtype
+                                (do ((c 0 (+ c 1)))
+                                    ((= c C))
+                                  (let ((sum 
+                                         (let n-loop ((n 0) (sum 0.0))
+                                           (if (= n N)
+                                               sum
+                                               (let i-loop ((i 0) (sum sum))
+                                                 (if (= i spatial-size)
+                                                     (n-loop (+ n 1) sum)
+                                                     (let ((idx (+ (* n C spatial-size)
+                                                                   (* c spatial-size)
+                                                                   i)))
+                                                       (i-loop (+ i 1)
+                                                               (+ sum (elt-ref input-data idx))))))))))
+                                    (elt-set! means c (/ sum batch-spatial)))))
+                    
+                    ;; Compute variance for each channel
+                    (with-dtype dtype
+                                (do ((c 0 (+ c 1)))
+                                    ((= c C))
+                                  (let* ((mean (elt-ref means c))
+                                         (sum-sq 
+                                          (let n-loop ((n 0) (sum-sq 0.0))
+                                            (if (= n N)
+                                                sum-sq
+                                                (let i-loop ((i 0) (sum-sq sum-sq))
+                                                  (if (= i spatial-size)
+                                                      (n-loop (+ n 1) sum-sq)
+                                                      (let* ((idx (+ (* n C spatial-size)
+                                                                     (* c spatial-size)
+                                                                     i))
+                                                             (val (elt-ref input-data idx))
+                                                             (diff (- val mean)))
+                                                        (i-loop (+ i 1)
+                                                                (+ sum-sq (* diff diff))))))))))
+                                    (elt-set! vars c (/ sum-sq batch-spatial)))))
+                    
+                    ;; Update running statistics
+                    (do ((c 0 (+ c 1)))
+                        ((= c C))
+                      (with-dtype dtype
+                                  (let ((new-mean (elt-ref means c))
+                                        (new-var (elt-ref vars c))
+                                        (old-mean (elt-ref running-mean c))
+                                        (old-var (elt-ref running-var c)))
+                                    (elt-set! running-mean c
+                                              (+ (* (- 1.0 momentum) old-mean)
+                                                 (* momentum new-mean)))
+                                    (elt-set! running-var c
+                                              (+ (* (- 1.0 momentum) old-var)
+                                                 (* momentum new-var))))))
+                    
+                    ;; Normalize using batch statistics
+                    (let ((normalized-data 
+                           (with-dtype dtype (vec (* N C spatial-size) 0.0))))
+                      
+                      (with-dtype dtype
+                                  (do ((c 0 (+ c 1)))
+                                      ((= c C))
+                                    (let* ((mean (elt-ref means c))
+                                           (var (elt-ref vars c))
+                                           (gamma-val (elt-ref (tensor-data gamma) c))
+                                           (beta-val (elt-ref (tensor-data beta) c))
+                                           (std (sqrt (+ var epsilon))))
+                                      
+                                      (do ((n 0 (+ n 1)))
+                                          ((= n N))
+                                        (do ((i 0 (+ i 1)))
+                                            ((= i spatial-size))
+                                          (let ((idx (+ (* n C spatial-size)
+                                                        (* c spatial-size)
+                                                        i)))
+                                            (let ((normalized 
+                                                   (/ (- (elt-ref input-data idx) mean) std)))
+                                              (elt-set! normalized-data idx
+                                                        (+ (* gamma-val normalized) 
+                                                           beta-val)))))))))
+                      
+                      (make-base-tensor normalized-data input-shape dtype
+                                        (tensor-requires-grad? input))))
                 
-                (make-base-tensor normalized-data input-shape dtype #f)))))
-       
+                ;; Eval mode: use running statistics
+                  (let ((normalized-data 
+                         (with-dtype dtype (vec (* N C spatial-size) 0.0))))
+                    
+                    (with-dtype dtype
+                                (do ((c 0 (+ c 1)))
+                                    ((= c C))
+                                  (let* ((mean (elt-ref running-mean c))
+                                         (var (elt-ref running-var c))
+                                         (gamma-val (elt-ref (tensor-data gamma) c))
+                                         (beta-val (elt-ref (tensor-data beta) c))
+                                         (std (sqrt (+ var epsilon))))
+                                    
+                                    (do ((n 0 (+ n 1)))
+                                        ((= n N))
+                                      (do ((i 0 (+ i 1)))
+                                          ((= i spatial-size))
+                                        (let ((idx (+ (* n C spatial-size)
+                                                      (* c spatial-size)
+                                                      i)))
+                                          (let ((normalized 
+                                                 (/ (- (elt-ref input-data idx) mean) std)))
+                                            (elt-set! normalized-data idx
+                                                      (+ (* gamma-val normalized) 
+                                                         beta-val)))))))))
+                    
+                    (make-base-tensor normalized-data input-shape dtype #f)))))))
+     
        ((parameters self)
         (list gamma beta))
-       
+     
        ((zero-grad-layer! self)
         (zero-grad! gamma)
         (zero-grad! beta)))))
@@ -1036,60 +1170,128 @@
   ;;; ==================================================================
   ;;; Global Average Pooling
   ;;; ==================================================================
-  
+
   (define (global-avg-pool2d input)
-    "Global average pooling over spatial dimensions.
-     
-     Input shape: (C, H, W)
-     Output shape: (C,)"
-    
+    "Global average pooling over spatial dimensions with batch support.
+   
+     Input shapes:
+       3D: (C, H, W) -> Output: (C,)
+       4D: (N, C, H, W) -> Output: (N, C)"
+  
     (let* ((dtype (tensor-dtype input))
            (shape (tensor-shape input))
-           (C (car shape))
-           (H (cadr shape))
-           (W (caddr shape))
-           (spatial-size (* H W))
-           (data (tensor-data input))
-           (output-data (with-dtype dtype (vec C 0.0))))
+           (ndim (length shape)))
       
-      ;; Average over spatial dimensions for each channel
-      (with-dtype dtype
-                  (do ((c 0 (+ c 1)))
-                      ((= c C))
-                    (let ((sum
-                           (let loop ((sum 0.0) (i 0))
-                             (if (< i spatial-size)
-                                 (let ((idx (+ (* c spatial-size) i)))
-                                   (loop (+ sum (elt-ref data idx))
-                                         (+ i 1)))
-                                 sum))))
-                      (elt-set! output-data c (/ sum spatial-size)))))
-      
-      (let ((result (make-base-tensor output-data (list C) dtype
-                                      (tensor-requires-grad? input))))
-        
-        ;; Backward pass
-        (when (tensor-requires-grad? input)
-          (set-backward-fn! result
-            (lambda ()
-              (let ((grad-out (tensor-grad result))
-                    (grad-in (with-dtype dtype (vec (* C H W) 0.0))))
-                
-                ;; Distribute gradient equally over spatial dimensions
-                (with-dtype dtype
-                            (do ((c 0 (+ c 1)))
-                                ((= c C))
-                              (let* ((grad-val (elt-ref grad-out c))
-                                     (grad-per-pixel (/ grad-val spatial-size)))
-                                (do ((i 0 (+ i 1)))
-                                    ((= i spatial-size))
-                                  (let ((idx (+ (* c spatial-size) i)))
-                                    (elt-set! grad-in idx grad-per-pixel))))))
-                
-                (add-to-grad! input grad-in)))
-            (list input)))
-        
-        result)))
+      (cond
+       ;; 3D input: (C, H, W)
+       ((= ndim 3)
+        (let* ((C (car shape))
+               (H (cadr shape))
+               (W (caddr shape))
+               (spatial-size (* (cadr shape) (caddr shape)))
+               (data (tensor-data input))
+               (output-data (with-dtype dtype (vec C 0.0))))
+          
+          ;; Average over spatial dimensions for each channel
+          (with-dtype dtype
+                      (do ((c 0 (+ c 1)))
+                          ((= c C))
+                        (let ((sum
+                               (let loop ((sum 0.0) (i 0))
+                                 (if (< i spatial-size)
+                                     (let ((idx (+ (* c spatial-size) i)))
+                                       (loop (+ sum (elt-ref data idx))
+                                             (+ i 1)))
+                                     sum))))
+                          (elt-set! output-data c (/ sum spatial-size)))))
+          
+          (let ((result (make-base-tensor output-data (list C) dtype
+                                          (tensor-requires-grad? input))))
+            
+            ;; Backward pass
+            (when (tensor-requires-grad? input)
+              (set-backward-fn!
+               result
+               (lambda ()
+                 (let ((grad-out (tensor-grad result))
+                       (grad-in (with-dtype dtype (vec (* C H W) 0.0))))
+                   
+                   (with-dtype dtype
+                               (do ((c 0 (+ c 1)))
+                                   ((= c C))
+                                 (let* ((grad-val (elt-ref grad-out c))
+                                        (grad-per-pixel (/ grad-val spatial-size)))
+                                   (do ((i 0 (+ i 1)))
+                                       ((= i spatial-size))
+                                     (let ((idx (+ (* c spatial-size) i)))
+                                       (elt-set! grad-in idx grad-per-pixel))))))
+                   
+                   (add-to-grad! input grad-in)))
+               (list input)))
+            
+            result)))
+       
+       ;; 4D input: (N, C, H, W)
+       ((= ndim 4)
+        (let* ((N (car shape))
+               (C (cadr shape))
+               (H (caddr shape))
+               (W (cadddr shape))
+               (spatial-size (* (caddr shape) (cadddr shape)))
+               (data (tensor-data input))
+               (output-data (with-dtype dtype (vec (* N C) 0.0))))
+          
+          ;; Average over spatial dimensions for each (batch, channel) pair
+          (with-dtype dtype
+                      (do ((n 0 (+ n 1)))
+                          ((= n N))
+                        (do ((c 0 (+ c 1)))
+                            ((= c C))
+                          (let ((sum
+                                 (let loop ((sum 0.0) (i 0))
+                                   (if (< i spatial-size)
+                                       (let ((idx (+ (* n C spatial-size)
+                                                     (* c spatial-size)
+                                                     i)))
+                                         (loop (+ sum (elt-ref data idx))
+                                               (+ i 1)))
+                                       sum))))
+                            (elt-set! output-data (+ (* n C) c) 
+                                      (/ sum spatial-size))))))
+          
+          (let ((result (make-base-tensor output-data (list N C) dtype
+                                          (tensor-requires-grad? input))))
+            
+            ;; Backward pass
+            (when (tensor-requires-grad? input)
+              (set-backward-fn!
+               result
+               (lambda ()
+                 (let ((grad-out (tensor-grad result))
+                       (grad-in (with-dtype dtype (vec (* N C H W) 0.0))))
+                   
+                   (with-dtype dtype
+                               (do ((n 0 (+ n 1)))
+                                   ((= n N))
+                                 (do ((c 0 (+ c 1)))
+                                     ((= c C))
+                                   (let* ((grad-val (elt-ref grad-out (+ (* n C) c)))
+                                          (grad-per-pixel (/ grad-val spatial-size)))
+                                     (do ((i 0 (+ i 1)))
+                                         ((= i spatial-size))
+                                       (let ((idx (+ (* n C spatial-size)
+                                                     (* c spatial-size)
+                                                     i)))
+                                         (elt-set! grad-in idx grad-per-pixel)))))))
+                   
+                   (add-to-grad! input grad-in)))
+               (list input)))
+            
+            result)))
+       
+       (else
+        (error 'global-avg-pool2d 
+               (format #f "Expected 3D or 4D input, got ~AD" ndim))))))
   
   ;;; ==================================================================
   ;;; Utilities
@@ -1101,7 +1303,7 @@
       (printf "~A~A: " spaces (layer-name layer))
       (cond
        ((dense-layer? layer)
-        (printf "Dense(~A → ~A, activation=~A)\n"
+        (printf "Dense(~A -> ~A, activation=~A)\n"
                 (layer-input-size layer)
                 (layer-output-size layer)
                 (activation-name (layer-activation layer))))

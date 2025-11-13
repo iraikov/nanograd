@@ -165,8 +165,10 @@
                  requires-grad?: #t))
   
   ;; Slice and compute simple loss
-  (define slice (slice-tensor input 1 1))  ;; Extract middle row [3.0, 4.0]
+  (define slice (squeeze (slice-tensor input 1 1)))  ;; Extract middle row [3.0, 4.0]
   (define target (make-tensor32 (f32vector 10.0 20.0) '(2)))
+  (print "slice shape: " (tensor-shape slice))
+  (print "target shape: " (tensor-shape target))
   (define loss (mse-loss slice target))
   
   ;; Backward pass
@@ -207,8 +209,8 @@
                  requires-grad?: #t))
   
   ;; Take two different slices and sum their losses
-  (define slice1 (slice-tensor input 0 1))  ;; [1.0, 2.0]
-  (define slice2 (slice-tensor input 2 1))  ;; [5.0, 6.0]
+  (define slice1 (squeeze (slice-tensor input 0 1)))  ;; [1.0, 2.0]
+  (define slice2 (squeeze (slice-tensor input 2 1)))  ;; [5.0, 6.0]
   
   (define target1 (make-tensor32 (f32vector 2.0 4.0) '(2)))
   (define target2 (make-tensor32 (f32vector 6.0 8.0) '(2)))
@@ -253,7 +255,7 @@
                  requires-grad?: #t))
   
   ;; Extract middle row and perform operations
-  (define slice (slice-tensor input 1 1))  ;; [6.0, 8.0]
+  (define slice (squeeze (slice-tensor input 1 1)))  ;; [6.0, 8.0]
   
   ;; Scale by 2
   (define scaled (scale-op slice 2.0))
@@ -272,6 +274,10 @@
   
   ;; Compute loss and backprop
   (define target (make-tensor32 (f32vector 20.0 30.0) '(2)))
+  (print "shape const: " (tensor-shape const))
+  (print "shape scaled: " (tensor-shape scaled))
+  (print "shape added: " (tensor-shape added))
+  (print "shape target: " (tensor-shape target))
   (define loss (mse-loss added target))
   (backward! loss)
   

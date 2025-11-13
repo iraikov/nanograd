@@ -12,7 +12,8 @@
         blas
         nanograd-autograd
         nanograd-layer
-        nanograd-optimizer)
+        nanograd-optimizer
+        nanograd-diagnostics)
 
 (define (f32vector-fold f x0 v . rest)
     (let ((n   (f32vector-length v))
@@ -177,6 +178,50 @@
       ((f64) (do ((i 0 (+ i 1)))
                  ((= i n))
                (f64vector-set! vec i 1.0))))))
+
+;;; ==================================================================
+;;; Batch Construction
+;;; ==================================================================
+
+(define (stack-images batch)
+  "Stack a batch of images into a single 4D tensor (N, C, H, W)"
+  (let* ((batch-size (length batch))
+         (sample-img (caar batch))
+         (img-size (f32vector-length sample-img))
+         ;; Create batched tensor data
+         (batched-data (make-f32vector (* batch-size img-size) 0.0)))
+    
+    ;; Copy each image into the batched tensor
+    (do ((i 0 (+ i 1)))
+        ((= i batch-size))
+      (let ((img-data (car (list-ref batch i)))
+            (offset (* i img-size)))
+        (do ((j 0 (+ j 1)))
+            ((= j img-size))
+          (f32vector-set! batched-data (+ offset j)
+                         (f32vector-ref img-data j)))))
+    
+    ;; Return as 4D tensor: (batch_size, channels, height, width)
+    (make-tensor32 batched-data 
+                   (list batch-size num-channels image-size image-size)
+                   requires-grad?: #f)))
+
+(define (stack-targets batch)
+  "Stack batch targets into 2D tensor (N, num_classes) for one-hot
+   or 1D tensor (N,) for class indices"
+  (let* ((batch-size (length batch))
+         ;; Use class indices format for efficiency
+         (target-data (make-f32vector batch-size 0.0)))
+    
+    (do ((i 0 (+ i 1)))
+        ((= i batch-size))
+      (let ((class (cdr (list-ref batch i))))
+        (f32vector-set! target-data i (exact->inexact class))))
+    
+    ;; Return as 1D tensor of class indices
+    (make-tensor32 target-data (list batch-size))))
+
+
 
 ;;; ==================================================================
 ;;; CNN Architecture
@@ -383,6 +428,114 @@
     
     (values (/ total-loss n) (/ correct n))))
 
+
+(define (train-epoch-batched model optimizer train-data 
+                             #!key (batch-size 32) (gradient-diagnostics #f))
+  "Train for one epoch with true batch processing"
+  (let* ((total-loss 0.0)
+         (correct 0)
+         (n (length train-data))
+         (conv-layers (car model))
+         (dense-layers (cadr model))
+         (params (append (parameters conv-layers)
+                         (parameters dense-layers)))
+         (monitor (make-gradient-monitor 
+                   exploding-threshold: 10.0
+                   vanishing-threshold: 1e-7)))
+
+    
+    ;; Split data into mini-batches
+    (let ((batches (let loop ((remaining train-data)
+                              (i 0)
+                              (result '()))
+                    (if (null? remaining)
+                        (reverse result)
+                        (let* ((batch-end (min batch-size (length remaining)))
+                               (batch (take remaining batch-end))
+                               (rest (drop remaining batch-end)))
+                          (loop rest (+ i 1) (cons (cons i batch) result)))))))
+
+      ;; Process each mini-batch
+      (for-each
+       (lambda (step+batch)
+         (let* ((step (car step+batch))
+                (batch (cdr step+batch))
+                (actual-batch-size (length batch))
+                
+                ;; Stack entire batch into single tensors
+                (batch-images (stack-images batch))
+                (batch-targets (stack-targets batch))
+
+                ;; Single forward pass for entire batch
+                (conv-out (forward conv-layers batch-images))
+                
+                ;; Flatten: (N, C, H, W) -> (N, C*H*W)
+                (batch-shape (tensor-shape conv-out))
+                (N (car batch-shape))
+                (flattened-size (apply * (cdr batch-shape)))
+                (flat (reshape conv-out (list N flattened-size)))
+                
+                ;; Dense layers: (N, features_in) -> (N, num_classes)
+                (logits (forward dense-layers flat))
+                
+                ;; Softmax over classes: (N, num_classes)
+                (probs (softmax logits axis: -1))
+                
+                ;; Cross-entropy loss with mean reduction
+                ;; Returns scalar loss averaged over batch
+                (loss (cross-entropy-loss probs batch-targets 
+                                          reduction: 'mean
+                                          from-logits: #f)))
+
+           ;(printf "mini-batch logits: ~A\n" (tensor-data logits))
+           ;(printf "mini-batch probs: ~A\n" (tensor-data probs))
+           ;(printf "mini-batch batch-targets: ~A\n" (tensor-data batch-targets))
+           ;(printf "mini-batch loss: ~A\n" (tensor-data loss))
+           
+           ;; Accumulate loss for reporting
+           (set! total-loss (+ total-loss 
+                              (* (f32vector-ref (tensor-data loss) 0)
+                                 actual-batch-size)))
+           
+           ;; Count correct predictions
+           (let ((logits-data (tensor-data logits)))
+             (do ((i 0 (+ i 1)))
+                 ((= i actual-batch-size))
+               (let* ((offset (* i num-classes))
+                      (pred-class (argmax-offset logits-data offset num-classes))
+                      (true-class (inexact->exact 
+                                  (f32vector-ref (tensor-data batch-targets) i))))
+                 (when (= pred-class true-class)
+                   (set! correct (+ correct 1))))))
+           
+           ;; Single backward pass for entire batch
+           ;; Loss already computed with reduction='mean'
+           (backward! loss)
+
+           ;; Check gradient health
+           (if gradient-diagnostics
+               (record-step! monitor step params))
+
+                  
+           ;; Single optimizer step
+           (step! optimizer)
+           
+           ;; Zero gradients for next batch
+           (zero-grad-layer! conv-layers)
+           (zero-grad-layer! dense-layers)))
+       batches))
+
+    (if gradient-diagnostics
+        (begin
+          (printf "\nTraining Diagnosis:\n")
+          (let ((diagnosis (diagnose-training monitor)))
+            (printf "Total steps: ~A\n" (cdr (assoc 'total-steps diagnosis)))
+            (printf "Mean gradient norm: ~A\n" (cdr (assoc 'mean-gradient-norm diagnosis)))
+            (printf "Unhealthy steps: ~A\n" (cdr (assoc 'unhealthy-steps diagnosis))))))
+    
+    (values (/ total-loss n) (/ correct n))))
+
+
 (define (evaluate model test-data)
   "Evaluate model on test data"
   (let ((correct 0)
@@ -430,6 +583,193 @@
       (let ((idx (+ (* true-class num-classes) pred-class)))
         (printf "~A  " (vector-ref confusion idx))))
     (printf "\n")))
+
+
+;;; ==================================================================
+;;; Batched Evaluation
+;;; ==================================================================
+
+(define (evaluate-batched model test-data #!key (batch-size 64))
+  "Evaluate model on test data using batched forward passes"
+  (let ((correct 0)
+        (total (length test-data))
+        (confusion (make-vector (* num-classes num-classes) 0))
+        (conv-layers (car model))
+        (dense-layers (cadr model)))
+    
+    ;; Split test data into batches
+    (let ((batches (let loop ((remaining test-data)
+                             (result '()))
+                    (if (null? remaining)
+                        (reverse result)
+                        (let* ((batch-end (min batch-size (length remaining)))
+                               (batch (take remaining batch-end))
+                               (rest (drop remaining batch-end)))
+                          (loop rest (cons batch result)))))))
+      
+      (for-each
+       (lambda (batch)
+         (let* ((actual-batch-size (length batch))
+                
+                ;; Stack batch (no gradients needed for eval)
+                (batch-images (stack-images batch))
+                (batch-targets (stack-targets batch))
+                
+                ;; Disable gradient tracking
+                (batch-images (make-tensor32 (tensor-data batch-images)
+                                             (tensor-shape batch-images)
+                                             requires-grad?: #f))
+                
+                ;; Forward pass
+                (conv-out (forward conv-layers batch-images))
+                (batch-shape (tensor-shape conv-out))
+                (N (car batch-shape))
+                (flattened-size (apply * (cdr batch-shape)))
+                (flat (reshape conv-out (list N flattened-size)))
+                (logits (forward dense-layers flat))
+                (logits-data (tensor-data logits)))
+           
+           ;; Process predictions
+           (do ((i 0 (+ i 1)))
+               ((= i actual-batch-size))
+             (let* ((offset (* i num-classes))
+                    (pred-class (argmax-offset logits-data offset num-classes))
+                    (true-class (inexact->exact 
+                                (f32vector-ref (tensor-data batch-targets) i))))
+               
+               (when (= pred-class true-class)
+                 (set! correct (+ correct 1)))
+               
+               ;; Update confusion matrix
+               (let ((idx (+ (* true-class num-classes) pred-class)))
+                 (vector-set! confusion idx 
+                            (+ 1 (vector-ref confusion idx))))))))
+       batches))
+    
+    (values (/ correct total) confusion)))
+
+(define (argmax-offset vec offset length)
+  "Find argmax in a slice of a vector starting at offset"
+  (let loop ((i 1) (max-i 0) (max-val (f32vector-ref vec offset)))
+    (if (= i length)
+        max-i
+        (let ((val (f32vector-ref vec (+ offset i))))
+          (if (> val max-val)
+              (loop (+ i 1) i val)
+              (loop (+ i 1) max-i max-val))))))
+
+;; Add this debugging version to your cnn.scm file
+;; This will help identify where gradients are lost
+
+(define (debug-forward-pass model batch-images batch-targets)
+  "Forward pass with gradient flow debugging"
+  (let ((conv-layers (car model))
+        (dense-layers (cadr model)))
+    
+    (printf "\n=== Forward Pass Debug ===\n")
+    
+    ;; Step 1: Conv layers
+    (printf "Input shape: ~A\n" (tensor-shape batch-images))
+    (printf "Input requires-grad?: ~A\n" (tensor-requires-grad? batch-images))
+    
+    (let ((conv-out (forward conv-layers batch-images)))
+      (printf "Conv output shape: ~A\n" (tensor-shape conv-out))
+      (printf "Conv output requires-grad?: ~A\n" (tensor-requires-grad? conv-out))
+      (printf "Conv output children count: ~A\n" 
+              (length (tensor-children conv-out)))
+      
+      ;; Step 2: Reshape
+      (let* ((batch-shape (tensor-shape conv-out))
+             (N (car batch-shape))
+             (flattened-size (apply * (cdr batch-shape)))
+             (flat (reshape conv-out (list N flattened-size))))
+        
+        (printf "\nReshape:\n")
+        (printf "  Flat shape: ~A\n" (tensor-shape flat))
+        (printf "  Flat requires-grad?: ~A\n" (tensor-requires-grad? flat))
+        ;(printf "  Flat has backward-fn?: ~A\n" 
+        ;        (if (tensor-backward-fn flat) "YES" "NO"))
+        (printf "  Flat children count: ~A\n" 
+                (length (tensor-children flat)))
+        (printf "  Flat children[0] == conv-out?: ~A\n"
+                (if (null? (tensor-children flat))
+                    "NO CHILDREN!"
+                    (eq? (car (tensor-children flat)) conv-out)))
+        
+        ;; Step 3: Dense layers
+        (let ((logits (forward dense-layers flat)))
+          (printf "\nDense output:\n")
+          (printf "  Logits shape: ~A\n" (tensor-shape logits))
+          (printf "  Logits requires-grad?: ~A\n" (tensor-requires-grad? logits))
+          ;(printf "  Logits has backward-fn?: ~A\n" 
+          ;       (if (tensor-backward-fn logits) "YES" "NO"))
+          
+          ;; Step 4: Loss
+          (let* ((probs (softmax logits axis: -1))
+                 (loss (cross-entropy-loss probs batch-targets 
+                                           reduction: 'mean
+                                           from-logits: #f)))
+            
+            (printf "\nLoss:\n")
+            (printf "  Loss value: ~A\n" (tensor-data loss))
+            (printf "  Loss requires-grad?: ~A\n" (tensor-requires-grad? loss))
+            
+            ;; Step 5: Backward pass
+            (printf "\n=== Backward Pass Debug ===\n")
+            (backward! loss)
+            
+            (printf "After backward:\n")
+            (printf "  Loss grad: ~A\n" (tensor-grad loss))
+            (printf "  Logits grad sum: ~A\n" 
+                    (if (tensor-grad logits)
+                        (f32vector-fold + 0.0 (tensor-grad logits))
+                        "NO GRAD"))
+            (printf "  Flat grad sum: ~A\n" 
+                    (if (tensor-grad flat)
+                        (f32vector-fold + 0.0 (tensor-grad flat))
+                        "NO GRAD"))
+            (printf "  Conv-out grad sum: ~A\n" 
+                    (if (tensor-grad conv-out)
+                        (f32vector-fold + 0.0 (tensor-grad conv-out))
+                        "NO GRAD"))
+            
+            ;; Check conv layer parameter gradients
+            (printf "\nConv layer parameter gradients:\n")
+            (let ((conv-params (parameters conv-layers)))
+              (for-each
+               (lambda (param idx)
+                 (let ((grad (tensor-grad param)))
+                   (printf "  Param ~A grad sum: ~A\n" 
+                           idx
+                           (if grad
+                               (f32vector-fold + 0.0 grad)
+                               "NO GRAD"))))
+               conv-params
+               (iota (length conv-params))))
+            
+            loss))))))
+
+;; Use this to debug a single batch
+(define (debug-single-batch)
+  "Debug gradient flow on a single small batch"
+  (set-random-seed! 42)
+  
+  (printf "Generating small test batch...\n")
+  (let* ((test-batch (generate-dataset 2))  ; Just 2 samples per class = 8 total
+         (small-batch (take test-batch 4))  ; Take 4 samples
+         (model (build-cnn))
+         (conv-layers (car model))
+         (dense-layers (cadr model)))
+    
+    (printf "Building batch tensors...\n")
+    (let ((batch-images (stack-images small-batch))
+          (batch-targets (stack-targets small-batch)))
+      
+      (printf "Batch images shape: ~A\n" (tensor-shape batch-images))
+      (printf "Batch targets shape: ~A\n" (tensor-shape batch-targets))
+      
+      ;; Run debug forward pass
+      (debug-forward-pass model batch-images batch-targets))))
 
 ;;; ==================================================================
 ;;; Main Training Loop
@@ -506,13 +846,17 @@
       ((> epoch num-epochs))
     
     ;; Train
-    (let-values (((avg-loss accuracy) (train-epoch model optimizer train-data batch-size: 64)))
+    (let-values (((avg-loss accuracy)
+                  ;(train-epoch model optimizer train-data
+                  ;                     )))
+                  (train-epoch-batched model optimizer train-data
+                                       batch-size: 64 gradient-diagnostics: (= epoch 1))))
       (printf "Epoch ~A/~A - Loss: ~A - Acc: ~A"
               epoch num-epochs avg-loss (* 100.0 accuracy))
       
       ;; Evaluate every 5 epochs
       (when (= (modulo epoch 5) 0)
-        (let-values (((test-acc confusion) (evaluate model test-data)))
+        (let-values (((test-acc confusion) (evaluate-batched model test-data batch-size: 64)))
           (printf " - Test Acc: ~A" (* 100.0 test-acc))))
       
       (printf "\n"))

@@ -8,6 +8,7 @@
    
    ;; Tensor accessors
    tensor-data tensor-grad tensor-shape
+   tensor-children
    tensor-requires-grad? tensor-dtype
    
    ;; Gradient operations
@@ -38,6 +39,7 @@
    
    ;; Utilities
    reshape
+   squeeze
    transpose-tensor
    flatten-tensor
    slice-tensor
@@ -977,160 +979,322 @@
                              (new-c (- (- t sum) y)))           ; Update compensation
                         (loop (+ i 1) t new-c))))))
   
+
   (define (conv2d input weight bias 
                   #!key 
                   (stride 1)
-                  (padding 0)
-                  (debug #f))
-    "2D Convolution operation.
-   Input shape: (Cin, H, W)
+                  (padding 0))
+  "2D Convolution operation with batch support.
+   
+   Input shapes:
+     3D: (Cin, H, W) - single image
+     4D: (N, Cin, H, W) - batched images
    Weight shape: (Cout, Cin, KH, KW)
    Bias shape: (Cout,)
-   Output shape: (Cout, OH, OW)"
-    
-    (assert (eq? (tensor-dtype input) (tensor-dtype weight)))
+   
+   Output shapes:
+     3D: (Cout, OH, OW)
+     4D: (N, Cout, OH, OW)"
+  
+  (assert (eq? (tensor-dtype input) (tensor-dtype weight)))
   
   (let* ((dtype (tensor-dtype input))
          (ishape (tensor-shape input))
          (wshape (tensor-shape weight))
-         
-         (Cin (car ishape))
-         (H (cadr ishape))
-         (W (caddr ishape))
-         
-         (Cout (car wshape))
-         (Cin-w (cadr wshape))
-         (KH (caddr wshape))
-         (KW (cadddr wshape))
-         
-         (stride-h stride)
-         (stride-w stride)
-         (pad-h padding)
-         (pad-w padding)
-         
-         ;; Output dimensions
-         (OH (+ 1 (quotient (+ H (* 2 pad-h) (- KH)) stride-h)))
-         (OW (+ 1 (quotient (+ W (* 2 pad-w) (- KW)) stride-w)))
-
+         (ndim (length ishape))
          (requires-grad? (or (tensor-requires-grad? input)
                              (tensor-requires-grad? weight)
                              (and bias (tensor-requires-grad? bias)))))
     
-    (unless (= Cin Cin-w)
-      (error 'conv2d "Input channels mismatch"))
-    
-    ;; Forward pass using im2col + matrix multiplication
-    ;; 1. Convert input to column matrix
-    (let* ((col (im2col input KH KW stride-h stride-w pad-h pad-w))
-           (col-data (tensor-data col))
-           
-           ;; 2. Reshape weight to (Cout, Cin*KH*KW)
-           (weight-data (tensor-data weight))
-           (weight-rows Cout)
-           (weight-cols (* Cin KH KW))
-           
-           ;; 3. Matrix multiply: output = weight @ col
-           (output-data (with-dtype dtype (vec (* Cout OH OW) 0.0)))
-           )
-
-      (with-dtype dtype
-        (gemm! RowMajor NoTrans NoTrans
-               weight-rows (* OH OW) weight-cols
-               1.0 weight-data col-data 
-               0.0 output-data lda: weight-cols
-               ldb: (* OH OW)
-               ldc: (* OH OW)))
-      
-      ;; 4. Add bias if provided
-      (when bias
-        (let ((bias-data (tensor-data bias)))
-          (with-dtype dtype
-                      (do ((cout 0 (+ cout 1)))
-                          ((= cout Cout))
-                        (let ((b (elt-ref bias-data cout)))
-                          (do ((i 0 (+ i 1)))
-                              ((= i (* OH OW)))
-                            (let ((idx (+ (* cout OH OW) i)))
-                              (elt-set! output-data idx
-                                        (+ (elt-ref output-data idx) b))
-                              )))
-                        ))
-          ))
-          
-      ;; Create result tensor
-      (let ((result (make-base-tensor output-data 
-                                      (list Cout OH OW)
-                                      dtype
-                                      requires-grad?)))
-
-        (when requires-grad?
-          (set-backward-fn! result
-            (lambda ()
-              (let ((grad-out (tensor-grad result)))
-                
-                ;; Gradient w.r.t. input
-                (when (tensor-requires-grad? input)
-                  ;; dL/dInput = weight^T @ dL/dOutput (in column form)
-                  ;; Then apply col2im
-                  (let ((grad-col-data (with-dtype dtype (vec (* weight-cols OH OW) 0.0))))
-                    
-                    (with-dtype dtype
-                      (gemm! RowMajor Trans NoTrans
-                             weight-cols (* OH OW) weight-rows
-                             1.0 weight-data grad-out 
-                             0.0 grad-col-data
-                             lda: weight-cols
-                             ldb: (* OH OW)
-                             ldc: (* OH OW)))
-                    
-                    (let* ((grad-col (make-base-tensor grad-col-data
-                                                       (list weight-cols (* OH OW))
-                                                       dtype #f))
-                           (grad-input (col2im grad-col Cin H W 
-                                               KH KW stride-h stride-w pad-h pad-w)))
-                      (add-to-grad! input (tensor-data grad-input)))))
-                
-                ;; Gradient w.r.t. weight
-                (when (tensor-requires-grad? weight)
-                  ;; dL/dWeight = dL/dOutput @ col^T
-                  ;; Reshape to (Cout, Cin*KH*KW)
-                  (let ((grad-weight-data (with-dtype dtype (vec (* Cout weight-cols) 0.0))))
-                    (with-dtype dtype
-                      (gemm! RowMajor NoTrans Trans
-                             weight-rows weight-cols (* OH OW)
-                             1.0 grad-out 
-                             col-data 
-                             0.0 grad-weight-data
-                             lda: (* OH OW)
-                             ldb: (* OH OW)
-                             ldc: weight-cols))
-                    
-                    (add-to-grad! weight grad-weight-data)))
-                
-                ;; Gradient w.r.t. bias
-                (when (and bias (tensor-requires-grad? bias))
-                  ;; dL/dBias = sum of dL/dOutput over spatial dimensions
-                  (let ((grad-bias-data (with-dtype dtype (vec Cout 0.0))))
-                    (with-dtype
-                     dtype
-                     (do ((cout 0 (+ cout 1)))
-                         ((= cout Cout))
-                       ;; Use compensated summation for better numerical accuracy
-                       (let ((start-idx (* cout OH OW))
-                             (end-idx (* (+ cout 1) OH OW)))
-                         
-                         (let ((sum (compensated-sum dtype grad-out start-idx end-idx)))
-                           (elt-set! grad-bias-data cout sum))))
-                     )
-                    
-                    (add-to-grad! bias grad-bias-data)))))
-            
-            (if bias
-                (list input weight bias)
-                (list input weight))))
+    (cond
+     ;; Case 1: 3D input (single image)
+     ((= ndim 3)
+      (let* ((Cin (car ishape))
+             (H (cadr ishape))
+             (W (caddr ishape))
+             (Cout (car wshape))
+             (Cin-w (cadr wshape))
+             (KH (caddr wshape))
+             (KW (cadddr wshape))
+             (stride-h stride)
+             (stride-w stride)
+             (pad-h padding)
+             (pad-w padding)
+             (OH (+ 1 (quotient (+ H (* 2 pad-h) (- KH)) stride-h)))
+             (OW (+ 1 (quotient (+ W (* 2 pad-w) (- KW)) stride-w))))
         
-        result))))
-
+        (unless (= Cin Cin-w)
+          (error 'conv2d "Input channels mismatch"))
+        
+        ;; Use existing single-image im2col implementation
+        (let* ((col (im2col input KH KW stride-h stride-w pad-h pad-w))
+               (col-data (tensor-data col))
+               (weight-data (tensor-data weight))
+               (weight-rows Cout)
+               (weight-cols (* Cin KH KW))
+               (output-data (with-dtype dtype (vec (* Cout OH OW) 0.0))))
+          
+          (with-dtype dtype
+            (gemm! RowMajor NoTrans NoTrans
+                   weight-rows (* OH OW) weight-cols
+                   1.0 weight-data col-data 
+                   0.0 output-data
+                   lda: weight-cols
+                   ldb: (* OH OW)
+                   ldc: (* OH OW)))
+          
+          ;; Add bias if provided
+          (when bias
+            (let ((bias-data (tensor-data bias)))
+              (with-dtype dtype
+                (do ((cout 0 (+ cout 1)))
+                    ((= cout Cout))
+                  (let ((b (elt-ref bias-data cout)))
+                    (do ((i 0 (+ i 1)))
+                        ((= i (* OH OW)))
+                      (let ((idx (+ (* cout OH OW) i)))
+                        (elt-set! output-data idx
+                                 (+ (elt-ref output-data idx) b)))))))))
+          
+          (let ((result (make-base-tensor output-data 
+                                         (list Cout OH OW)
+                                         dtype
+                                         requires-grad?)))
+            
+            (when requires-grad?
+              (set-backward-fn! result
+                (lambda ()
+                  (let ((grad-out (tensor-grad result)))
+                    
+                    ;; Gradient w.r.t. input
+                    (when (tensor-requires-grad? input)
+                      (let ((grad-col-data (with-dtype dtype (vec (* weight-cols OH OW) 0.0))))
+                        (with-dtype dtype
+                          (gemm! RowMajor Trans NoTrans
+                                 weight-cols (* OH OW) weight-rows
+                                 1.0 weight-data grad-out 
+                                 0.0 grad-col-data
+                                 lda: weight-cols
+                                 ldb: (* OH OW)
+                                 ldc: (* OH OW)))
+                        
+                        (let* ((grad-col (make-base-tensor grad-col-data
+                                                          (list weight-cols (* OH OW))
+                                                          dtype #f))
+                               (grad-input (col2im grad-col Cin H W 
+                                                   KH KW stride-h stride-w pad-h pad-w)))
+                          (add-to-grad! input (tensor-data grad-input)))))
+                    
+                    ;; Gradient w.r.t. weight
+                    (when (tensor-requires-grad? weight)
+                      (let ((grad-weight-data (with-dtype dtype (vec (* Cout weight-cols) 0.0))))
+                        (with-dtype dtype
+                          (gemm! RowMajor NoTrans Trans
+                                 weight-rows weight-cols (* OH OW)
+                                 1.0 grad-out col-data 
+                                 0.0 grad-weight-data
+                                 lda: (* OH OW)
+                                 ldb: (* OH OW)
+                                 ldc: weight-cols))
+                        (add-to-grad! weight grad-weight-data)))
+                    
+                    ;; Gradient w.r.t. bias
+                    (when (and bias (tensor-requires-grad? bias))
+                      (let ((grad-bias-data (with-dtype dtype (vec Cout 0.0))))
+                        (with-dtype dtype
+                          (do ((cout 0 (+ cout 1)))
+                              ((= cout Cout))
+                            (let ((start-idx (* cout OH OW))
+                                  (end-idx (* (+ cout 1) OH OW)))
+                              (let ((sum (compensated-sum dtype grad-out start-idx end-idx)))
+                                (elt-set! grad-bias-data cout sum)))))
+                        (add-to-grad! bias grad-bias-data)))))
+                
+                (if bias
+                    (list input weight bias)
+                    (list input weight))))
+            
+            result))))
+     
+     ;; Case 2: 4D input (batched images)
+     ((= ndim 4)
+      (let* ((N (car ishape))
+             (Cin (cadr ishape))
+             (H (caddr ishape))
+             (W (cadddr ishape))
+             (Cout (car wshape))
+             (Cin-w (cadr wshape))
+             (KH (caddr wshape))
+             (KW (cadddr wshape))
+             (stride-h stride)
+             (stride-w stride)
+             (pad-h padding)
+             (pad-w padding)
+             (OH (+ 1 (quotient (+ H (* 2 pad-h) (- KH)) stride-h)))
+             (OW (+ 1 (quotient (+ W (* 2 pad-w) (- KW)) stride-w))))
+        
+        (unless (= Cin Cin-w)
+          (error 'conv2d "Input channels mismatch"))
+        
+        (let ((output-data (with-dtype dtype (vec (* N Cout OH OW) 0.0)))
+              (all-cols-data (with-dtype dtype (vec (* N Cin KH KW OH OW) 0.0))))
+          
+          ;; Process each image in batch
+          (with-dtype dtype
+            (do ((n 0 (+ n 1)))
+                ((= n N))
+              
+              (let ((input-offset (* n Cin H W))
+                    (output-offset (* n Cout OH OW))
+                    (col-offset (* n Cin KH KW OH OW)))
+                
+                ;; Extract single image
+                (let* ((img-data (vec (* Cin H W) 0.0)))
+                  (copy-to img-data (tensor-data input) 
+                           Xoffset: input-offset size: (* Cin H W))
+                  
+                  (let ((img (make-base-tensor img-data (list Cin H W) dtype #f)))
+                    
+                    ;; im2col for this image
+                    (let* ((col (im2col img KH KW stride-h stride-w pad-h pad-w))
+                           (col-data (tensor-data col))
+                           (weight-data (tensor-data weight)))
+                      
+                      ;; Store col for backward pass
+                      (copy-to all-cols-data col-data Yoffset: col-offset 
+                               size: (* Cin KH KW OH OW))
+                      
+                      ;; Convolve: output[n] = weight @ col
+                      (let ((img-output (vec (* Cout OH OW) 0.0)))
+                        (gemm! RowMajor NoTrans NoTrans
+                               Cout (* OH OW) (* Cin KH KW)
+                               1.0 weight-data col-data
+                               0.0 img-output
+                               lda: (* Cin KH KW)
+                               ldb: (* OH OW)
+                               ldc: (* OH OW))
+                        
+                        ;; Add bias if provided
+                        (when bias
+                          (let ((bias-data (tensor-data bias)))
+                            (do ((cout 0 (+ cout 1)))
+                                ((= cout Cout))
+                              (let ((b (elt-ref bias-data cout)))
+                                (do ((i 0 (+ i 1)))
+                                    ((= i (* OH OW)))
+                                  (let ((idx (+ (* cout OH OW) i)))
+                                    (elt-set! img-output idx
+                                             (+ (elt-ref img-output idx) b))))))))
+                        
+                        ;; Copy to output
+                        (copy-to output-data img-output Yoffset: output-offset 
+                                 size: (* Cout OH OW)))))))))
+          
+          (let ((result (make-base-tensor output-data
+                                         (list N Cout OH OW)
+                                         dtype
+                                         requires-grad?)))
+            
+            (when requires-grad?
+              (set-backward-fn! result
+                (lambda ()
+                  (let ((grad-out (tensor-grad result)))
+                    
+                    ;; Gradient w.r.t. input
+                    (when (tensor-requires-grad? input)
+                      (let ((grad-input-data (with-dtype dtype (vec (* N Cin H W) 0.0))))
+                        
+                        (with-dtype dtype
+                          (do ((n 0 (+ n 1)))
+                              ((= n N))
+                            
+                            (let ((output-offset (* n Cout OH OW))
+                                  (input-offset (* n Cin H W))
+                                  (weight-data (tensor-data weight)))
+                              
+                              ;; Extract gradient for this image
+                              (let ((grad-img-out (vec (* Cout OH OW) 0.0)))
+                                (copy-to grad-img-out grad-out 
+                                         Xoffset: output-offset size: (* Cout OH OW))
+                                
+                                ;; grad_col = weight^T @ grad_out
+                                (let ((grad-col-data (vec (* Cin KH KW OH OW) 0.0)))
+                                  (gemm! RowMajor Trans NoTrans
+                                         (* Cin KH KW) (* OH OW) Cout
+                                         1.0 weight-data grad-img-out
+                                         0.0 grad-col-data
+                                         lda: (* Cin KH KW)
+                                         ldb: (* OH OW)
+                                         ldc: (* OH OW))
+                                  
+                                  ;; col2im
+                                  (let* ((grad-col (make-base-tensor grad-col-data
+                                                                    (list (* Cin KH KW) (* OH OW))
+                                                                    dtype #f))
+                                         (grad-img (col2im grad-col Cin H W
+                                                          KH KW stride-h stride-w pad-h pad-w)))
+                                    (copy-to grad-input-data (tensor-data grad-img)
+                                             Yoffset: input-offset size: (* Cin H W))))))))
+                        
+                        (add-to-grad! input grad-input-data)))
+                    
+                    ;; Gradient w.r.t. weight (accumulate across batch)
+                    (when (tensor-requires-grad? weight)
+                      (let ((grad-weight-data (with-dtype dtype (vec (* Cout Cin KH KW) 0.0))))
+                        
+                        (with-dtype dtype
+                          (do ((n 0 (+ n 1)))
+                              ((= n N))
+                            
+                            (let ((output-offset (* n Cout OH OW))
+                                  (col-offset (* n Cin KH KW OH OW)))
+                              
+                              ;; Extract gradient and col for this image
+                              (let ((grad-img-out (vec (* Cout OH OW) 0.0))
+                                    (col-data (vec (* Cin KH KW OH OW) 0.0)))
+                                (copy-to grad-img-out grad-out
+                                         Xoffset: output-offset size: (* Cout OH OW))
+                                (copy-to col-data all-cols-data
+                                         Xoffset: col-offset size: (* Cin KH KW OH OW))
+                                
+                                ;; Accumulate: grad_weight += grad_out @ col^T
+                                (gemm! RowMajor NoTrans Trans
+                                       Cout (* Cin KH KW) (* OH OW)
+                                       1.0 grad-img-out col-data
+                                       1.0 grad-weight-data
+                                       lda: (* OH OW)
+                                       ldb: (* OH OW)
+                                       ldc: (* Cin KH KW))))))
+                        
+                        (add-to-grad! weight grad-weight-data)))
+                    
+                    ;; Gradient w.r.t. bias (sum across batch and spatial dims)
+                    (when (and bias (tensor-requires-grad? bias))
+                      (let ((grad-bias-data (with-dtype dtype (vec Cout 0.0))))
+                        
+                        (with-dtype dtype
+                          (do ((n 0 (+ n 1)))
+                              ((= n N))
+                            (do ((cout 0 (+ cout 1)))
+                                ((= cout Cout))
+                              (let ((start-idx (+ (* n Cout OH OW) (* cout OH OW)))
+                                    (end-idx (+ (* n Cout OH OW) (* (+ cout 1) OH OW))))
+                                (let ((sum (compensated-sum dtype grad-out start-idx end-idx)))
+                                  (elt-set! grad-bias-data cout
+                                           (+ (elt-ref grad-bias-data cout) sum)))))))
+                        
+                        (add-to-grad! bias grad-bias-data)))))
+                
+                (if bias
+                    (list input weight bias)
+                    (list input weight))))
+            
+            result))))
+     
+     (else
+      (error 'conv2d 
+             (format #f "conv2d only supports 3D or 4D inputs, got ~AD" ndim))))))
+  
   ;;; ==================================================================
   ;;; Activation Functions
   ;;; ==================================================================
@@ -1469,246 +1633,801 @@
       result)))
 
 
-  (define (softmax x #!key (dim #f))
-    "Softmax activation"
+  (define (softmax x #!key (axis -1))
+    "Softmax activation with batch support.
+
+     For 1D input (n_classes,): Standard softmax
+     For 2D input (batch_size, n_classes): Softmax along axis (default: last axis)
+   
+     Args:
+       x: Input tensor
+       axis: Axis to apply softmax over (default: -1 for last axis)
+   
+     Returns:
+       Tensor with same shape as input, where elements along axis sum to 1"
   
     (let* ((dtype (tensor-dtype x))
            (shape-x (tensor-shape x))
+           (ndim (length shape-x))
            (data-x (tensor-data x))
            (requires-grad? (tensor-requires-grad? x)))
       
-      (unless (= (length shape-x) 1)
-        (error 'softmax "Currently only supports 1D tensors"))
-    
-      (let* ((n (car shape-x))
-             (result-data (with-dtype dtype (vec n 0.0))))
-      
-        ;; Find max
-        (let ((max-val (with-dtype dtype (fold max -inf.0 data-x))))
-          
-          ;; Compute exp(x - max) and sum with compensated summation
-          (let ((exp-sum
-                 (with-dtype dtype
-                             (let loop ((i 0) (sum 0.0) (c 0.0))
-                               (if (= i n)
-                                   sum
-                                   (let* ((exp-val (exp (- (elt-ref data-x i) max-val)))
-                                          ;; Store exp value for later
-                                          (_ (elt-set! result-data i exp-val))
-                                          ;; compensated summation
-                                          (y (- exp-val c))
-                                          (t (+ sum y))
-                                          (new-c (- (- t sum) y)))
-                                     (loop (+ i 1) t new-c)))))))
-
+      ;; Normalize axis
+      (let ((axis-norm (if (< axis 0) (+ ndim axis) axis)))
+        
+        (unless (and (>= axis-norm 0) (< axis-norm ndim))
+          (error 'softmax (format #f "Axis ~A out of range for ~AD tensor" axis ndim)))
+        
+        (cond
+         ;; Case 1: 1D input
+         ((= ndim 1)
+          (let* ((n (car shape-x))
+                 (result-data (with-dtype dtype (vec n 0.0))))
             
-            ;; Normalize using BLAS scal
-            (with-dtype dtype (scal! n (/ 1.0 exp-sum) result-data))
+            ;; Find max
+            (let ((max-val (with-dtype dtype (fold max -inf.0 data-x))))
             
-            (let ((result (make-base-tensor result-data shape-x dtype requires-grad?)))
+              ;; Compute exp(x - max) and sum with compensated summation
+              (let ((exp-sum
+                     (with-dtype dtype
+                                 (let loop ((i 0) (sum 0.0) (c 0.0))
+                                   (if (= i n)
+                                       sum
+                                       (let* ((exp-val (exp (- (elt-ref data-x i) max-val)))
+                                              ;; Store exp value for later
+                                              (_ (elt-set! result-data i exp-val))
+                                              ;; compensated summation
+                                              (y (- exp-val c))
+                                              (t (+ sum y))
+                                              (new-c (- (- t sum) y)))
+                                         (loop (+ i 1) t new-c)))))))
               
-              (when requires-grad?
-                (set-backward-fn! result
-                                  (lambda ()
-                                    (let ((grad-out (tensor-grad result)))
-                                      
-                                      ;; Use BLAS dot for efficiency
-                                      (let* ((dot-prod (with-dtype dtype (dot n grad-out result-data)))
-                                             (grad-x (with-dtype dtype (vec n 0.0))))
-                                        
-                                        ;; Method using BLAS operations:
-                                        ;; 1. grad_x = grad_out (copy)
-                                        ;; 2. grad_x -= dot_prod (subtract scalar from all elements)
-                                        ;; 3. grad_x *= softmax (element-wise multiply)
-                      
-                                        (with-dtype dtype
-                                           ;; Copy grad_out to grad_x
-                                           (copy-to grad-x grad-out)
-                                           ;; Subtract dot_prod from each element and multiply by softmax
-                                           (do ((i 0 (+ i 1)))
-                                               ((= i n))
-                                             (elt-set! grad-x i
-                                                       (* (elt-ref result-data i)
-                                                          (- (elt-ref grad-x i)
-                                                             dot-prod)))))
-                                        
-                                        (add-to-grad! x grad-x))))
-                                  
-                                  (list x)))
+                ;; Normalize using BLAS scal
+                (with-dtype dtype (scal! n (/ 1.0 exp-sum) result-data))
               
-              result))))))
-
-  (define (log-softmax x #!key (dim #f))
-    "Log-softmax: log(softmax(x))
-     More numerically stable than computing log(softmax(x)) separately.
-   
-   Forward: log_softmax(x)[i] = x[i] - max(x) - log(sum(exp(x[j] - max(x))))
-   
-   Gradient: dL/dx = dL/dy - exp(log_softmax) * sum(dL/dy)"
-  
-    (let* ((dtype (tensor-dtype x))
-           (shape-x (tensor-shape x))
-           (data-x (tensor-data x))
-           (requires-grad? (tensor-requires-grad? x)))
-      
-      (unless (= (length shape-x) 1)
-        (error 'log-softmax "Currently only supports 1D tensors"))
-      
-      (let* ((n (car shape-x))
-             (result-data (with-dtype dtype (vec n 0.0))))
-      
-        ;; Find max
-        (let ((max-val (with-dtype dtype (fold max -inf.0 data-x))))
-          
-          ;; Compute sum of exp(x - max)
-          (let ((exp-sum
-                 (with-dtype dtype
-                             (let loop ((i 0) (sum 0.0) (c 0.0))
-                               (if (= i n)
-                                   sum
-                                   (let* ((exp-val (exp (- (elt-ref data-x i) max-val)))
-                                          ;; Store exp value for later
-                                          (_ (elt-set! result-data i exp-val))
-                                          ;; compensated summation
-                                          (y (- exp-val c))
-                                          (t (+ sum y))
-                                          (new-c (- (- t sum) y)))
-                                     (loop (+ i 1) t new-c)))))))
+                (let ((result (make-base-tensor result-data shape-x dtype requires-grad?)))
+                
+                  (when requires-grad?
+                    (set-backward-fn!
+                     result
+                     (lambda ()
+                       (let ((grad-out (tensor-grad result)))
+                         
+                         ;; Use BLAS dot for efficiency
+                         (let* ((dot-prod (with-dtype dtype (dot n grad-out result-data)))
+                                (grad-x (with-dtype dtype (vec n 0.0))))
+                           
+                           ;; grad_x = softmax * (grad_out - dot_prod)
+                           (with-dtype dtype
+                                       (copy-to grad-x grad-out)
+                                       (do ((i 0 (+ i 1)))
+                                           ((= i n))
+                                         (elt-set! grad-x i
+                                                   (* (elt-ref result-data i)
+                                                      (- (elt-ref grad-x i) dot-prod)))))
+                           
+                           (add-to-grad! x grad-x))))
+                     (list x)))
+                  
+                  result)))))
+       
+         ;; Case 2: 2D input, softmax over last axis (axis=1)
+         ((and (= ndim 2) (= axis-norm 1))
+          (let ((batch-size (car shape-x))
+                (n-classes (cadr shape-x)))
             
-            (let ((log-sum-exp (log exp-sum)))
+            (let ((result-data (with-dtype dtype (vec (* batch-size n-classes) 0.0))))
               
-              ;; Compute: log_softmax[i] = x[i] - max - log_sum_exp
+              ;; Process each batch element
               (with-dtype dtype
-                          (do ((i 0 (+ i 1)))
-                              ((= i n))
-                            (elt-set! result-data i
-                                      (- (elt-ref data-x i) max-val log-sum-exp))))
+                          (do ((b 0 (+ b 1)))
+                              ((= b batch-size))
+                            
+                            (let ((offset (* b n-classes)))
+                              
+                              ;; Extract row
+                              (let ((row (vec n-classes 0.0)))
+                                (copy-to row data-x Xoffset: offset size: n-classes)
+                                
+                                ;; Find max for this row
+                                (let ((max-val (fold max -inf.0 row)))
+                                  
+                                  ;; Compute exp(x - max) and sum
+                                  (let ((exp-sum
+                                         (let loop ((i 0) (sum 0.0) (c 0.0))
+                                           (if (= i n-classes)
+                                               sum
+                                               (let* ((exp-val (exp (- (elt-ref row i) max-val)))
+                                                      (_ (elt-set! row i exp-val))
+                                                      (y (- exp-val c))
+                                                      (t (+ sum y))
+                                                      (new-c (- (- t sum) y)))
+                                                 (loop (+ i 1) t new-c))))))
+                                    
+                                    ;; Normalize
+                                    (scal! n-classes (/ 1.0 exp-sum) row)
+                                    
+                                    ;; Copy back to result
+                                    (copy-to result-data row Yoffset: offset size: n-classes)))))))
               
               (let ((result (make-base-tensor result-data shape-x dtype requires-grad?)))
                 
                 (when requires-grad?
-                  (set-backward-fn! result
-                                    (lambda ()
-                                      (let ((grad-out (tensor-grad result)))
-                                        
-                                        ;; Compute sum of grad_out
-                                        (let ((grad-sum
-                                               (with-dtype dtype
-                                                          (let loop ((i 0) (sum 0.0))
-                                                            (if (= i n)
-                                                                sum
-                                                                (loop (+ i 1) 
-                                                                      (+ sum (elt-ref grad-out i))))))))
-                                          
-                                          (let ((grad-x (with-dtype dtype (vec n 0.0))))
-                                            
-                                            ;; grad_x[i] = grad_out[i] - exp(log_softmax[i]) * grad_sum
-                                            (with-dtype dtype
-                                               (do ((i 0 (+ i 1)))
-                                                   ((= i n))
-                                                 (elt-set! grad-x i
-                                                           (- (elt-ref grad-out i)
-                                                              (* (exp (elt-ref result-data i))
-                                                                 grad-sum)))))
-                                            
-                                            (add-to-grad! x grad-x)))))
-                                    
-                                    (list x)))
+                  (set-backward-fn!
+                   result
+                   (lambda ()
+                     (let ((grad-out (tensor-grad result))
+                           (grad-x (with-dtype dtype (vec (* batch-size n-classes) 0.0))))
+                       
+                       ;; Process each batch element
+                       (with-dtype dtype
+                                   (do ((b 0 (+ b 1)))
+                                       ((= b batch-size))
+                                     
+                                     (let ((offset (* b n-classes)))
+                                       
+                                       ;; Extract rows
+                                       (let ((grad-row (vec n-classes 0.0))
+                                             (softmax-row (vec n-classes 0.0)))
+                                         
+                                         (copy-to grad-row grad-out Xoffset: offset size: n-classes)
+                                         (copy-to softmax-row result-data Xoffset: offset size: n-classes)
+                                         
+                                         ;; Compute dot product
+                                         (let ((dot-prod (dot n-classes grad-row softmax-row)))
+                                           
+                                           ;; grad_x[b] = softmax[b] * (grad_out[b] - dot_prod)
+                                           (do ((i 0 (+ i 1)))
+                                               ((= i n-classes))
+                                             (elt-set! grad-x (+ offset i)
+                                                       (* (elt-ref softmax-row i)
+                                                          (- (elt-ref grad-row i) dot-prod)))))))))
+                       
+                       (add-to-grad! x grad-x)))
+                   (list x)))
                 
-                result)))))))
+                result))))
+       
+         ;; Case 3: 2D input, softmax over first axis (axis=0)
+         ((and (= ndim 2) (= axis-norm 0))
+          (let ((n-rows (car shape-x))
+                (n-cols (cadr shape-x)))
+            
+            (let ((result-data (with-dtype dtype (vec (* n-rows n-cols) 0.0))))
+              
+              ;; Process each column
+              (with-dtype dtype
+                          (do ((col 0 (+ col 1)))
+                              ((= col n-cols))
+                            
+                            ;; Extract column
+                            (let ((column (vec n-rows 0.0)))
+                              (do ((row 0 (+ row 1)))
+                                  ((= row n-rows))
+                                (elt-set! column row 
+                                          (elt-ref data-x (+ (* row n-cols) col))))
+                              
+                              ;; Find max
+                              (let ((max-val (fold max -inf.0 column)))
+                                
+                                ;; Compute softmax for column
+                                (let ((exp-sum
+                                       (let loop ((i 0) (sum 0.0) (c 0.0))
+                                         (if (= i n-rows)
+                                             sum
+                                             (let* ((exp-val (exp (- (elt-ref column i) max-val)))
+                                                    (_ (elt-set! column i exp-val))
+                                                    (y (- exp-val c))
+                                                    (t (+ sum y))
+                                                    (new-c (- (- t sum) y)))
+                                               (loop (+ i 1) t new-c))))))
+                                  
+                                  ;; Normalize and scatter back
+                                  (scal! n-rows (/ 1.0 exp-sum) column)
+                                  (do ((row 0 (+ row 1)))
+                                      ((= row n-rows))
+                                    (elt-set! result-data (+ (* row n-cols) col)
+                                              (elt-ref column row))))))))
+              
+              (let ((result (make-base-tensor result-data shape-x dtype requires-grad?)))
+                
+                (when requires-grad?
+                  (set-backward-fn!
+                   result
+                   (lambda ()
+                     (let ((grad-out (tensor-grad result))
+                           (grad-x (with-dtype dtype (vec (* n-rows n-cols) 0.0))))
+                       
+                       ;; Process each column
+                       (with-dtype dtype
+                                   (do ((col 0 (+ col 1)))
+                                       ((= col n-cols))
+                                     
+                                     ;; Extract columns
+                                     (let ((grad-col (vec n-rows 0.0))
+                                           (softmax-col (vec n-rows 0.0)))
+                                       
+                                       (do ((row 0 (+ row 1)))
+                                           ((= row n-rows))
+                                         (elt-set! grad-col row
+                                       (elt-ref grad-out (+ (* row n-cols) col)))
+                                         (elt-set! softmax-col row
+                                                   (elt-ref result-data (+ (* row n-cols) col))))
+                                       
+                                       ;; Compute dot product
+                                       (let ((dot-prod (dot n-rows grad-col softmax-col)))
+                                         
+                                         ;; Scatter gradient back
+                                         (do ((row 0 (+ row 1)))
+                                             ((= row n-rows))
+                                           (elt-set! grad-x (+ (* row n-cols) col)
+                                                     (* (elt-ref softmax-col row)
+                                                        (- (elt-ref grad-col row) dot-prod))))))))
+                       
+                       (add-to-grad! x grad-x)))
+                   (list x)))
+                
+                result))))
+         
+         (else
+          (error 'softmax 
+                 (format #f "Softmax with axis=~A not yet implemented for ~AD tensors" 
+                         axis ndim)))))))
 
+
+  (define (log-softmax x #!key (axis -1))
+    "Log-softmax with batch support: log(softmax(x))
+   
+     More numerically stable than computing log(softmax(x)) separately.
+
+     Forward: log_softmax(x)[i] = x[i] - max(x) - log(sum(exp(x[j] - max(x))))
+   
+     Gradient: dL/dx = dL/dy - exp(log_softmax) * sum(dL/dy)
+   
+     For 1D input (n_classes,): Standard log-softmax
+     For 2D input (batch_size, n_classes): Log-softmax along axis
+   
+     Args:
+       x: Input tensor
+       axis: Axis to apply log-softmax over (default: -1 for last axis)"
+  
+    (let* ((dtype (tensor-dtype x))
+           (shape-x (tensor-shape x))
+           (ndim (length shape-x))
+           (data-x (tensor-data x))
+           (requires-grad? (tensor-requires-grad? x)))
+      
+      ;; Normalize axis
+      (let ((axis-norm (if (< axis 0) (+ ndim axis) axis)))
+        
+        (unless (and (>= axis-norm 0) (< axis-norm ndim))
+          (error 'log-softmax (format #f "Axis ~A out of range for ~AD tensor" axis ndim)))
+        
+        (cond
+         ;; Case 1: 1D input
+         ((= ndim 1)
+          (let* ((n (car shape-x))
+                 (result-data (with-dtype dtype (vec n 0.0))))
+            
+            ;; Find max
+            (let ((max-val (with-dtype dtype (fold max -inf.0 data-x))))
+              
+              ;; Compute sum of exp(x - max)
+              (let ((exp-sum
+                     (with-dtype dtype
+                                 (let loop ((i 0) (sum 0.0) (c 0.0))
+                                   (if (= i n)
+                                       sum
+                                       (let* ((exp-val (exp (- (elt-ref data-x i) max-val)))
+                                              (_ (elt-set! result-data i exp-val))
+                                              (y (- exp-val c))
+                                              (t (+ sum y))
+                                              (new-c (- (- t sum) y)))
+                                         (loop (+ i 1) t new-c)))))))
+                
+                (let ((log-sum-exp (log exp-sum)))
+                  
+                  ;; Compute: log_softmax[i] = x[i] - max - log_sum_exp
+                  (with-dtype dtype
+                              (do ((i 0 (+ i 1)))
+                                  ((= i n))
+                                (elt-set! result-data i
+                                          (- (elt-ref data-x i) max-val log-sum-exp))))
+                  
+                  (let ((result (make-base-tensor result-data shape-x dtype requires-grad?)))
+                    
+                    (when requires-grad?
+                      (set-backward-fn!
+                       result
+                       (lambda ()
+                         (let ((grad-out (tensor-grad result)))
+                           
+                           ;; Compute sum of grad_out
+                           (let ((grad-sum
+                                  (with-dtype dtype
+                                              (let loop ((i 0) (sum 0.0))
+                                                (if (= i n)
+                                                    sum
+                                                    (loop (+ i 1) (+ sum (elt-ref grad-out i))))))))
+                             
+                             (let ((grad-x (with-dtype dtype (vec n 0.0))))
+                               
+                               ;; grad_x[i] = grad_out[i] - exp(log_softmax[i]) * grad_sum
+                               (with-dtype dtype
+                                           (do ((i 0 (+ i 1)))
+                                               ((= i n))
+                                             (elt-set! grad-x i
+                                                       (- (elt-ref grad-out i)
+                                                          (* (exp (elt-ref result-data i))
+                                                             grad-sum)))))
+                               
+                               (add-to-grad! x grad-x)))))
+                       (list x)))
+                    
+                    result))))))
+         
+         ;; Case 2: 2D input, log-softmax over last axis
+         ((and (= ndim 2) (= axis-norm 1))
+          (let ((batch-size (car shape-x))
+                (n-classes (cadr shape-x)))
+            
+            (let ((result-data (with-dtype dtype (vec (* batch-size n-classes) 0.0))))
+              
+              ;; Process each batch element
+              (with-dtype dtype
+                          (do ((b 0 (+ b 1)))
+                              ((= b batch-size))
+                            
+                            (let ((offset (* b n-classes)))
+                              
+                              ;; Extract row
+                              (let ((row (vec n-classes 0.0)))
+                                (copy-to row data-x Xoffset: offset size: n-classes)
+                                
+                                ;; Find max
+                                (let ((max-val (fold max -inf.0 row)))
+                                  
+                                  ;; Compute sum of exp(x - max)
+                                  (let ((exp-sum
+                                         (let loop ((i 0) (sum 0.0) (c 0.0))
+                                           (if (= i n-classes)
+                                               sum
+                                               (let* ((exp-val (exp (- (elt-ref row i) max-val)))
+                                                      (y (- exp-val c))
+                                                      (t (+ sum y))
+                                                      (new-c (- (- t sum) y)))
+                                                 (loop (+ i 1) t new-c))))))
+                                    
+                                    (let ((log-sum-exp (log exp-sum)))
+                                      
+                                      ;; Compute log-softmax for this row
+                                      (do ((i 0 (+ i 1)))
+                                          ((= i n-classes))
+                                        (elt-set! result-data (+ offset i)
+                                                  (- (elt-ref row i) max-val log-sum-exp))))))))))
+            
+            (let ((result (make-base-tensor result-data shape-x dtype requires-grad?)))
+              
+              (when requires-grad?
+                (set-backward-fn!
+                 result
+                 (lambda ()
+                   (let ((grad-out (tensor-grad result))
+                         (grad-x (with-dtype dtype (vec (* batch-size n-classes) 0.0))))
+                     
+                     ;; Process each batch element
+                     (with-dtype dtype
+                                 (do ((b 0 (+ b 1)))
+                                     ((= b batch-size))
+                                   
+                                   (let ((offset (* b n-classes)))
+                                     
+                                     ;; Extract gradient row
+                                     (let ((grad-row (vec n-classes 0.0)))
+                                       (copy-to grad-row grad-out Xoffset: offset size: n-classes)
+                                       
+                                       ;; Sum gradients
+                                       (let ((grad-sum
+                                              (let loop ((i 0) (sum 0.0))
+                                                (if (= i n-classes)
+                                                    sum
+                                                    (loop (+ i 1) (+ sum (elt-ref grad-row i)))))))
+                                         
+                                         ;; Compute gradient
+                                         (do ((i 0 (+ i 1)))
+                                             ((= i n-classes))
+                                           (elt-set! grad-x (+ offset i)
+                                                     (- (elt-ref grad-row i)
+                                                        (* (exp (elt-ref result-data (+ offset i)))
+                                                           grad-sum)))))))))
+                     
+                     (add-to-grad! x grad-x)))
+                 (list x)))
+              
+              result))))
+        
+        (else
+         (error 'log-softmax 
+                (format #f "Log-softmax with axis=~A not yet implemented for ~AD tensors" 
+                        axis ndim))))))
+    )
+  
   ;;; ==================================================================
   ;;; Loss Functions
   ;;; ==================================================================
 
-  ;; Mean Squared Error Loss
-  (define (mse-loss pred target)
+  ;; Mean Squared Error Loss with batch support
+  (define (mse-loss pred target #!key (reduction 'mean))
+    "Mean Squared Error loss with batch support.
+   
+     Args:
+       pred: Predictions tensor (any shape)
+       target: Target tensor (same shape as pred)
+       reduction: 'mean (default) - average over all elements
+                  'sum' - sum over all elements
+                  'none' - return per-element loss
+   
+     For batched inputs (batch_size, ...):
+       - Computes loss per sample
+       - Returns scalar (averaged or summed over batch)
+   
+     Gradient: Distributed across batch"
+  
     (assert (eq? (tensor-dtype pred) (tensor-dtype target)))
+    (assert (equal? (tensor-shape pred) (tensor-shape target)))
+  
     (let* ((dtype (tensor-dtype pred))
            (data-pred (tensor-data pred))
            (data-target (tensor-data target))
            (n (vector-length-for-dtype data-pred dtype))
-           (requires-grad? (tensor-requires-grad? pred))
-           ;; Forward: L = 0.5 * (1/n) * \sum(pred - target)^2
-           (loss-value
-             (with-dtype dtype
-                         (let loop ((i 0) (sum 0.0))
-                           (if (= i n)
-                               ;; Multiply by 0.5 for cleaner gradients
-                               (* 0.5 (/ sum (exact->inexact n)))
-                               (let ((diff (- (elt-ref data-pred i)
-                                              (elt-ref data-target i))))
-                                 (loop (+ i 1)
-                                       (+ sum (* diff diff))))))))
-           )
+           (requires-grad? (tensor-requires-grad? pred)))
       
-      ;; Create scalar tensor for loss
-      (let ((loss-tensor (make-base-tensor
-                          (with-dtype dtype (vec0 loss-value))
-                         '(1) dtype requires-grad?)))
-        (when requires-grad?
-          (set-backward-fn! loss-tensor
-            (lambda ()
-              ;; Gradient: dL/d pred_i = (1/n) * (pred_i - target_i)
-              ;; The 0.5 coefficient in forward pass cancels the factor of 2 from d/dx[x^2]
-              (let ((grad-pred (with-dtype dtype (vec n 0.0)))
-                    (scale-factor (/ 1.0 (exact->inexact n))))
+      (case reduction
+        ;; Mean reduction: average over all elements
+        ((mean)
+         (let ((loss-value
                 (with-dtype dtype
-                   (do ((i 0 (+ i 1)))
-                       ((= i n))
-                     (elt-set! grad-pred i
-                               (* scale-factor
-                                  (- (elt-ref data-pred i)
-                                     (elt-ref data-target i))))))
+                            (let loop ((i 0) (sum 0.0))
+                              (if (= i n)
+                                  (* 0.5 (/ sum (exact->inexact n)))
+                                  (let ((diff (- (elt-ref data-pred i)
+                                                 (elt-ref data-target i))))
+                                    (loop (+ i 1) (+ sum (* diff diff)))))))))
+         
+           (let ((loss-tensor (make-base-tensor
+                               (with-dtype dtype (vec0 loss-value))
+                               '(1) dtype requires-grad?)))
+             (when requires-grad?
+               (set-backward-fn!
+                loss-tensor
+                (lambda ()
+                  ;; Gradient: dL/d pred_i = (1/n) * (pred_i - target_i)
+                  (let ((grad-pred (with-dtype dtype (vec n 0.0)))
+                        (scale-factor (/ 1.0 (exact->inexact n))))
+                    (with-dtype dtype
+                                (do ((i 0 (+ i 1)))
+                                    ((= i n))
+                                  (elt-set! grad-pred i
+                                            (* scale-factor
+                                               (- (elt-ref data-pred i)
+                                                  (elt-ref data-target i))))))
+                   
+                    (add-to-grad! pred grad-pred)))
+                (list pred)))
+             loss-tensor)))
+      
+        ;; Sum reduction: sum over all elements
+        ((sum)
+         (let ((loss-value
+                (with-dtype dtype
+                            (let loop ((i 0) (sum 0.0))
+                              (if (= i n)
+                                  (* 0.5 sum)
+                                  (let ((diff (- (elt-ref data-pred i)
+                                                 (elt-ref data-target i))))
+                                    (loop (+ i 1) (+ sum (* diff diff)))))))))
+           
+           (let ((loss-tensor (make-base-tensor
+                               (with-dtype dtype (vec0 loss-value))
+                               '(1) dtype requires-grad?)))
+             (when requires-grad?
+               (set-backward-fn!
+                loss-tensor
+                (lambda ()
+                  (let ((grad-pred (with-dtype dtype (vec n 0.0))))
+                    (with-dtype dtype
+                                (do ((i 0 (+ i 1)))
+                                    ((= i n))
+                                  (elt-set! grad-pred i
+                                            (- (elt-ref data-pred i)
+                                               (elt-ref data-target i)))))
+                    
+                    (add-to-grad! pred grad-pred)))
+                (list pred)))
+             loss-tensor)))
+        
+        (else
+         (error 'mse-loss 
+                (format #f "Unknown reduction: ~A (expected 'mean or 'sum)" reduction))))))
 
-                (add-to-grad! pred grad-pred)))
-            (list pred)
-            ))
-        loss-tensor)))
 
-  ;; Cross Entropy Loss (simplified, assumes softmax already applied)
-  (define (cross-entropy-loss pred target)
+  ;; Cross Entropy Loss with batch handling
+  (define (cross-entropy-loss pred target #!key (reduction 'mean) (from-logits #f))
+    "Cross Entropy loss with batch support.
+   
+     Args:
+       pred: Predictions tensor
+             If from-logits=#f: (batch_size, n_classes) with probabilities (softmax applied)
+             If from-logits=#t: (batch_size, n_classes) with logits (raw scores)
+       target: Target tensor
+               One-hot: (batch_size, n_classes) with 0/1 values
+               Class indices: (batch_size,) with integer class labels [0, n_classes)
+       reduction: 'mean (default) - average over batch
+                  'sum' - sum over batch
+       from-logits: If true, apply log-softmax to pred first
+   
+     Returns:
+       Scalar loss tensor"
+  
     (assert (eq? (tensor-dtype pred) (tensor-dtype target)))
+  
     (let* ((dtype (tensor-dtype pred))
-           (data-pred (tensor-data pred))
-           (data-target (tensor-data target))
-           (n (vector-length-for-dtype data-pred dtype))
-           (requires-grad? (tensor-requires-grad? pred))
-           ;; Forward: L = -\sum(target * log(pred))
-           (loss-value
-             (with-dtype dtype
-                         (let loop ((i 0) (sum 0.0))
-                           (if (= i n) (- sum)
-                               (loop (+ i 1)
-                                     (+ sum (* (elt-ref data-target i)
-                                               (log (max 1e-10 (elt-ref data-pred i))))))))))
-           )
+           (pred-shape (tensor-shape pred))
+           (target-shape (tensor-shape target))
+           (requires-grad? (tensor-requires-grad? pred)))
+
+      (cond
+       ;; Case 0: 1D input (single sample)
+       ((= (length pred-shape) 1)
+        (let ((n-classes (car pred-shape)))
+    
+          ;; Apply log to get log-probabilities
+          (let ((log-probs (if from-logits
+                               (log-softmax pred)
+                               ;; Already probabilities, take log
+                               (let* ((data-pred (tensor-data pred))
+                                      (log-data (with-dtype dtype (vec n-classes 0.0))))
+                                 (with-dtype dtype
+                                             (do ((i 0 (+ i 1)))
+                                                 ((= i n-classes))
+                                               (elt-set! log-data i
+                                                         (log (max 1e-10 (elt-ref data-pred i))))))
+                                 (make-base-tensor log-data pred-shape dtype #t)))))
       
-      (let ((loss-tensor (make-base-tensor
-                         (with-dtype dtype (vec0 loss-value))
-                         '(1) dtype requires-grad?)))
-        (when requires-grad?
-          (set-backward-fn!
-           loss-tensor
-           (lambda ()
-                              
-              ;; Gradient: dL/dpred_i = -target_i / pred_i
-              (let ((grad-pred (with-dtype dtype (vec n 0.0))))
-                (with-dtype dtype
-                            (do ((i 0 (+ i 1)))
-                                ((= i n))
-                              (elt-set! grad-pred i
-                                        (- (/ (elt-ref data-target i)
-                                              (max 1e-10 (elt-ref data-pred i)))))))
-                (add-to-grad! pred grad-pred)
-                ))
-            (list pred)))
-        loss-tensor)))
+            (let ((log-probs-data (tensor-data log-probs)))
+        
+              (cond
+               
+               ;; Target is one-hot encoded (n_classes,)
+               ((equal? target-shape pred-shape)
+                (let ((data-target (tensor-data target)))
+                  
+                  (let ((loss-value
+                         (with-dtype dtype
+                                     (let loop ((i 0) (sum 0.0))
+                                       (if (= i n-classes)
+                                           (- sum)
+                                           (loop (+ i 1)
+                                                 (+ sum (* (elt-ref data-target i)
+                                                           (elt-ref log-probs-data i)))))))))
+              
+                    (let ((loss-tensor (make-base-tensor
+                                        (with-dtype dtype (vec0 loss-value))
+                                        '(1) dtype requires-grad?)))
+                      (when requires-grad?
+                        (set-backward-fn!
+                         loss-tensor
+                         (lambda ()
+                           (if from-logits
+                               (let ((grad-log-probs (with-dtype dtype (vec n-classes 0.0))))
+                                 (with-dtype dtype
+                                             (do ((i 0 (+ i 1)))
+                                                 ((= i n-classes))
+                                               (elt-set! grad-log-probs i
+                                                         (- (elt-ref data-target i)))))
+                                 (add-to-grad! log-probs grad-log-probs)
+                                 (backward! log-probs))
+                               (let ((grad-pred (with-dtype dtype (vec n-classes 0.0)))
+                                     (data-pred (tensor-data pred)))
+                                 (with-dtype dtype
+                                             (do ((i 0 (+ i 1)))
+                                                 ((= i n-classes))
+                                               (elt-set! grad-pred i
+                                                         (- (/ (elt-ref data-target i)
+                                                               (max 1e-10 (elt-ref data-pred i)))))))
+                                 (add-to-grad! pred grad-pred))))
+                         (list pred)))
+                      loss-tensor))))
+         
+               ;; Target is class index (scalar)
+               ((equal? target-shape '(1))
+                (let ((data-target (tensor-data target)))
+            
+                  (let ((loss-value
+                         (with-dtype dtype
+                                     (let* ((class-idx (inexact->exact (elt-ref data-target 0)))
+                                            (log-prob (elt-ref log-probs-data class-idx)))
+                                       (- log-prob)))))
+              
+                    (let ((loss-tensor (make-base-tensor
+                                        (with-dtype dtype (vec0 loss-value))
+                                        '(1) dtype requires-grad?)))
+                      (when requires-grad?
+                        (set-backward-fn!
+                         loss-tensor
+                         (lambda ()
+                           (if from-logits
+                               (let ((grad-log-probs (with-dtype dtype (vec n-classes 0.0)))
+                                     (class-idx (inexact->exact (with-dtype dtype (elt-ref data-target 0)))))
+                                 (with-dtype dtype
+                                             (elt-set! grad-log-probs class-idx -1.0))
+                                 (add-to-grad! log-probs grad-log-probs)
+                                 (backward! log-probs))
+                               (let ((grad-pred (with-dtype dtype (vec n-classes 0.0)))
+                                     (data-pred (tensor-data pred))
+                                     (class-idx (inexact->exact (with-dtype dtype (elt-ref data-target 0)))))
+                                 (with-dtype dtype
+                                             (elt-set! grad-pred class-idx
+                                                       (- (/ 1.0 (max 1e-10 (elt-ref data-pred class-idx))))))
+                                 (add-to-grad! pred grad-pred))))
+                         (list pred)))
+                      loss-tensor))))
+               
+               (else
+                (error 'cross-entropy-loss 
+                       (format #f "Target shape ~A incompatible with pred shape ~A" 
+                               target-shape pred-shape))))))))
+ 
+       ((= (length pred-shape) 2)
+        (let ((batch-size (car pred-shape))
+              (n-classes (cadr pred-shape)))
+        
+          ;; Apply log-softmax if needed
+          (let ((log-probs (if from-logits
+                               (log-softmax pred axis: -1)
+                               ;; Already probabilities, take log
+                               (let* ((data-pred (tensor-data pred))
+                                      (n (* batch-size n-classes))
+                                      (log-data (with-dtype dtype (vec n 0.0))))
+                                 (with-dtype dtype
+                                             (do ((i 0 (+ i 1)))
+                                                 ((= i n))
+                                               (elt-set! log-data i
+                                                         (log (max 1e-10 (elt-ref data-pred i))))))
+                                 (make-base-tensor log-data pred-shape dtype #t)))))
+            
+            (let ((log-probs-data (tensor-data log-probs)))
+              
+              (cond
+               ;; Case 1: Target is one-hot encoded (batch_size, n_classes)
+               ((equal? target-shape pred-shape)
+                (let ((data-target (tensor-data target))
+                      (n (* batch-size n-classes)))
+                  
+                  (let ((loss-value
+                         (with-dtype dtype
+                                     (let loop ((i 0) (sum 0.0))
+                                       (if (= i n)
+                                           (case reduction
+                                             ((mean) (- (/ sum (exact->inexact batch-size))))
+                                             ((sum) (- sum))
+                                             (else (error 'cross-entropy-loss "Unknown reduction")))
+                                           (loop (+ i 1)
+                                                 (+ sum (* (elt-ref data-target i)
+                                                           (elt-ref log-probs-data i)))))))))
+                    
+                    (let ((loss-tensor (make-base-tensor
+                                        (with-dtype dtype (vec0 loss-value))
+                                        '(1) dtype requires-grad?)))
+                      (when requires-grad?
+                        (set-backward-fn!
+                         loss-tensor
+                         (lambda ()
+                           ;; For one-hot targets: grad = -target / pred (if not from-logits)
+                           ;; or use log-softmax gradient if from-logits
+                           (if from-logits
+                               ;; Gradient flows through log-softmax
+                               (let ((grad-log-probs (with-dtype dtype (vec n 0.0)))
+                                     (scale (case reduction
+                                              ((mean) (/ 1.0 (exact->inexact batch-size)))
+                                              ((sum) 1.0))))
+                                 (with-dtype dtype
+                                             (do ((i 0 (+ i 1)))
+                                                 ((= i n))
+                                               (elt-set! grad-log-probs i
+                                                         (* (- scale) (elt-ref data-target i)))))
+                                 (add-to-grad! log-probs grad-log-probs)
+                                 (backward! log-probs))
+                               
+                               ;; Direct gradient to pred
+                               (let ((grad-pred (with-dtype dtype (vec n 0.0)))
+                                     (data-pred (tensor-data pred))
+                                     (scale (case reduction
+                                              ((mean) (/ 1.0 (exact->inexact batch-size)))
+                                              ((sum) 1.0))))
+                                 (with-dtype dtype
+                                             (do ((i 0 (+ i 1)))
+                                                 ((= i n))
+                                               (elt-set! grad-pred i
+                                                         (* (- scale)
+                                                            (/ (elt-ref data-target i)
+                                                               (max 1e-10 (elt-ref data-pred i)))))))
+                                 (add-to-grad! pred grad-pred))))
+                         (list pred)))
+                      loss-tensor))))
+               
+               ;; Case 2: Target is class indices (batch_size,)
+               ((and (= (length target-shape) 1)
+                     (= (car target-shape) batch-size))
+                
+                (let ((data-target (tensor-data target)))
+                  
+                  (let ((loss-value
+                         (with-dtype dtype
+                                     (let loop ((b 0) (sum 0.0))
+                                       (if (= b batch-size)
+                                           (case reduction
+                                             ((mean) (- (/ sum (exact->inexact batch-size))))
+                                             ((sum) (- sum)))
+                                           (let* ((class-idx (inexact->exact (elt-ref data-target b)))
+                                                  (log-prob (elt-ref log-probs-data 
+                                                                     (+ (* b n-classes) class-idx))))
+                                             (loop (+ b 1) (+ sum log-prob))))))))
+                    
+                    (let ((loss-tensor (make-base-tensor
+                                        (with-dtype dtype (vec0 loss-value))
+                                        '(1) dtype requires-grad?)))
+                      (when requires-grad?
+                        (set-backward-fn!
+                         loss-tensor
+                         (lambda ()
+                           (if from-logits
+                               ;; Gradient through log-softmax: softmax - one_hot
+                               (let ((grad-log-probs (with-dtype dtype 
+                                                                 (vec (* batch-size n-classes) 0.0)))
+                                     (scale (case reduction
+                                              ((mean) (/ 1.0 (exact->inexact batch-size)))
+                                              ((sum) 1.0))))
+                                 (with-dtype dtype
+                                             (do ((b 0 (+ b 1)))
+                                                 ((= b batch-size))
+                                               (let ((class-idx (inexact->exact (elt-ref data-target b)))
+                                                     (offset (* b n-classes)))
+                                                 (elt-set! grad-log-probs (+ offset class-idx)
+                                                           (- scale)))))
+                                 (add-to-grad! log-probs grad-log-probs)
+                                 (backward! log-probs))
+                               ;; Direct gradient to probabilities
+                               (let ((grad-pred (with-dtype dtype 
+                                                            (vec (* batch-size n-classes) 0.0)))
+                                     (data-pred (tensor-data pred))
+                                     (scale (case reduction
+                                              ((mean) (/ 1.0 (exact->inexact batch-size)))
+                                              ((sum) 1.0))))
+                                 (with-dtype dtype
+                                             (do ((b 0 (+ b 1)))
+                                                 ((= b batch-size))
+                                               (let ((class-idx (inexact->exact (elt-ref data-target b)))
+                                                     (offset (* b n-classes)))
+                                                 (elt-set! grad-pred (+ offset class-idx)
+                                                           (* (- scale)
+                                                              (/ 1.0 (max 1e-10 
+                                                                          (elt-ref data-pred 
+                                                                                   (+ offset class-idx)))))))))
+                                 (add-to-grad! pred grad-pred))))
+                         (list pred)))
+                      loss-tensor))))
+               
+               (else
+                (error 'cross-entropy-loss 
+                       (format #f "Target shape ~A incompatible with pred shape ~A" 
+                               target-shape pred-shape)))))))))
+      ))
 
 
-;;; ==================================================================
-;;; Reduction Operations (Gradient-Aware Fold)
-;;; ==================================================================
+  ;;; ==================================================================
+  ;;; Reduction Operations (Gradient-Aware Fold)
+  ;;; ==================================================================
 
   (define (reduce-tensor tensor reducer #!key (compute-gradient #f))
     "Generic reduction operation that maintains gradient flow.
@@ -1818,93 +2537,225 @@
   ;;; Utilities
   ;;; ==================================================================
 
-  
   (define (rmsnorm x weight #!key (epsilon 1e-5))
-    "Root Mean Square Normalization."
+  "Root Mean Square Normalization with batch support.
+   
+   For 1D input (d_model,): Standard RMSNorm
+   For 2D input (batch_size, d_model): RMSNorm applied to each batch element independently
+   
+   Formula per element: output[i] = (x[i] / RMS(x)) * weight[i]
+   where RMS(x) = sqrt(mean(x^2) + epsilon)"
   
-    (assert (eq? (tensor-dtype x) (tensor-dtype weight)))
+  (assert (eq? (tensor-dtype x) (tensor-dtype weight)))
+  
+  (let* ((dtype (tensor-dtype x))
+         (x-shape (tensor-shape x))
+         (ndim (length x-shape))
+         (data-x (tensor-data x))
+         (data-w (tensor-data weight))
+         (requires-grad? (or (tensor-requires-grad? x)
+                             (tensor-requires-grad? weight))))
     
-    (let* ((dtype (tensor-dtype x))
-           (data-x (tensor-data x))
-           (data-w (tensor-data weight))
-           (requires-grad? (or (tensor-requires-grad? x)
-                               (tensor-requires-grad? weight))))
-      
-      (let* ((n (vector-length-for-dtype data-x dtype))
-             
-             ;; Compute RMS using BLAS dot
-             (x-dot-x (with-dtype dtype (dot n data-x data-x)))
-             (rms (sqrt (+ epsilon (/ x-dot-x (exact->inexact n)))))
-             (inv-rms (/ 1.0 rms))
-             
-             (result-data (with-dtype dtype (vec n 0.0)))
-             (normalized-data (with-dtype dtype (vec n 0.0)))
-             )
+    (cond
+     ;; Case 1: 1D input (single vector)
+     ((= ndim 1)
+      (let ((d-model (car x-shape)))
         
-        ;; Copy and scale: normalized = x / rms
-        (with-dtype dtype
-           (copy-to normalized-data data-x)
-           (scal! n inv-rms normalized-data))
+        (unless (= d-model (car (tensor-shape weight)))
+          (error 'rmsnorm "Weight dimension mismatch"))
         
-        ;; Element-wise multiply with weight
-        (with-dtype dtype
-           (do ((i 0 (+ i 1)))
-               ((= i n))
-             (elt-set! result-data i
-                       (* (elt-ref normalized-data i)
-                          (elt-ref data-w i)))))
-        
-        (let ((result (make-base-tensor result-data (tensor-shape x) dtype requires-grad?)))
+        (let* ((n d-model)
+               ;; Compute RMS using BLAS dot
+               (x-dot-x (with-dtype dtype (dot n data-x data-x)))
+               (rms (sqrt (+ epsilon (/ x-dot-x (exact->inexact n)))))
+               (inv-rms (/ 1.0 rms))
+               
+               (result-data (with-dtype dtype (vec n 0.0)))
+               (normalized-data (with-dtype dtype (vec n 0.0))))
           
-          (when requires-grad?
-            (set-backward-fn! result
-                              (lambda ()
-                                (let ((grad-out (tensor-grad result)))
-                                  
-                                  ;; Gradient for weight
-                                  (when (tensor-requires-grad? weight)
-                                    (let ((grad-weight (with-dtype dtype (vec n 0.0))))
-                                      (with-dtype dtype
-                                         (do ((i 0 (+ i 1)))
-                                             ((= i n))
-                                           (elt-set! grad-weight i
-                                                     (* (elt-ref grad-out i)
-                                                              (elt-ref normalized-data i)))))
-                                      (add-to-grad! weight grad-weight)))
-                                  
-                                  ;; Gradient for x
-                                  (when (tensor-requires-grad? x)
-                                    (let ((grad-normalized (with-dtype dtype (vec n 0.0))))
-                                      
-                                      ;; grad_normalized = grad_out * weight
-                                      (with-dtype dtype
-                                         (do ((i 0 (+ i 1)))
-                                             ((= i n))
-                                           (elt-set! grad-normalized i
-                                                           (* (elt-ref grad-out i)
-                                                              (elt-ref data-w i)))))
-                                      
-                                      (let* ((dot-prod (with-dtype dtype (dot n grad-normalized data-x)))
-                                             (mean-term (/ dot-prod (exact->inexact n)))
-                                             (grad-x (with-dtype dtype (vec n 0.0))))
-                                        
-                                        ;; Compute: grad_x = (grad_normalized - normalized * mean_term) / rms
-                                        (with-dtype dtype
-                                           (copy-to grad-x grad-normalized)
-                                           ;; Subtract: grad_x -= normalized * mean_term
-                                           (axpy! n (- mean-term) normalized-data grad-x)
-                                           ;; Scale: grad_x /= rms
-                                           (scal! n inv-rms grad-x))
-
-                                        (add-to-grad! x grad-x)))))
-                                )
-                                
-                              (list x weight)))
+          ;; Copy and scale: normalized = x / rms
+          (with-dtype dtype
+                      (copy-to normalized-data data-x)
+                      (scal! n inv-rms normalized-data))
+          
+          ;; Element-wise multiply with weight
+          (with-dtype dtype
+                      (do ((i 0 (+ i 1)))
+                          ((= i n))
+                        (elt-set! result-data i
+                                  (* (elt-ref normalized-data i)
+                                     (elt-ref data-w i)))))
+          
+          (let ((result (make-base-tensor result-data x-shape dtype requires-grad?)))
             
-          result)))
-    )
-    
-
+            (when requires-grad?
+              (set-backward-fn!
+               result
+               (lambda ()
+                 (let ((grad-out (tensor-grad result)))
+                   
+                   ;; Gradient for weight
+                   (when (tensor-requires-grad? weight)
+                     (let ((grad-weight (with-dtype dtype (vec n 0.0))))
+                       (with-dtype dtype
+                                   (do ((i 0 (+ i 1)))
+                                       ((= i n))
+                                     (elt-set! grad-weight i
+                                               (* (elt-ref grad-out i)
+                                                  (elt-ref normalized-data i)))))
+                       (add-to-grad! weight grad-weight)))
+                    
+                    ;; Gradient for x
+                    (when (tensor-requires-grad? x)
+                      (let ((grad-normalized (with-dtype dtype (vec n 0.0))))
+                        
+                        ;; grad_normalized = grad_out * weight
+                        (with-dtype dtype
+                                    (do ((i 0 (+ i 1)))
+                                        ((= i n))
+                                      (elt-set! grad-normalized i
+                                                (* (elt-ref grad-out i)
+                                                   (elt-ref data-w i)))))
+                        
+                        (let* ((dot-prod (with-dtype dtype (dot n grad-normalized data-x)))
+                               (mean-term (/ dot-prod (exact->inexact n)))
+                               (grad-x (with-dtype dtype (vec n 0.0))))
+                          
+                          ;; Compute: grad_x = (grad_normalized - normalized * mean_term) / rms
+                          (with-dtype dtype
+                                      (copy-to grad-x grad-normalized)
+                                      ;; Subtract: grad_x -= normalized * mean_term
+                                      (axpy! n (- mean-term) normalized-data grad-x)
+                                      ;; Scale: grad_x /= rms
+                                      (scal! n inv-rms grad-x))
+                          
+                          (add-to-grad! x grad-x))))))
+               (list x weight)))
+            
+            result))))
+     
+     ;; Case 2: 2D input (batch of vectors)
+     ((= ndim 2)
+      (let ((batch-size (car x-shape))
+            (d-model (cadr x-shape)))
+        
+        (unless (= d-model (car (tensor-shape weight)))
+          (error 'rmsnorm "Weight dimension mismatch"))
+        
+        (let* ((result-data (with-dtype dtype (vec (* batch-size d-model) 0.0)))
+               (normalized-data (with-dtype dtype (vec (* batch-size d-model) 0.0)))
+               (rms-values (with-dtype dtype (vec batch-size 0.0))))
+          
+          ;; Process each batch element separately
+          (with-dtype dtype
+                      (do ((b 0 (+ b 1)))
+                          ((= b batch-size))
+                        
+                        (let ((offset (* b d-model)))
+                
+                          ;; Compute RMS for this batch element using BLAS
+                          (let* ((x-row (vec d-model 0.0)))
+                            ;; Copy row using BLAS
+                            (copy-to x-row data-x Xoffset: offset size: d-model)
+                            
+                            (let* ((x-dot-x (dot d-model x-row x-row))
+                                   (rms (sqrt (+ epsilon (/ x-dot-x (exact->inexact d-model)))))
+                                   (inv-rms (/ 1.0 rms)))
+                    
+                              ;; Store RMS for backward pass
+                              (elt-set! rms-values b rms)
+                    
+                              ;; Normalize this row using BLAS scal!
+                              (scal! d-model inv-rms x-row)
+                    
+                              ;; Store normalized values and apply weight
+                              ;; Copy normalized values to normalized-data
+                              (copy-to normalized-data x-row Yoffset: offset size: d-model)
+                    
+                              ;; Element-wise multiply with weight
+                              (do ((i 0 (+ i 1)))
+                                  ((= i d-model))
+                                (elt-set! result-data (+ offset i)
+                                          (* (elt-ref x-row i)
+                                             (elt-ref data-w i)))))))))
+          
+          (let ((result (make-base-tensor result-data x-shape dtype requires-grad?)))
+            
+            (when requires-grad?
+              (set-backward-fn! result
+                (lambda ()
+                  (let ((grad-out (tensor-grad result)))
+                    
+                    ;; Gradient for weight (sum across batch) using BLAS
+                    (when (tensor-requires-grad? weight)
+                      (let ((grad-weight (with-dtype dtype (vec d-model 0.0))))
+                        (with-dtype dtype
+                                    (do ((b 0 (+ b 1)))
+                                        ((= b batch-size))
+                                      (let ((offset (* b d-model)))
+                                        ;; For each batch element, accumulate:
+                                        ;; grad_weight += grad_out[b] * normalized[b]
+                                        (do ((i 0 (+ i 1)))
+                                            ((= i d-model))
+                                          (elt-set! grad-weight i
+                                                    (+ (elt-ref grad-weight i)
+                                                       (* (elt-ref grad-out (+ offset i))
+                                                          (elt-ref normalized-data (+ offset i)))))))))
+                        (add-to-grad! weight grad-weight)))
+                    
+                    ;; Gradient for x (per batch element) using BLAS
+                    (when (tensor-requires-grad? x)
+                      (let ((grad-x (with-dtype dtype (vec (* batch-size d-model) 0.0))))
+                        
+                        (with-dtype dtype
+                                    (do ((b 0 (+ b 1)))
+                                        ((= b batch-size))
+                                      
+                                      (let ((offset (* b d-model))
+                                            (inv-rms (/ 1.0 (elt-ref rms-values b))))
+                                        
+                                        ;; Extract rows for this batch element
+                                        (let ((grad-normalized (vec d-model 0.0))
+                                              (x-row (vec d-model 0.0))
+                                              (normalized-row (vec d-model 0.0)))
+                                          
+                                          ;; Copy using BLAS
+                                          (copy-to x-row data-x Xoffset: offset size: d-model)
+                                          (copy-to normalized-row normalized-data 
+                                                   Xoffset: offset size: d-model)
+                                          
+                                          ;; Compute grad_normalized = grad_out * weight element-wise
+                                          (do ((i 0 (+ i 1)))
+                                              ((= i d-model))
+                                            (elt-set! grad-normalized i
+                                                      (* (elt-ref grad-out (+ offset i))
+                                                         (elt-ref data-w i))))
+                                          
+                                          ;; Compute dot product using BLAS
+                                          (let* ((dot-prod (dot d-model grad-normalized x-row))
+                                                 (mean-term (/ dot-prod (exact->inexact d-model)))
+                                                 (grad-row (vec d-model 0.0)))
+                                            
+                                            ;; grad_row = grad_normalized (copy)
+                                            (copy-to grad-row grad-normalized)
+                                            
+                                            ;; grad_row -= normalized_row * mean_term (using BLAS axpy!)
+                                            (axpy! d-model (- mean-term) normalized-row grad-row)
+                                            
+                                            ;; grad_row *= inv_rms (using BLAS scal!)
+                                            (scal! d-model inv-rms grad-row)
+                                            
+                                            ;; Copy result to grad-x
+                                            (copy-to grad-x grad-row Yoffset: offset size: d-model))))))
+                        
+                        (add-to-grad! x grad-x)))))
+                (list x weight)))
+            
+            result))))
+     
+     (else
+      (error 'rmsnorm 
+             (format #f "RMSNorm only supports 1D or 2D inputs, got ~AD" ndim))))))
   
   ; Normalized dot product (cosine similarity)
   (define (cosine-similarity a b)
@@ -1929,20 +2780,208 @@
       (make-base-tensor result-data '(1) dtype #f)))
 
   ;; L2 normalization
-  (define (l2-normalize tensor #!key (epsilon 1e-8))
-    "L2 normalization: x / ||x||"
-    (let* ((dot-self (dot-op tensor tensor))
-           (dtype (tensor-dtype tensor))
-           (norm-squared (with-dtype dtype (elt-ref (tensor-data dot-self) 0)))
-           (norm (sqrt (+ norm-squared epsilon)))
-           (n (vector-length-for-dtype (tensor-data tensor) dtype))
-           (norm-tensor-data (with-dtype dtype (vec n norm)))
-           (norm-tensor (make-base-tensor norm-tensor-data
-                                          (tensor-shape tensor)
-                                          dtype
-                                          #f)))
-      (div tensor norm-tensor)))
   
+  (define (l2-normalize tensor #!key (axis #f) (epsilon 1e-8))
+    "L2 normalization with axis support.
+   
+     Args:
+       tensor: Input tensor
+       axis: Axis along which to normalize
+             - If #f (default): normalize entire tensor (legacy behavior)
+             - If integer: normalize along that axis
+       epsilon: Small value to avoid division by zero
+   
+     Returns:
+       Normalized tensor where ||output||_2 = 1 along specified axis"
+  
+    (let* ((dtype (tensor-dtype tensor))
+           (shape (tensor-shape tensor))
+           (ndim (length shape))
+           (data (tensor-data tensor))
+           (requires-grad? (tensor-requires-grad? tensor)))
+      
+      (cond
+       ;; Case 1: Normalize entire tensor (backward compatible)
+       ((not axis)
+        (let* ((n (vector-length-for-dtype data dtype))
+               (norm-squared (with-dtype dtype (dot n data data)))
+               (norm (sqrt (+ norm-squared epsilon)))
+               (result-data (with-dtype dtype (vec n 0.0))))
+          
+          (with-dtype dtype
+                      (copy-to result-data data)
+                      (scal! n (/ 1.0 norm) result-data))
+          
+          (let ((result (make-base-tensor result-data shape dtype requires-grad?)))
+            
+            (when requires-grad?
+              (set-backward-fn!
+               result
+               (lambda ()
+                 (let ((grad-out (tensor-grad result)))
+                   ;; Gradient: (grad_out - (result · grad_out) * result) / norm
+                   (let* ((dot-prod (with-dtype dtype (dot n grad-out result-data)))
+                          (grad-in (with-dtype dtype (vec n 0.0))))
+                     
+                     (with-dtype dtype
+                                 (copy-to grad-in grad-out)
+                                 (axpy! n (- dot-prod) result-data grad-in)
+                                 (scal! n (/ 1.0 norm) grad-in))
+                     
+                     (add-to-grad! tensor grad-in))))
+               (list tensor)))
+            
+            result)))
+       
+       ;; Case 2: 2D tensor, normalize along axis
+       ((and (= ndim 2) axis)
+        (let ((axis-norm (if (< axis 0) (+ ndim axis) axis)))
+          
+          (unless (and (>= axis-norm 0) (< axis-norm ndim))
+            (error 'l2-normalize (format #f "Axis ~A out of range for ~AD tensor" axis ndim)))
+          
+          (let ((n-rows (car shape))
+                (n-cols (cadr shape)))
+            
+            (cond
+             ;; Normalize along columns (each row becomes unit vector)
+             ((= axis-norm 1)
+              (let ((result-data (with-dtype dtype (vec (* n-rows n-cols) 0.0)))
+                    (norms (with-dtype dtype (vec n-rows 0.0))))
+                
+                (with-dtype dtype
+                            (do ((row 0 (+ row 1)))
+                                ((= row n-rows))
+                              
+                              (let ((offset (* row n-cols))
+                                    (row-data (vec n-cols 0.0)))
+                                
+                                ;; Extract row
+                                (copy-to row-data data Xoffset: offset size: n-cols)
+                                
+                                ;; Compute norm
+                                (let ((norm-squared (dot n-cols row-data row-data)))
+                                  (let ((norm (sqrt (+ norm-squared epsilon))))
+                                    (elt-set! norms row norm)
+                                    
+                                    ;; Normalize and copy back
+                                    (scal! n-cols (/ 1.0 norm) row-data)
+                                    (copy-to result-data row-data Yoffset: offset size: n-cols))))))
+                
+                (let ((result (make-base-tensor result-data shape dtype requires-grad?)))
+                  
+                  (when requires-grad?
+                    (set-backward-fn!
+                     result
+                     (lambda ()
+                       (let ((grad-out (tensor-grad result))
+                             (grad-in (with-dtype dtype (vec (* n-rows n-cols) 0.0))))
+                         
+                         (with-dtype dtype
+                                     (do ((row 0 (+ row 1)))
+                                         ((= row n-rows))
+                                       
+                                       (let ((offset (* row n-cols))
+                                             (grad-row (vec n-cols 0.0))
+                                             (result-row (vec n-cols 0.0))
+                                             (norm (elt-ref norms row)))
+                                         
+                                         (copy-to grad-row grad-out Xoffset: offset size: n-cols)
+                                         (copy-to result-row result-data Xoffset: offset size: n-cols)
+                                         
+                                         ;; Compute gradient for this row
+                                         (let ((dot-prod (dot n-cols grad-row result-row))
+                                               (grad-row-in (vec n-cols 0.0)))
+                                           
+                                           (copy-to grad-row-in grad-row)
+                                           (axpy! n-cols (- dot-prod) result-row grad-row-in)
+                                           (scal! n-cols (/ 1.0 norm) grad-row-in)
+                                           
+                                           (copy-to grad-in grad-row-in Yoffset: offset size: n-cols)))))
+                         
+                         (add-to-grad! tensor grad-in)))
+                     (list tensor)))
+                  
+                  result)))
+             
+           ;; Normalize along rows (each column becomes unit vector)
+             ((= axis-norm 0)
+              (let ((result-data (with-dtype dtype (vec (* n-rows n-cols) 0.0)))
+                    (norms (with-dtype dtype (vec n-cols 0.0))))
+                
+                (with-dtype dtype
+                            (do ((col 0 (+ col 1)))
+                                ((= col n-cols))
+                              
+                              ;; Extract column
+                              (let ((col-data (vec n-rows 0.0)))
+                                (do ((row 0 (+ row 1)))
+                                    ((= row n-rows))
+                                  (elt-set! col-data row
+                                            (elt-ref data (+ (* row n-cols) col))))
+                                
+                                ;; Compute norm
+                                (let ((norm-squared (dot n-rows col-data col-data)))
+                                  (let ((norm (sqrt (+ norm-squared epsilon))))
+                                    (elt-set! norms col norm)
+                                    
+                                    ;; Normalize and scatter back
+                                    (scal! n-rows (/ 1.0 norm) col-data)
+                                    (do ((row 0 (+ row 1)))
+                                        ((= row n-rows))
+                                      (elt-set! result-data (+ (* row n-cols) col)
+                                                (elt-ref col-data row))))))))
+                
+                (let ((result (make-base-tensor result-data shape dtype requires-grad?)))
+                  
+                  (when requires-grad?
+                    (set-backward-fn!
+                     result
+                     (lambda ()
+                       (let ((grad-out (tensor-grad result))
+                             (grad-in (with-dtype dtype (vec (* n-rows n-cols) 0.0))))
+                         
+                         (with-dtype dtype
+                                     (do ((col 0 (+ col 1)))
+                                         ((= col n-cols))
+                                       
+                                       (let ((grad-col (vec n-rows 0.0))
+                                             (result-col (vec n-rows 0.0))
+                                             (norm (elt-ref norms col)))
+                                         
+                                         ;; Extract columns
+                                         (do ((row 0 (+ row 1)))
+                                             ((= row n-rows))
+                                           (elt-set! grad-col row
+                                                     (elt-ref grad-out (+ (* row n-cols) col)))
+                                           (elt-set! result-col row
+                                                     (elt-ref result-data (+ (* row n-cols) col))))
+                                         
+                                         ;; Compute gradient
+                                         (let ((dot-prod (dot n-rows grad-col result-col))
+                                               (grad-col-in (vec n-rows 0.0)))
+                                           
+                                           (copy-to grad-col-in grad-col)
+                                           (axpy! n-rows (- dot-prod) result-col grad-col-in)
+                                           (scal! n-rows (/ 1.0 norm) grad-col-in)
+                                           
+                                           ;; Scatter back
+                                           (do ((row 0 (+ row 1)))
+                                               ((= row n-rows))
+                                             (elt-set! grad-in (+ (* row n-cols) col)
+                                                       (elt-ref grad-col-in row)))))))
+                         
+                         (add-to-grad! tensor grad-in)))
+                     (list tensor)))
+                  
+                  result)))))))
+        
+        (else
+         (error 'l2-normalize 
+                (format #f "L2 normalization with axis not yet implemented for ~AD tensors" 
+                        ndim))))
+       ))
+    
   
   ;; Helper functions for tensor creation
   (define (vector-length-for-dtype vec dtype)
@@ -2022,6 +3061,41 @@
           result))
       ))
 
+  (define (squeeze tensor #!key (axis #f))
+    "Remove dimensions of size 1 from tensor shape.
+   
+     Args:
+       tensor: Input tensor
+       axis: Optional specific axis to squeeze (must have size 1)
+             If #f (default), squeeze all dimensions with size 1
+   
+     Returns:
+       Tensor with singleton dimensions removed"
+  
+    (let* ((dtype (tensor-dtype tensor))
+           (old-shape (tensor-shape tensor))
+           (data (tensor-data tensor))
+           (requires-grad? (tensor-requires-grad? tensor)))
+    
+      (let* ((new-shape 
+              (if axis
+                  ;; Squeeze specific axis
+                  (let ((axis-norm (if (< axis 0) (+ (length old-shape) axis) axis)))
+                    (unless (and (>= axis-norm 0) (< axis-norm (length old-shape)))
+                      (error 'squeeze (format #f "Axis ~A out of range" axis)))
+                    (unless (= (list-ref old-shape axis-norm) 1)
+                      (error 'squeeze (format #f "Cannot squeeze axis ~A with size ~A" 
+                                              axis (list-ref old-shape axis-norm))))
+                    (append (take old-shape axis-norm)
+                            (drop old-shape (+ axis-norm 1))))
+                  ;; Squeeze all size-1 dimensions
+                  (filter (lambda (dim) (> dim 1)) old-shape)))
+             ;; Handle edge case: all dimensions squeezed -> scalar (1,)
+             (new-shape (if (null? new-shape) '(1) new-shape)))
+        
+        (reshape tensor new-shape))
+      ))
+  
   (define (print-tensor tensor)
     (printf "Tensor(dtype=~a, shape=~a, requires_grad=~a)\n"
             (tensor-dtype tensor)
