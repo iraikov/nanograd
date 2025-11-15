@@ -5,6 +5,9 @@
         (chicken base)
         (chicken format)
         (chicken random)
+        (chicken time)
+        (chicken file)
+        (chicken io)
         (srfi 1)
         (srfi 4)
         (srfi 42)
@@ -262,14 +265,7 @@
                               padding: 1
                               activation: (make-relu)
                               name: "Conv3")))
-          
-        (conv-layers
-         (make-sequential
-          conv-layers-list
-          name: "ConvLayers"))
-
-        (dense-layers
-         (make-sequential
+         (dense-layers-list
           (list
            (make-dense-layer (* 64 7 7) 128
                              activation: (make-relu)
@@ -277,12 +273,19 @@
            
            (make-dense-layer 128 num-classes
                              activation: (make-identity)
-                             name: "Output"))
-          name: "DenseLayers"))
+                             name: "Output")))
+         
+         
+        (model
+         (make-sequential
+          `(,@conv-layers-list
+            ,(make-flatten name: "Flatten")
+            ,@dense-layers-list)
+          name: "CNN"))
         )
-    (list conv-layers dense-layers
-          conv-layers-list
-          )
+    
+    (list model
+          conv-layers-list dense-layers-list)
   ))
 
 ;;; ==================================================================
@@ -314,14 +317,9 @@
 (define (forward-cnn model x)
   "Forward pass through CNN with explicit flattening"
   ;; Forward through convolutional layers
-  (let ((conv-layers (car model))
-        (dense-layers (cadr model)))
-    (let* (
-           (conv-out (forward conv-layers x))
-           (flat (flatten-tensor conv-out))
-           (logits (forward dense-layers flat))
-           )
-      logits)))
+  (let* ((model-layer (car model))
+         (logits (forward model-layer x)))
+      logits))
 
 ;;; ==================================================================
 ;;; Training Functions
@@ -435,10 +433,8 @@
   (let* ((total-loss 0.0)
          (correct 0)
          (n (length train-data))
-         (conv-layers (car model))
-         (dense-layers (cadr model))
-         (params (append (parameters conv-layers)
-                         (parameters dense-layers)))
+         (model-layer (car model))
+         (params (parameters model-layer))
          (monitor (make-gradient-monitor 
                    exploding-threshold: 10.0
                    vanishing-threshold: 1e-7)))
@@ -467,16 +463,16 @@
                 (batch-targets (stack-targets batch))
 
                 ;; Single forward pass for entire batch
-                (conv-out (forward conv-layers batch-images))
+                (logits (forward model-layer batch-images))
                 
                 ;; Flatten: (N, C, H, W) -> (N, C*H*W)
-                (batch-shape (tensor-shape conv-out))
-                (N (car batch-shape))
-                (flattened-size (apply * (cdr batch-shape)))
-                (flat (reshape conv-out (list N flattened-size)))
+                ;(batch-shape (tensor-shape conv-out))
+                ;(N (car batch-shape))
+                ;(flattened-size (apply * (cdr batch-shape)))
+                ;(flat (reshape conv-out (list N flattened-size)))
                 
                 ;; Dense layers: (N, features_in) -> (N, num_classes)
-                (logits (forward dense-layers flat))
+                ;(logits (forward dense-layers flat))
                 
                 ;; Softmax over classes: (N, num_classes)
                 (probs (softmax logits axis: -1))
@@ -521,13 +517,13 @@
            (step! optimizer)
            
            ;; Zero gradients for next batch
-           (zero-grad-layer! conv-layers)
-           (zero-grad-layer! dense-layers)))
+           (zero-grad-layer! model-layer)
+           ))
        batches))
 
     (if gradient-diagnostics
         (begin
-          (printf "\nTraining Diagnosis:\n")
+          (printf "\nTraining Diagnostics:\n")
           (let ((diagnosis (diagnose-training monitor)))
             (printf "Total steps: ~A\n" (cdr (assoc 'total-steps diagnosis)))
             (printf "Mean gradient norm: ~A\n" (cdr (assoc 'mean-gradient-norm diagnosis)))
@@ -540,10 +536,7 @@
   "Evaluate model on test data"
   (let ((correct 0)
         (total (length test-data))
-        (confusion (make-vector (* num-classes num-classes) 0))
-        ;; Unpack model parts
-        (conv-layers (car model))
-        (dense-layers (cadr model)))
+        (confusion (make-vector (* num-classes num-classes) 0)))
     
     (for-each
      (lambda (sample)
@@ -594,8 +587,7 @@
   (let ((correct 0)
         (total (length test-data))
         (confusion (make-vector (* num-classes num-classes) 0))
-        (conv-layers (car model))
-        (dense-layers (cadr model)))
+        (model-layer (car model)))
     
     ;; Split test data into batches
     (let ((batches (let loop ((remaining test-data)
@@ -621,12 +613,12 @@
                                              requires-grad?: #f))
                 
                 ;; Forward pass
-                (conv-out (forward conv-layers batch-images))
-                (batch-shape (tensor-shape conv-out))
-                (N (car batch-shape))
-                (flattened-size (apply * (cdr batch-shape)))
-                (flat (reshape conv-out (list N flattened-size)))
-                (logits (forward dense-layers flat))
+                ;(conv-out (forward conv-layers batch-images))
+                ;(batch-shape (tensor-shape conv-out))
+                ;(N (car batch-shape))
+                ;(flattened-size (apply * (cdr batch-shape)))
+                ;(flat (reshape conv-out (list N flattened-size)))
+                (logits (forward model-layer batch-images))
                 (logits-data (tensor-data logits)))
            
            ;; Process predictions
@@ -663,8 +655,8 @@
 
 (define (debug-forward-pass model batch-images batch-targets)
   "Forward pass with gradient flow debugging"
-  (let ((conv-layers (car model))
-        (dense-layers (cadr model)))
+  (let ((conv-layers (cadr model))
+        (dense-layers (caddr model)))
     
     (printf "\n=== Forward Pass Debug ===\n")
     
@@ -757,9 +749,7 @@
   (printf "Generating small test batch...\n")
   (let* ((test-batch (generate-dataset 2))  ; Just 2 samples per class = 8 total
          (small-batch (take test-batch 4))  ; Take 4 samples
-         (model (build-cnn))
-         (conv-layers (car model))
-         (dense-layers (cadr model)))
+         (model (build-cnn)))
     
     (printf "Building batch tensors...\n")
     (let ((batch-images (stack-images small-batch))
@@ -806,12 +796,13 @@
   ;; Build model
   (printf "Building CNN model...\n")
   (define model (build-cnn))
-  (define conv-layers (car model))
-  (define dense-layers (cadr model))
+  (define model-layer (car model))
+  (define conv-layers (make-sequential (cadr model) name: "Conv-Layers"))
+  (define dense-layers (make-sequential (caddr model) name: "Dense-Layers"))
   
   (printf "\nModel Architecture:\n")
   (printf "  Convolutional Layers:\n")
-  (let ((conv-params (parameters conv-layers)))
+  (let ((conv-params (parameters conv-layers )))
     (printf "    Parameters: ~A\n" 
             (fold (lambda (p acc)
                     (+ acc (f32vector-length (tensor-data p))))
@@ -832,13 +823,14 @@
   ;; Create optimizer
   (define learning-rate 0.001)
   (printf "Optimizer: Adam (lr=~A)\n\n" learning-rate)
-  (define optimizer (make-adam (append (parameters conv-layers)
-                                       (parameters dense-layers))
+  (define optimizer (make-adam (parameters model-layer)
                                learning-rate: learning-rate
                                weight-decay: 0.0001))
   
   ;; Training loop
   (define num-epochs 20)
+  (define best-acc 0.0)
+
   (printf "Training for ~A epochs...\n" num-epochs)
   (printf "----------------------------------------\n")
   
@@ -857,7 +849,14 @@
       ;; Evaluate every 5 epochs
       (when (= (modulo epoch 5) 0)
         (let-values (((test-acc confusion) (evaluate-batched model test-data batch-size: 64)))
-          (printf " - Test Acc: ~A" (* 100.0 test-acc))))
+          (printf " - Test Acc: ~A" (* 100.0 test-acc))
+          ;; Save checkpoint if best so far
+          (when (> test-acc best-acc)
+            (set! best-acc test-acc)
+            (printf "\n  New best accuracy! Saving checkpoint...")
+            (save-checkpoint model optimizer epoch avg-loss accuracy
+                             (sprintf "best-cnn-model_~A.ngrd" epoch)))))
+          
       
       (printf "\n"))
     
@@ -868,6 +867,11 @@
         (printf "  - Learning rate decreased to ~A\n" new-lr))))
   
   (printf "----------------------------------------\n\n")
+
+  ;; Save final model
+  (printf "Saving final model...\n")
+  (save-cnn-model model "final-cnn-model.ngrd")
+  (printf "\n")
   
   ;; Final evaluation
   (printf "Final Evaluation on Test Set:\n")
@@ -936,8 +940,8 @@
   
   (let ((params (parameters model))
         (layer-names '("Conv1-W" "Conv1-b" "Conv2-W" "Conv2-b" 
-                      "Conv3-W" "Conv3-b" "FC1-W" "FC1-b" 
-                      "FC2-W" "FC2-b")))
+                       "Conv3-W" "Conv3-b" "FC1-W" "FC1-b" 
+                       "FC2-W" "FC2-b")))
     
     (for-each
      (lambda (param name)
@@ -973,6 +977,114 @@
            (printf "\n"))))
      params
      layer-names)))
+
+;;; ==================================================================
+;;; Model Persistence
+;;; ==================================================================
+
+(define (save-cnn-model model filepath)
+  "Save CNN model to file
+   
+   Args:
+     model: The model tuple (conv-layers, dense-layers, conv-layers-internal)
+     filepath: Path where to save the model
+   
+   The model is saved as a two-layer sequential (conv + dense)"
+  
+  (let ((model-layer (car model))
+        (conv-layers (make-sequential (cadr model) name: "Conv-Layers"))
+        (dense-layers (make-sequential (caddr model) name: "Dense-Layers")))
+    
+    (printf "Saving model to ~A...\n" filepath)
+    
+      ;; Save using the built-in serialization
+      (save-model model-layer filepath)
+      
+      (printf "Model saved successfully!\n")
+      (printf "  Conv layers parameters: ~A\n" 
+              (length (parameters conv-layers)))
+      (printf "  Dense layers parameters: ~A\n" 
+              (length (parameters dense-layers)))
+      ))
+
+(define (load-cnn-model filepath)
+  "Load CNN model from file
+   
+   Args:
+     filepath: Path to the saved model
+   
+   Returns:
+     Model tuple compatible with forward-cnn and train functions"
+  
+  (printf "Loading model from ~A...\n" filepath)
+  
+  ;; Load the sequential model
+  (let* ((full-model (load-model filepath))
+         (ser (layer->serializable full-model))
+         (layer-type (assq 'type ser))
+         (layer-list (if (eq? (and layer-type (cdr layer-type)) 'sequential)
+                         (assq 'layers ser) '(layers)))
+         (layer-objects (map serializable->layer (cdr layer-list)))
+         (conv-layers (filter conv2d-layer? layer-objects))
+         (dense-layers (filter dense-layer? layer-objects)))
+
+    (printf "Model loaded successfully!\n")
+    
+    ;; The loaded model is a sequential containing conv and dense layers
+    ;; We need to extract them to match the expected model structure
+    
+    (list full-model
+          conv-layers
+          dense-layers)))
+
+;;; ==================================================================
+;;; Model Checkpointing
+;;; ==================================================================
+
+(define (save-checkpoint model optimizer epoch train-loss train-acc filepath)
+  "Save training checkpoint including model, optimizer state, and metrics"
+   
+  (printf "\nSaving checkpoint at epoch ~A...\n" epoch)
+  (save-cnn-model model filepath)
+  
+  (let ((metadata-file (string-append filepath ".meta")))
+    (with-output-to-file metadata-file
+      (lambda ()
+        (printf "epoch: ~A\n" epoch)
+        (printf "train-loss: ~A\n" train-loss)
+        (printf "train-acc: ~A\n" train-acc)
+        (printf "timestamp: ~A\n" (current-seconds)))))
+  
+  (printf "Checkpoint saved!\n"))
+
+(define (load-checkpoint filepath)
+  "Load a training checkpoint
+   
+   Returns: (model metadata)"
+  
+  (printf "Loading checkpoint from ~A...\n" filepath)
+  
+  (let ((model (load-cnn-model filepath))
+        (metadata-file (string-append filepath ".meta")))
+    
+    ;; Load metadata if it exists
+    (let ((metadata 
+           (if (file-exists? metadata-file)
+               (with-input-from-file metadata-file
+                 (lambda ()
+                   (let ((lines '()))
+                     (let loop ((line (read-line)))
+                       (unless (eof-object? line)
+                         (set! lines (cons line lines))
+                         (loop (read-line))))
+                     (reverse lines))))
+               '())))
+      
+      (when (not (null? metadata))
+        (printf "\nCheckpoint metadata:\n")
+        (for-each (lambda (line) (printf "  ~A\n" line)) metadata))
+      
+      (values model metadata))))
 
 ;;; ==================================================================
 ;;; Advanced Training: Data Augmentation
@@ -1060,3 +1172,4 @@
 
 (main)
 
+(define loaded-model (load-cnn-model "final-cnn-model.ngrd"))

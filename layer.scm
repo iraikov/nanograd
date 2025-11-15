@@ -3,10 +3,10 @@
 (module nanograd-layer
   (
    ;; Layer predicates and operations
-   layer? dense-layer? sequential?
+   layer? dense-layer? sequential? flatten-layer?
    
    ;; Layer construction
-   make-dense-layer make-sequential
+   make-dense-layer make-sequential make-flatten
    make-conv2d-layer conv2d-layer?
    
    ;; Layer operations
@@ -111,6 +111,7 @@
   (define-predicate layer?)
   (define-predicate dense-layer?)
   (define-predicate sequential?)
+  (define-predicate flatten-layer?)
   
   (define-operation (forward layer . rest))
   (define-operation (parameters layer))
@@ -188,6 +189,26 @@
              (format #f "~A: expected ~A but got ~A" 
                      context expected actual))))
 
+  (define (verify-flatten-transition before-layer flatten-layer after-layer)
+    "Verify that conv->flatten->dense transition is valid"
+    (let ((conv-output (layer-output-size before-layer))
+          (dense-input (layer-input-size after-layer)))
+    
+      (cond
+       ;; If both are known, we can verify the flattening math
+       ((and conv-output dense-input)
+        ;; For conv layers, output size is num channels
+        ;; Dense expects flattened size = channels * height * width
+        ;; We need to check if dense-input is a multiple of conv-output
+        (unless (and (> dense-input conv-output)
+                     (zero? (modulo dense-input conv-output)))
+          (printf "Warning: Flatten dimensions may be incompatible: ~A channels -> ~A features\n"
+                  conv-output dense-input)))
+       
+       ;; If either is unknown, we can't verify
+       (else
+        (void)))))
+  
   (define (serializable->layer serializable-repr)
     "Reconstruct a layer from its serializable representation with dimension checking"
     (let ((layer-type (cdr (assq 'type serializable-repr))))
@@ -302,54 +323,16 @@
           ;; Validate bias dimensions
           (check-dimension-match out-channels (car bias-shape)
                                 "Conv2D bias size")
-          
-          ;; Create layer with deserialized tensors
-          (object
-           ;; Type predicates
-           ((layer? self) #t)
-           ((conv2d-layer? self) #t)
-           
-           ;; Layer info
-           ((layer-name self) name)
-           ((layer-input-size self) in-channels)
-           ((layer-output-size self) out-channels)
-           ((layer-activation self) activation)
-           
-           ;; Forward pass
-           ((forward self input)
-            (let ((ishape (tensor-shape input)))
-              (unless (= (car ishape) in-channels)
-                (error 'forward 
-                       (format #f "Input channel mismatch: expected ~A, got ~A"
-                               in-channels (car ishape)))))
-            
-            (let* ((conv-output (conv2d input weights biases
-                                        stride: stride
-                                        padding: padding)))
-              (activation-forward activation conv-output)))
-           
-           ;; Get parameters
-           ((parameters self)
-            (list weights biases))
-           
-           ;; Zero gradients
-           ((zero-grad-layer! self)
-            (zero-grad! weights)
-            (zero-grad! biases))
 
-           ((layer->serializable self)
-            `((type . conv2d-layer)
-              (name . ,name)
-              (in-channels . ,in-channels)
-              (out-channels . ,out-channels)
-              (kernel-size . ,kernel-size)
-              (dtype . ,dtype)
-              (weights . ,(tensor->serializable weights))
-              (biases . ,(tensor->serializable biases))
-              (activation . ,(activation->serializable activation))))
-
-           ((save-layer self filepath)
-            (save-layer-to-file self filepath)))))
+          (make-conv2d-layer in-channels out-channels kernel-size
+                             stride: stride
+                             padding: padding
+                             activation: activation
+                             dtype: dtype
+                             name: name
+                             weight-values: (tensor-data weights)
+                             bias-values: (tensor-data biases))
+          ))
        
        ;; Sequential Layer Deserialization
        ((eq? layer-type 'sequential)
@@ -358,59 +341,40 @@
                
                ;; Recursively deserialize all layers
                (layers (map serializable->layer layers-ser)))
-          
-          ;; Verify layer connectivity (output of layer i matches input of layer i+1)
+
+          ;; Verify layer connectivity (allowing for dynamic dimensions)
           (let loop ((remaining-layers layers))
             (when (>= (length remaining-layers) 2)
               (let ((curr-layer (car remaining-layers))
                     (next-layer (cadr remaining-layers)))
-                (check-dimension-match 
-                 (layer-output-size curr-layer)
-                 (layer-input-size next-layer)
-                 (format #f "Sequential layer connectivity between ~A and ~A"
-                         (layer-name curr-layer)
-                         (layer-name next-layer))))
-              (loop (cdr remaining-layers))))
-          
-          ;; Create sequential layer
-          (object
-           ;; Type predicates
-           ((layer? self) #t)
-           ((sequential? self) #t)
-           
-           ;; Layer info
-           ((layer-name self) name)
-           ((layer-input-size self) 
-            (if (null? layers)
-                0
-                (layer-input-size (car layers))))
-           ((layer-output-size self)
-            (if (null? layers)
-                0
-                (layer-output-size (last layers))))
-           
-           ;; Forward pass (chain through all layers)
-           ((forward self input)
-            (fold (lambda (layer x)
-                    (forward layer x))
-                  input
-                  layers))
-           
-           ;; Get all parameters from all layers
-           ((parameters self)
-            (append-map parameters layers))
-           
-           ;; Zero gradients for all layers
-           ((zero-grad-layer! self)
-            (for-each zero-grad-layer! layers))
-           
-           ((layer->serializable self)
-            `((type . sequential)
-              (name . ,name)
-              (layers . ,(map layer->serializable layers))))
-           
-           ((save-layer self filepath)
-            (save-layer-to-file self filepath)))))
+                
+                (let ((curr-output (layer-output-size curr-layer))
+                      (next-input (layer-input-size next-layer)))
+                  
+                  ;; Only verify when both dimensions are statically known
+                  (cond
+                   ((and curr-output next-input)
+                    (check-dimension-match 
+                     curr-output
+                     next-input
+                     (format #f "Sequential layer connectivity between ~A and ~A"
+                             (layer-name curr-layer)
+                             (layer-name next-layer))))
+                   ;; Flatten in the middle - check if flattening makes sense
+                   ((flatten-layer? next-layer)
+                    (when (>= (length remaining-layers) 3)
+                      (let ((after-flatten (caddr remaining-layers)))
+                        (verify-flatten-transition curr-layer next-layer after-flatten))))
+                   ))
+              
+                (loop (cdr remaining-layers)))
+              ))
+          (make-sequential layers name: name)
+          ))
+
+       ((eq? layer-type 'flatten-layer)
+        (let ((name (cdr (assq 'name serializable-repr))))
+          (make-flatten name: name)))
        
        (else
         (error 'serializable->layer 
@@ -661,6 +625,7 @@
         (if (null? layer-list)
             0
             (layer-input-size (car layer-list))))
+       
        ((layer-output-size self)
         (if (null? layer-list)
             0
@@ -690,6 +655,51 @@
        ((save-layer self filepath)
         (save-layer-to-file self filepath)))))
 
+
+  (define (make-flatten #!key (name "Flatten"))
+    "Flatten layer: converts (N, C, H, W) -> (N, C*H*W) or (C, H, W) -> (C*H*W)"
+    (object
+     ((layer? self) #t)
+     ((flatten-layer? self) #t)
+     ((layer-name self) name)
+     
+     ((layer-input-size self) #f)   ; Unknown until runtime
+     ((layer-output-size self) #f)  ; Unknown until runtime
+     
+     ((forward self input)
+      (let* ((shape (tensor-shape input))
+             (ndim (length shape)))
+        (cond
+         ;; 4D: (N, C, H, W) -> (N, C*H*W)
+         ((= ndim 4)
+          (let ((N (car shape))
+                (flattened-size (apply * (cdr shape))))
+            (reshape input (list N flattened-size))))
+         
+         ;; 3D: (C, H, W) -> (C*H*W)
+         ((= ndim 3)
+          (let ((flattened-size (apply * shape)))
+            (reshape input (list flattened-size))))
+         
+         ;; Already flat
+         ((= ndim 2) input)
+         ((= ndim 1) input)
+         
+         (else
+          (error 'flatten (format #f "Cannot flatten ~AD tensor" ndim))))))
+   
+     ((parameters self) '())  ; No parameters
+     ((zero-grad-layer! self) (void))
+     ((set-training-mode! self train?) (void))
+     ((set-eval-mode! self) (void))
+     
+     ((layer->serializable self)
+      `((type . flatten-layer)
+        (name . ,name)))
+     
+     ((save-layer self filepath)
+      (save-layer-to-file self filepath))))
+  
   ;;; ==================================================================
   ;;; Layer Normalization
   ;;; ==================================================================
@@ -747,6 +757,8 @@
                              (padding 0)
                              (activation (make-identity))
                              (dtype 'f32)
+                             (weight-values #f)
+                             (bias-values #f)
                              (name "Conv2D"))
     "2D convolutional layer with batch support
    
@@ -763,17 +775,19 @@
            
            ;; Initialize weights: (out_channels, in_channels, KH, KW)
            (weight-size (* out-channels in-channels KH KW))
-           (weight-data (with-dtype
-                         dtype
-                         (let ((w (vec weight-size 0.0)))
-                           (do ((i 0 (+ i 1)))
-                               ((= i weight-size) w)
-                             (elt-set! w i
-                                       (* init-scale
-                                          (- (* 2.0 (pseudo-random-real)) 1.0)))))))
+           (weight-data (or weight-values
+                             (with-dtype
+                              dtype
+                              (let ((w (vec weight-size 0.0)))
+                                (do ((i 0 (+ i 1)))
+                                    ((= i weight-size) w)
+                                  (elt-set! w i
+                                            (* init-scale
+                                               (- (* 2.0 (pseudo-random-real)) 1.0))))))))
            
            ;; Initialize biases
-           (bias-data (with-dtype dtype (vec out-channels 0.0)))
+           (bias-data (or bias-values
+                          (with-dtype dtype (vec out-channels 0.0))))
            
            ;; Create parameter tensors
            (weights (case dtype

@@ -365,8 +365,8 @@
       
       (define forward-match
         (vectors-close? (tensor-data original-output)
-                       (tensor-data loaded-output)
-                       1e-6))
+                        (tensor-data loaded-output)
+                        1e-6))
       
       (test-result "Conv2D forward pass matches" forward-match)
       
