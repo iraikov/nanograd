@@ -168,16 +168,14 @@
    
         ;; Compute strides for old and new layouts
         (define (compute-strides shape)
-          (reverse
-           (cdr (reverse
-                 (fold (lambda (dim acc)
-                         (cons (* dim (car acc)) acc))
-                       '(1)
-                       (reverse shape))))))
+           (cdr (fold (lambda (dim acc)
+                        (cons (* dim (car acc)) acc))
+                      '(1)
+                      (reverse shape))))
         
         (let ((old-strides (compute-strides shape))
               (new-strides (compute-strides new-shape)))
-          
+
           ;; Copy data with transposed indices
           (let loop ((i 0))
             (when (< i size)
