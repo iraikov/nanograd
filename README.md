@@ -2,19 +2,20 @@
 
 A lightweight, YASOS-based automatic differentiation and neural
 network framework for CHICKEN Scheme, featuring BLAS-accelerated
-operations and a clean functional API.
+operations, batch processing support, and a clean functional API.
 
 ## Features
 
 - **Automatic Differentiation**: Reverse-mode autodiff with topological sorting for correct gradient computation
+- **Batch Processing**: Native support for batched operations across layers and loss functions
 - **BLAS Integration**: High-performance linear algebra operations using CBLAS
 - **YASOS Object System**: Clean, polymorphic object-oriented abstractions
 - **Mixed Precision**: Support for both 32-bit (f32) and 64-bit (f64) floating-point
-- **Neural Network Layers**: Dense layers, convolutional layers, batch normalization, and sequential containers
-- **Activation Functions**: ReLU, Tanh, Sigmoid, Softmax, LeakyReLU, Softplus, SiLU, GeLU
+- **Neural Network Layers**: Dense layers with batch support, convolutional layers (3D/4D), batch normalization, and sequential containers
+- **Activation Functions**: ReLU, Tanh, Sigmoid, Softmax (with batch support), LeakyReLU, Softplus, SiLU, GeLU
 - **Optimizers**: SGD (with momentum), Adam, RMSprop
-- **Loss Functions**: MSE, Cross-Entropy
-- **Advanced Operations**: Convolution, RMSNorm, Layer Normalization, Batch Normalization, Global Pooling
+- **Loss Functions**: MSE, Cross-Entropy (with batch support)
+- **Advanced Operations**: Convolution, RMSNorm (1D/2D), Layer Normalization, Batch Normalization (3D/4D), Global Pooling
 - **Tensor Operations**: Reduction operations, slicing, reshaping with full gradient support
 
 ## Installation
@@ -55,6 +56,29 @@ chicken-install
 (print-tensor (tensor-grad A))
 ```
 
+### Batch Processing
+
+```scheme
+;; Batch matrix multiplication
+(define X (make-tensor32 (make-f32vector 60) '(10 2 3)))  ; 10 samples, 2x3 each
+(define W (make-tensor32 (make-f32vector 12) '(3 4)))     ; Weight matrix 3x4
+
+;; Each of the 10 samples is multiplied by W
+(define Y (matmul-op X W))  ; Shape: (10, 2, 4)
+
+;; Batch normalization
+(define features (make-tensor32 (make-f32vector (* 32 64 8 8)) '(32 64 8 8)))
+(define bn-layer (make-batch-norm-2d 64))
+
+;; Training mode: uses batch statistics
+(set-training-mode! bn-layer #t)
+(define normalized (forward bn-layer features))  ; Normalized across batch
+
+;; Evaluation mode: uses running statistics
+(set-eval-mode! bn-layer)
+(define test-normalized (forward bn-layer test-features))
+```
+
 ### Reduction Operations
 
 ```scheme
@@ -89,7 +113,7 @@ chicken-install
 (print-tensor (tensor-grad batch))  ; Only positions 2-6 have gradients
 ```
 
-### Building a Neural Network
+### Building a Neural Network with Batch Support
 
 ```scheme
 (import nanograd-layer nanograd-optimizer)
@@ -106,7 +130,7 @@ chicken-install
 ;; Create optimizer
 (define optimizer (make-adam (parameters model) learning-rate: 0.001))
 
-;; Training loop
+;; Training loop with batches
 (do ((epoch 1 (+ epoch 1)))
     ((> epoch 10))
   
@@ -115,10 +139,12 @@ chicken-install
   
   (for-each
    (lambda (batch)
-     (let* ((x (car batch))
-            (target (cdr batch))
-            (pred (forward model x))
-            (loss (cross-entropy-loss (softmax pred) target)))
+     (let* ((x (car batch))        ; Shape: (batch_size, 784)
+            (target (cdr batch))   ; Shape: (batch_size, 10) one-hot
+            (pred (forward model x))  ; Shape: (batch_size, 10)
+            ;; Softmax and cross-entropy handle batches automatically
+            (probs (softmax pred axis: -1))  ; Softmax along last axis
+            (loss (cross-entropy-loss probs target reduction: 'mean)))
        
        ;; Backward pass and optimize
        (backward! loss)
@@ -137,23 +163,22 @@ chicken-install
 (define cnn
   (make-sequential
    (list
+    ;; Handles both 3D (C,H,W) and 4D (N,C,H,W) inputs
     (make-conv2d-layer 3 32 3 stride: 1 padding: 1 
                        activation: (make-relu) name: "Conv1")
-    (make-batch-norm-2d 32 name: "BN1")
+    (make-batch-norm-2d 32 name: "BN1")  ; Normalizes across batch
     (make-conv2d-layer 32 64 3 stride: 1 padding: 1 
                        activation: (make-relu) name: "Conv2")
     (make-batch-norm-2d 64 name: "BN2")
-    ;; Global average pooling reduces spatial dimensions
+    ;; Global average pooling: (N,64,H,W) -> (N,64) or (64,H,W) -> (64,)
+    (make-flatten name: "Flatten")
     (make-dense-layer 64 128 activation: (make-relu) name: "FC1")
     (make-dense-layer 128 10 activation: (make-identity) name: "Output"))
    name: "CNN"))
 
-;; Forward pass with global average pooling
-(define (forward-with-pooling model input)
-  (let* ((conv-output (forward (list-ref (get-layers model) 0) input))
-         (bn-output (forward (list-ref (get-layers model) 1) conv-output))
-         (pooled (global-avg-pool2d bn-output)))
-    (forward (list-ref (get-layers model) 2) pooled)))
+;; Forward pass with batched images
+(define batch-images (make-tensor32 batch-data '(32 3 32 32)))  ; 32 RGB images
+(define predictions (forward cnn batch-images))  ; Shape: (32, 10)
 ```
 
 ## Architecture
@@ -163,18 +188,18 @@ chicken-install
 - **`nanograd-autograd`**: Core automatic differentiation engine
   - Tensor abstraction with YASOS
   - Arithmetic operations (add, sub, mul, div)
-  - BLAS operations (matmul, dot, scale)
-  - Activation functions
-  - Loss functions
+  - BLAS operations (matmul, dot, scale) with batch support
+  - Activation functions (including batched softmax/log-softmax)
+  - Loss functions with batch reduction
   - Reduction operations (sum, mean, product, custom reductions)
   - Tensor manipulation (slice, reshape, flatten)
   - Gradient computation with cycle detection
 
 - **`nanograd-layer`**: Neural network layer abstractions
-  - Dense (fully connected) layers
-  - Convolutional layers (2D)
-  - Batch normalization (2D)
-  - Global average pooling
+  - Dense (fully connected) layers with 1D/2D input support
+  - Convolutional layers (2D) with 3D/4D input support
+  - Batch normalization (2D) with 3D/4D input support
+  - Global average pooling with 3D/4D support
   - Sequential containers
   - Activation function objects
   - Training/evaluation mode control
@@ -189,8 +214,9 @@ chicken-install
 1. **Functional Programming**: Immutable tensors, pure operations where possible
 2. **YASOS Objects**: Clean polymorphic dispatch for operations
 3. **BLAS Efficiency**: Leverage optimized linear algebra for performance
-4. **Explicit Gradient Management**: Manual control over backward passes
-5. **Mixed Precision**: First-class support for both f32 and f64
+4. **Batch-First Design**: Native batch support throughout the stack
+5. **Explicit Gradient Management**: Manual control over backward passes
+6. **Mixed Precision**: First-class support for both f32 and f64
 
 ## API Reference
 
@@ -222,7 +248,7 @@ chicken-install
 
 #### Linear Algebra
 ```scheme
-(matmul-op a b)            ; Matrix multiplication
+(matmul-op a b)            ; Matrix multiplication (batch-aware)
 (dot-op a b)               ; Dot product
 (scale-op tensor scalar)   ; Scalar multiplication
 ```
@@ -231,67 +257,62 @@ chicken-install
 ```scheme
 (reduce-tensor tensor reducer #:key (compute-gradient #f))
   ; Generic reduction with custom gradient
-  ; reducer: (element accumulator) -> new-accumulator
-  ; compute-gradient: (grad-out index value all-values) -> grad-in
-
-(sum-tensor tensor)        ; Sum all elements (gradient: uniform)
+  
+(sum-tensor tensor)        ; Sum all elements
 (mean-tensor tensor)       ; Mean of all elements
-(product-tensor tensor)    ; Product of all elements (gradient: product rule)
-```
-
-**Example: Custom Maximum Reduction**
-```scheme
-(define (max-tensor tensor)
-  (reduce-tensor tensor max
-    compute-gradient: (lambda (grad-out idx val all-values)
-                       ;; Gradient flows only to maximum element
-                       (if (= val (apply max all-values))
-                           grad-out
-                           0.0))))
+(product-tensor tensor)    ; Product of all elements
 ```
 
 #### Tensor Manipulation
 ```scheme
-(slice-tensor tensor start length)
-  ; Extract slice along first dimension
-  ; tensor: Input tensor with shape (n, ...)
-  ; start: Starting index
-  ; length: Number of elements to extract
-  ; Returns: Tensor with shape (length, ...)
-
-(reshape tensor new-shape)  ; Reshape (must preserve total elements)
-(flatten-tensor tensor)     ; Flatten to 1D
+(slice-tensor tensor start length)  ; Extract slice along first dimension
+(reshape tensor new-shape)           ; Reshape tensor
+(flatten-tensor tensor)              ; Flatten to 1D
 ```
 
-**Example: Batch Processing**
-```scheme
-;; Process mini-batches from a dataset
-(define dataset (make-tensor32 (make-f32vector 1000) '(100 10)))
-
-(do ((i 0 (+ i batch-size)))
-    ((>= i 100))
-  (let ((batch (slice-tensor dataset i batch-size)))
-    (process-batch model batch)))
-```
-
-#### Activations
+#### Activations (Batch-Aware)
 ```scheme
 (relu tensor)              ; ReLU activation
 (tanh-op tensor)           ; Hyperbolic tangent
 (sigmoid tensor)           ; Sigmoid (logistic)
 (sigmoid-stable tensor)    ; Numerically stable sigmoid
-(softmax tensor)           ; Softmax normalization
-(log-softmax tensor)       ; Log-softmax
+
+;; Batch-aware softmax
+(softmax tensor #:key (axis -1))
+  ; 1D: (n_classes,) -> standard softmax
+  ; 2D: (batch_size, n_classes) -> softmax along axis
+
+(log-softmax tensor #:key (axis -1))
+  ; More stable than log(softmax(x))
+
 (silu tensor)              ; SiLU
 (gelu tensor)              ; GeLU
 (leaky-relu tensor #:key (alpha 0.01))
 (softplus tensor #:key (beta 1.0))
 ```
 
-#### Loss Functions
+#### Loss Functions (Batch-Aware)
 ```scheme
-(mse-loss pred target)              ; Mean squared error
-(cross-entropy-loss pred target)    ; Cross-entropy loss
+(mse-loss pred target #:key (reduction 'mean))
+  ; reduction: 'mean (average over batch) or 'sum
+
+(cross-entropy-loss pred target #:key (reduction 'mean) (from-logits #f))
+  ; Supports both:
+  ;   - 1D: (n_classes,) for single sample
+  ;   - 2D: (batch_size, n_classes) for batches
+  ; target can be one-hot or class indices
+  ; from-logits: if true, applies log-softmax first
+```
+
+#### Normalization (Batch-Aware)
+```scheme
+(rmsnorm x weight #:key (epsilon 1e-5))
+  ; 1D: (d_model,) -> standard RMSNorm
+  ; 2D: (batch_size, d_model) -> RMSNorm per batch element
+
+(l2-normalize tensor #:key (axis #f) (epsilon 1e-8))
+  ; axis=#f: normalize entire tensor
+  ; axis=n: normalize along specific axis (for 2D tensors)
 ```
 
 #### Gradient Operations
@@ -309,107 +330,47 @@ chicken-install
                   #:key (activation (make-identity))
                         (dtype 'f32)
                         (name "Dense"))
+  ; Supports:
+  ;   1D input: (input_size,) -> (output_size,)
+  ;   2D input: (batch_size, input_size) -> (batch_size, output_size)
 
 (make-conv2d-layer in-channels out-channels kernel-size
-                   #:key (stride 1)
-                         (padding 0)
+                   #:key (stride 1) (padding 0)
                          (activation (make-identity))
                          (dtype 'f32)
                          (name "Conv2D"))
+  ; Supports:
+  ;   3D input: (C, H, W) -> (C_out, H_out, W_out)
+  ;   4D input: (N, C, H, W) -> (N, C_out, H_out, W_out)
 
 (make-batch-norm-2d num-features
-                    #:key (epsilon 1e-5)
-                          (momentum 0.1)
+                    #:key (epsilon 1e-5) (momentum 0.1)
                           (dtype 'f32)
                           (name "BatchNorm2d"))
+  ; Supports:
+  ;   3D input: (C, H, W) - treats as batch of 1
+  ;   4D input: (N, C, H, W) - normalizes across batch dimension
 
 (make-sequential layers #:key (name "Sequential"))
 ```
 
-#### Batch Normalization
-
-Batch Normalization normalizes activations across the batch dimension, improving training stability and convergence:
-
-```scheme
-;; Create batch norm layer for 64 channels
-(define bn (make-batch-norm-2d 64 epsilon: 1e-5 momentum: 0.1))
-
-;; In training mode: uses batch statistics and updates running stats
-(set-training-mode! bn #t)
-(define normalized (forward bn input))  ; input shape: (64, H, W)
-
-;; In eval mode: uses running statistics
-(set-eval-mode! bn)
-(define normalized (forward bn input))  ; Deterministic output
-```
-
-**Key Features:**
-- Learnable scale (gamma) and shift (beta) parameters
-- Running mean and variance for evaluation
-- Training/eval mode switching
-- Numerical stability with epsilon parameter
-
-#### Global Average Pooling
-
+#### Global Average Pooling (Batch-Aware)
 ```scheme
 (global-avg-pool2d input)
-  ; Global average pooling over spatial dimensions
-  ; Input shape: (C, H, W)
-  ; Output shape: (C,)
-  ; Gradients distributed uniformly over spatial dimensions
-```
-
-**Example: Replace Fully Connected Layers**
-```scheme
-;; Traditional approach: flatten + dense
-(define old-approach
-  (make-sequential
-   (list
-    (make-conv2d-layer 64 128 3)
-    ;; flatten: (128, 8, 8) -> (8192,)
-    (make-dense-layer 8192 10))))
-
-;; Modern approach: global average pooling + dense
-(define new-approach
-  (make-sequential
-   (list
-    (make-conv2d-layer 64 128 3)
-    ;; global avg pool: (128, 8, 8) -> (128,)
-    (make-dense-layer 128 10))))
-
-;; Fewer parameters, better generalization!
+  ; 3D: (C, H, W) -> (C,)
+  ; 4D: (N, C, H, W) -> (N, C)
+  ; Averages over spatial dimensions
 ```
 
 #### Layer Operations
 ```scheme
-(forward layer input)      ; Forward pass
+(forward layer input)      ; Forward pass (batch-aware)
 (parameters layer)         ; Get trainable parameters
 (zero-grad-layer! layer)   ; Zero all parameter gradients
 
 ;; Training/Evaluation Mode Control
-(set-training-mode! layer training?)  ; Set training mode (boolean)
-(set-eval-mode! layer)                ; Set evaluation mode (shorthand)
-```
-
-**Training vs Evaluation Mode:**
-- **Training Mode**: 
-  - Batch norm uses batch statistics
-  - Dropout is active (if implemented)
-  - Stochastic behavior enabled
-  
-- **Evaluation Mode**:
-  - Batch norm uses running statistics
-  - Dropout is disabled
-  - Deterministic behavior
-
-```scheme
-;; Training
-(set-training-mode! model #t)
-(for-each train-step training-batches)
-
-;; Evaluation
-(set-eval-mode! model)
-(define accuracy (evaluate model test-data))
+(set-training-mode! layer training?)  ; Set training mode
+(set-eval-mode! layer)                ; Set evaluation mode
 ```
 
 #### Activation Objects
@@ -457,62 +418,84 @@ Batch Normalization normalizes activations across the batch dimension, improving
 
 ## Examples
 
-See the `examples/` directory for complete working examples:
+### Batch Processing with Dense Layers
 
-- Linear regression
-- Binary classification
-- Multi-class classification
-- Learning rate scheduling
-- Batch training
-- Convolutional networks with batch normalization
+```scheme
+(import nanograd-autograd nanograd-layer)
 
-### Complete Training Example with Batch Norm
+;; Create a batch of inputs
+(define batch-size 32)
+(define input-dim 784)
+(define batch-data (make-f32vector (* batch-size input-dim)))
+
+;; ... fill with data ...
+
+(define batch-input (make-tensor32 batch-data (list batch-size input-dim)))
+
+;; Dense layer automatically handles batches
+(define layer (make-dense-layer input-dim 128 activation: (make-relu)))
+(define output (forward layer batch-input))  ; Shape: (32, 128)
+
+;; Batch normalization example
+(define features (make-tensor32 (make-f32vector (* 32 128)) '(32 128)))
+(define normalized (rmsnorm features gamma))  ; Normalized per batch element
+```
+
+### Batched Softmax and Cross-Entropy
+
+```scheme
+;; Batch of logits
+(define logits (make-tensor32 (make-f32vector (* 32 10)) '(32 10)))
+(define targets (make-tensor32 target-data '(32 10)))  ; One-hot encoded
+
+;; Softmax along class dimension (axis 1)
+(define probs (softmax logits axis: -1))  ; Shape: (32, 10), sums to 1 per row
+
+;; Cross-entropy handles batches automatically
+(define loss (cross-entropy-loss probs targets reduction: 'mean))
+
+;; Alternative: use from-logits for numerical stability
+(define loss-stable (cross-entropy-loss logits targets 
+                                        from-logits: #t 
+                                        reduction: 'mean))
+```
+
+### Complete Training Example with Batches
 
 ```scheme
 (import nanograd-autograd nanograd-layer nanograd-optimizer)
 
-;; Define ResNet-style block
-(define (make-resnet-block in-channels out-channels)
-  (make-sequential
-   (list
-    (make-conv2d-layer in-channels out-channels 3 
-                       padding: 1 activation: (make-identity))
-    (make-batch-norm-2d out-channels)
-    ;; ReLU applied separately
-    (make-conv2d-layer out-channels out-channels 3
-                       padding: 1 activation: (make-identity))
-    (make-batch-norm-2d out-channels))
-   name: "ResNetBlock"))
-
-;; Full model
+;; Define model
 (define model
   (make-sequential
    (list
-    (make-conv2d-layer 3 64 7 stride: 2 padding: 3)
-    (make-batch-norm-2d 64)
-    (make-resnet-block 64 64)
-    (make-resnet-block 64 128)
-    ;; ... more blocks ...
-    )
-   name: "ResNet"))
+    (make-dense-layer 784 256 activation: (make-relu))
+    (make-dense-layer 256 128 activation: (make-relu))
+    (make-dense-layer 128 10 activation: (make-identity)))
+   name: "BatchMLP"))
 
-;; Training loop with proper mode switching
-(define (train-epoch model optimizer train-data)
+(define optimizer (make-adam (parameters model) learning-rate: 0.001))
+
+;; Training with batches
+(define (train-epoch train-batches)
   (set-training-mode! model #t)
   
   (for-each
    (lambda (batch)
-     (let* ((x (car batch))
-            (y (cdr batch))
-            (pred (forward model x))
-            (loss (cross-entropy-loss pred y)))
+     (let* ((x (car batch))        ; Shape: (batch_size, 784)
+            (y (cdr batch))        ; Shape: (batch_size, 10)
+            (logits (forward model x))
+            (loss (cross-entropy-loss logits y 
+                                      from-logits: #t 
+                                      reduction: 'mean)))
        
        (backward! loss)
        (step! optimizer)
        (zero-grad-layer! model)))
-   train-data))
+   train-batches))
 
-(define (evaluate-epoch model test-data)
+;; Evaluation
+(define (evaluate test-batches)
   (set-eval-mode! model)
   
   (let ((total-correct 0)
@@ -521,53 +504,60 @@ See the `examples/` directory for complete working examples:
      (lambda (batch)
        (let* ((x (car batch))
               (y (cdr batch))
-              (pred (forward model x))
-              (predicted-class (argmax (tensor->list pred)))
-              (true-class (argmax (tensor->list y))))
-         (when (= predicted-class true-class)
-           (set! total-correct (+ total-correct 1)))
-         (set! total-samples (+ total-samples 1))))
-     test-data)
+              (batch-size (car (tensor-shape x)))
+              (logits (forward model x))
+              (probs (softmax logits axis: -1)))
+         
+         ;; Count correct predictions per batch
+         ;; (implementation details omitted)
+         ))
+     test-batches)
     
     (/ total-correct total-samples)))
-
-;; Main training loop
-(define optimizer (make-adam (parameters model) learning-rate: 0.001))
-
-(do ((epoch 1 (+ epoch 1)))
-    ((> epoch 100))
-  (train-epoch model optimizer train-data)
-  (let ((acc (evaluate-epoch model test-data)))
-    (printf "Epoch ~A: Test Accuracy = ~A%\n" epoch (* 100 acc))))
 ```
 
-### Shape Manipulation
+### Convolutional Network with Batch Support
 
 ```scheme
-(define x (make-tensor32 (f32vector 1.0 2.0 3.0 4.0) '(2 2)))
+(define cnn
+  (make-sequential
+   (list
+    (make-conv2d-layer 3 32 3 padding: 1 activation: (make-relu))
+    (make-batch-norm-2d 32)
+    (make-conv2d-layer 32 64 3 padding: 1 activation: (make-relu))
+    (make-batch-norm-2d 64)
+    (make-flatten)
+    (make-dense-layer (* 64 32 32) 10))
+   name: "CNN"))
 
-;; Reshape (must preserve total elements)
-(define x-flat (reshape x '(4)))
-
-;; Transpose dimensions
-(define x-t (transpose-tensor x '(1 0)))
+;; Process batch of images
+(define batch-images (make-tensor32 image-data '(16 3 32 32)))  ; 16 images
+(set-training-mode! cnn #t)
+(define predictions (forward cnn batch-images))  ; Shape: (16, 10)
 ```
 
-### Custom Weight Initialization
+## Performance Notes
 
-```scheme
-;; Xavier/Glorot initialization (built-in for layers)
-(define init-scale (sqrt (/ 2.0 (+ input-size output-size))))
+- NanoGrad uses BLAS for matrix operations, including batched GEMM
+- Batch operations are significantly more efficient than processing samples individually
+- Use f32 (32-bit) tensors when 64-bit precision is not required
+- The framework detects computation graph cycles
+- Batch normalization adds minimal overhead and significantly improves training
+- Global average pooling reduces parameters without sacrificing performance
 
-;; He initialization for ReLU networks
-(define init-scale (sqrt (/ 2.0 fan-in)))
-```
+## Batch Processing Best Practices
+
+1. Always use batches during training for better performance and stable gradients
+2. Set appropriate batch sizes (typically 16-256 depending on memory)
+3. Use batch normalization for deeper networks (>10 layers)
+4. Switch to eval mode during validation/testing to use running statistics
+5. Prefer global average pooling over large fully-connected layers
 
 ## Limitations
 
-- No GPU support (CPU-only via BLAS)
-- Limited to dense and convolutional operations
-- No automatic batching (must be implemented manually)
+- CPU-only (no GPU support)
+- No automatic batching (must manually create batches)
+- Limited built-in layer types
 - Single-threaded execution
 
 ## Dependencies
@@ -582,12 +572,12 @@ See the `examples/` directory for complete working examples:
 
 ## License
 
-LPGLv3 License - see LICENSE file for details
+LGPLv3 License - see LICENSE file for details
 
 ## Acknowledgments
 
 This framework is inspired by:
-- **PyTorch**: Dynamic computation graphs and autograd design
+- **PyTorch**: Dynamic computation graphs, autograd design, and batch-first conventions
 - [micrograd](https://github.com/karpathy/micrograd): Minimalistic autograd engine by Andrej Karpathy
 - [tinygrad](https://github.com/tinygrad/tinygrad): Small neural network framework
 
