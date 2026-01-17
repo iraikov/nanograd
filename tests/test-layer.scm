@@ -476,6 +476,130 @@
                       "Gradient zeroed")))))
 
 ;;; ==================================================================
+;;; Batched MaxPool2D
+;;; ==================================================================
+
+(define (test-maxpool2d-batched)
+  (printf "\n=== Testing Batched MaxPool2D ===\n")
+  
+  ;; Test 1: 3D input (single image) - basic functionality
+  (let* ((input (make-tensor32 (f32vector 1.0 2.0 3.0 4.0
+                                         5.0 6.0 7.0 8.0
+                                         9.0 10.0 11.0 12.0
+                                         13.0 14.0 15.0 16.0) '(1 4 4)))
+         (output (maxpool2d input 2 stride: 2)))
+    
+    (assert-shape-equal output '(1 2 2) "3D MaxPool2D output shape")
+    
+    ;; Check max values: each 2x2 window
+    ;; Window 1: [1,2,5,6] -> max = 6
+    ;; Window 2: [3,4,7,8] -> max = 8
+    ;; Window 3: [9,10,13,14] -> max = 14
+    ;; Window 4: [11,12,15,16] -> max = 16
+    (let ((data (tensor-data output)))
+      (assert-equal (f32vector-ref data 0) 6.0 1e-5 "MaxPool window 1")
+      (assert-equal (f32vector-ref data 1) 8.0 1e-5 "MaxPool window 2")
+      (assert-equal (f32vector-ref data 2) 14.0 1e-5 "MaxPool window 3")
+      (assert-equal (f32vector-ref data 3) 16.0 1e-5 "MaxPool window 4")))
+  
+  ;; Test 2: 4D input (batch of 2) - basic functionality
+  (let* ((input (make-tensor32 (make-f32vector (* 2 1 4 4) 1.0) '(2 1 4 4)))
+         (output (maxpool2d input 2 stride: 2)))
+    
+    (assert-shape-equal output '(2 1 2 2) "4D MaxPool2D output shape"))
+  
+  ;; Test 3: 4D input with multiple channels
+  (let* ((input (make-tensor32 (make-f32vector (* 3 2 8 8) 2.0) '(3 2 8 8)))
+         (output (maxpool2d input 2 stride: 2)))
+    
+    (assert-shape-equal output '(3 2 4 4) "4D MaxPool2D multi-channel shape")
+    
+    ;; All values should be 2.0 since input is uniform
+    (let ((data (tensor-data output)))
+      (assert-equal (f32vector-ref data 0) 2.0 1e-5 "MaxPool uniform input")))
+  
+  ;; Test 4: Gradient flow for 3D input
+  (let* ((input (make-tensor32 (make-f32vector 16 1.0) '(1 4 4)))
+         (output (maxpool2d input 2 stride: 2))
+         (loss (dot-op (flatten-tensor output) (flatten-tensor output))))
+    
+    (backward! loss)
+    (assert-true (not (equal? (tensor-grad input) #f))
+                 "3D MaxPool2D gradient flows"))
+  
+  ;; Test 5: Gradient flow for 4D input
+  (let* ((input (make-tensor32 (make-f32vector (* 2 1 4 4) 1.0) '(2 1 4 4)))
+         (output (maxpool2d input 2 stride: 2))
+         (loss (dot-op (flatten-tensor output) (flatten-tensor output))))
+    
+    (backward! loss)
+    (assert-true (not (equal? (tensor-grad input) #f))
+                 "4D MaxPool2D gradient flows"))
+  
+  ;; Test 6: Different strides
+  (let* ((input (make-tensor32 (make-f32vector (* 1 1 8 8) 1.0) '(1 1 8 8)))
+         (output (maxpool2d input 3 stride: 1)))
+    
+    ;; With 8x8 input, 3x3 kernel, stride 1: output = (8-3)/1 + 1 = 6
+    (assert-shape-equal output '(1 1 6 6) "MaxPool2D with stride=1"))
+  
+  ;; Test 7: Batched with different values
+  (let* ((batch-size 2)
+         (C 1)
+         (H 4)
+         (W 4)
+         ;; Create input with different values for each batch element
+         (input-data (make-f32vector (* batch-size C H W) 0.0)))
+    
+    ;; Fill first batch with values 1-16
+    (do ((i 0 (+ i 1)))
+        ((= i 16))
+      (f32vector-set! input-data i (exact->inexact (+ i 1))))
+    
+    ;; Fill second batch with values 17-32
+    (do ((i 0 (+ i 1)))
+        ((= i 16))
+      (f32vector-set! input-data (+ i 16) (exact->inexact (+ i 17))))
+    
+    (let* ((input (make-tensor32 input-data (list batch-size C H W)))
+           (output (maxpool2d input 2 stride: 2)))
+      
+      (assert-shape-equal output (list batch-size C 2 2) "Batched MaxPool shape")
+      
+      ;; Check first batch output (same as test 1)
+      (let ((data (tensor-data output)))
+        (assert-equal (f32vector-ref data 0) 6.0 1e-5 "Batch 0 window 1")
+        (assert-equal (f32vector-ref data 1) 8.0 1e-5 "Batch 0 window 2")
+        (assert-equal (f32vector-ref data 2) 14.0 1e-5 "Batch 0 window 3")
+        (assert-equal (f32vector-ref data 3) 16.0 1e-5 "Batch 0 window 4")
+        
+        ;; Check second batch output (offset by +16)
+        (assert-equal (f32vector-ref data 4) 22.0 1e-5 "Batch 1 window 1")
+        (assert-equal (f32vector-ref data 5) 24.0 1e-5 "Batch 1 window 2")
+        (assert-equal (f32vector-ref data 6) 30.0 1e-5 "Batch 1 window 3")
+        (assert-equal (f32vector-ref data 7) 32.0 1e-5 "Batch 1 window 4")))))
+
+(define (test-batched-conv-maxpool)
+  (printf "\n=== Testing Batched Conv2D + MaxPool2D ===\n")
+  
+  (let* ((batch-size 4)
+         (input (make-tensor32 (make-f32vector (* batch-size 3 32 32) 1.0) 
+                              (list batch-size 3 32 32)))
+         (conv-layer (make-conv2d-layer 3 16 3 stride: 1 padding: 1))
+         (conv-out (forward conv-layer input)))
+    
+    (assert-shape-equal conv-out (list batch-size 16 32 32) "Batched Conv output")
+    
+    (let ((pool-out (maxpool2d conv-out 2 stride: 2)))
+      (assert-shape-equal pool-out (list batch-size 16 16 16) "Batched MaxPool after Conv")
+      
+      ;; Test gradient flow through both layers
+      (let ((loss (dot-op (flatten-tensor pool-out) (flatten-tensor pool-out))))
+        (backward! loss)
+        (assert-true (not (equal? (tensor-grad input) #f))
+                     "Gradient flows through Conv->MaxPool with batching")))))
+
+;;; ==================================================================
 ;;; Run All Tests
 ;;; ==================================================================
 
@@ -500,7 +624,8 @@
   (test-parameter-count)
   (test-conv-to-dense)
   (test-zero-grad)
-  
+  (test-maxpool2d-batched)
+  (test-batched-conv-maxpool) 
   (test-summary))
 
 ;; Run all tests

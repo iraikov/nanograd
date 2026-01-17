@@ -10,6 +10,7 @@
    tensor-data tensor-grad tensor-shape
    tensor-children
    tensor-requires-grad? tensor-dtype
+   tensor-backward-fn
    
    ;; Gradient operations
    zero-grad! backward!
@@ -978,6 +979,56 @@
                         (loop (+ i 1) t new-c))))))
   
 
+  (define (compute-conv2d-output-size input-size kernel-size stride padding)
+    "Compute output size for conv2d operation.
+     Returns output size or #f if invalid (≤ 0).
+   
+     Formula: out = floor((in + 2*pad - kernel) / stride) + 1"
+    (let ((raw-output (+ 1 (quotient (+ input-size (* 2 padding) (- kernel-size))
+                                     stride))))
+      (if (<= raw-output 0)
+          #f
+          raw-output)))
+  
+  (define (validate-conv2d-dimensions input-shape kernel-size stride padding layer-name)
+    "Validate that conv2d won't produce invalid dimensions.
+     Raises error with helpful message if dimensions would collapse."
+  
+    (let* ((ndim (length input-shape))
+           ;; Extract spatial dimensions based on input format
+           (spatial-dims (cond
+                          ((= ndim 3) (cdr input-shape))      ;; (C, H, W)
+                          ((= ndim 4) (cddr input-shape))     ;; (N, C, H, W)
+                          (else #f))))
+      
+      (when spatial-dims
+        (let ((H (car spatial-dims))
+              (W (cadr spatial-dims)))
+          
+          ;; Compute output dimensions
+          (let ((out-H (compute-conv2d-output-size H kernel-size stride padding))
+                (out-W (compute-conv2d-output-size W kernel-size stride padding)))
+            
+            ;; Check if dimensions collapsed
+            (unless (and out-H out-W (> out-H 0) (> out-W 0))
+              (error 'conv2d
+                     (format #f "~AConv2D output dimensions would be invalid!
+  Input spatial size: ~Ax~A
+  Kernel size: ~Ax~A, Stride: ~A, Padding: ~A
+  Computed output: ~Ax~A
+  
+  Minimum input size for this configuration: ~Ax~A
+  
+  Suggestion: Use larger input images or modify network architecture for small images."
+                             (if layer-name (format #f "[~A] " layer-name) "")
+                             H W
+                             kernel-size kernel-size stride padding
+                             (or out-H 0) (or out-W 0)
+                             ;; Calculate minimum size
+                             (+ (* stride (- kernel-size 1)) (- kernel-size (* 2 padding)))
+                             (+ (* stride (- kernel-size 1)) (- kernel-size (* 2 padding)))))))))))
+  
+  
   (define (conv2d input weight bias 
                   #!key 
                   (stride 1)
@@ -995,6 +1046,7 @@
      4D: (N, Cout, OH, OW)"
   
   (assert (eq? (tensor-dtype input) (tensor-dtype weight)))
+
   
   (let* ((dtype (tensor-dtype input))
          (ishape (tensor-shape input))
@@ -1023,6 +1075,10 @@
         
         (unless (= Cin Cin-w)
           (error 'conv2d "Input channels mismatch"))
+        
+        (validate-conv2d-dimensions (tensor-shape input) 
+                                    KH stride-h pad-h
+                                    "conv2d")
         
         ;; Use existing single-image im2col implementation
         (let* ((col (im2col input KH KW stride-h stride-w pad-h pad-w))
@@ -1133,6 +1189,10 @@
         
         (unless (= Cin Cin-w)
           (error 'conv2d "Input channels mismatch"))
+        
+        (validate-conv2d-dimensions (tensor-shape input) 
+                                    KH stride-h pad-h
+                                    "conv2d")
         
         (let ((output-data (with-dtype dtype (vec (* N Cout OH OW) 0.0)))
               (all-cols-data (with-dtype dtype (vec (* N Cin KH KW OH OW) 0.0))))
