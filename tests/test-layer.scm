@@ -38,6 +38,13 @@
               0))
   (printf "========================================\n\n"))
 
+
+(define (test-exit)
+  (if (= *test-passed* *test-count*)
+      (exit)
+      (exit 1)))
+
+
 (define (assert-equal actual expected tolerance name)
   (set! *test-count* (+ *test-count* 1))
   (let ((diff (abs (- actual expected))))
@@ -498,3 +505,4 @@
 
 ;; Run all tests
 (run-all-layer-tests)
+(test-exit)

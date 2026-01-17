@@ -1026,154 +1026,256 @@
        
        ((set-eval-mode! self)
         (set! training? #f))
-       
+
        ((forward self input)
-        "Forward pass through batch normalization.
+ "Forward pass through batch normalization.
        
-         During training: Uses batch statistics
-         During eval: Uses running statistics"
+  During training: Uses batch statistics and sets up gradients
+  During eval: Uses running statistics"
       
-        (let* ((input-shape (tensor-shape input))
-               (ndim (length input-shape))
-               (C num-features))
-          
-          ;; Extract dimensions based on input shape
-          (let-values (((N H W)
-                        (cond
-                         ;; 3D input: (C, H, W) - treat as batch of 1
-                         ((= ndim 3)
-                          (values 1 (cadr input-shape) (caddr input-shape)))
-                         
-                         ;; 4D input: (N, C, H, W)
-                         ((= ndim 4)
-                          (values (car input-shape) 
-                                  (caddr input-shape) 
-                                  (cadddr input-shape)))
-                         
-                         (else
-                          (error 'batch-norm-2d 
-                                 (format #f "Expected 3D or 4D input, got ~AD" ndim))))))
-          
-            (let ((spatial-size (* H W))
-                  (batch-spatial (* N H W))
-                  (input-data (tensor-data input)))
-              
-              (if training?
-                  ;; Training mode: compute batch statistics
-                  (let ((means (with-dtype dtype (vec C 0.0)))
-                        (vars (with-dtype dtype (vec C 0.0))))
-                    
-                    ;; Compute mean for each channel across batch and spatial dims
-                    (with-dtype dtype
-                                (do ((c 0 (+ c 1)))
-                                    ((= c C))
-                                  (let ((sum 
-                                         (let n-loop ((n 0) (sum 0.0))
-                                           (if (= n N)
-                                               sum
-                                               (let i-loop ((i 0) (sum sum))
-                                                 (if (= i spatial-size)
-                                                     (n-loop (+ n 1) sum)
-                                                     (let ((idx (+ (* n C spatial-size)
-                                                                   (* c spatial-size)
-                                                                   i)))
-                                                       (i-loop (+ i 1)
-                                                               (+ sum (elt-ref input-data idx))))))))))
-                                    (elt-set! means c (/ sum batch-spatial)))))
-                    
-                    ;; Compute variance for each channel
-                    (with-dtype dtype
-                                (do ((c 0 (+ c 1)))
-                                    ((= c C))
-                                  (let* ((mean (elt-ref means c))
-                                         (sum-sq 
-                                          (let n-loop ((n 0) (sum-sq 0.0))
-                                            (if (= n N)
-                                                sum-sq
-                                                (let i-loop ((i 0) (sum-sq sum-sq))
-                                                  (if (= i spatial-size)
-                                                      (n-loop (+ n 1) sum-sq)
-                                                      (let* ((idx (+ (* n C spatial-size)
-                                                                     (* c spatial-size)
-                                                                     i))
-                                                             (val (elt-ref input-data idx))
-                                                             (diff (- val mean)))
-                                                        (i-loop (+ i 1)
-                                                                (+ sum-sq (* diff diff))))))))))
-                                    (elt-set! vars c (/ sum-sq batch-spatial)))))
-                    
-                    ;; Update running statistics
-                    (do ((c 0 (+ c 1)))
-                        ((= c C))
-                      (with-dtype dtype
-                                  (let ((new-mean (elt-ref means c))
-                                        (new-var (elt-ref vars c))
-                                        (old-mean (elt-ref running-mean c))
-                                        (old-var (elt-ref running-var c)))
-                                    (elt-set! running-mean c
-                                              (+ (* (- 1.0 momentum) old-mean)
-                                                 (* momentum new-mean)))
-                                    (elt-set! running-var c
-                                              (+ (* (- 1.0 momentum) old-var)
-                                                 (* momentum new-var))))))
-                    
-                    ;; Normalize using batch statistics
-                    (let ((normalized-data 
-                           (with-dtype dtype (vec (* N C spatial-size) 0.0))))
-                      
-                      (with-dtype dtype
-                                  (do ((c 0 (+ c 1)))
-                                      ((= c C))
-                                    (let* ((mean (elt-ref means c))
-                                           (var (elt-ref vars c))
-                                           (gamma-val (elt-ref (tensor-data gamma) c))
-                                           (beta-val (elt-ref (tensor-data beta) c))
-                                           (std (sqrt (+ var epsilon))))
-                                      
-                                      (do ((n 0 (+ n 1)))
-                                          ((= n N))
-                                        (do ((i 0 (+ i 1)))
-                                            ((= i spatial-size))
-                                          (let ((idx (+ (* n C spatial-size)
-                                                        (* c spatial-size)
-                                                        i)))
-                                            (let ((normalized 
-                                                   (/ (- (elt-ref input-data idx) mean) std)))
-                                              (elt-set! normalized-data idx
-                                                        (+ (* gamma-val normalized) 
-                                                           beta-val)))))))))
-                      
-                      (make-base-tensor normalized-data input-shape dtype
-                                        (tensor-requires-grad? input))))
-                
-                ;; Eval mode: use running statistics
-                  (let ((normalized-data 
-                         (with-dtype dtype (vec (* N C spatial-size) 0.0))))
-                    
-                    (with-dtype dtype
-                                (do ((c 0 (+ c 1)))
-                                    ((= c C))
-                                  (let* ((mean (elt-ref running-mean c))
-                                         (var (elt-ref running-var c))
-                                         (gamma-val (elt-ref (tensor-data gamma) c))
-                                         (beta-val (elt-ref (tensor-data beta) c))
-                                         (std (sqrt (+ var epsilon))))
-                                    
-                                    (do ((n 0 (+ n 1)))
-                                        ((= n N))
-                                      (do ((i 0 (+ i 1)))
-                                          ((= i spatial-size))
-                                        (let ((idx (+ (* n C spatial-size)
-                                                      (* c spatial-size)
-                                                      i)))
-                                          (let ((normalized 
-                                                 (/ (- (elt-ref input-data idx) mean) std)))
-                                            (elt-set! normalized-data idx
-                                                      (+ (* gamma-val normalized) 
-                                                         beta-val)))))))))
-                    
-                    (make-base-tensor normalized-data input-shape dtype #f)))))))
+ (let* ((input-shape (tensor-shape input))
+        (ndim (length input-shape))
+        (C num-features)
+        (input-data (tensor-data input))
+        (requires-grad? (or (tensor-requires-grad? input)
+                            (tensor-requires-grad? gamma)
+                            (tensor-requires-grad? beta))))
+   
+   ;; Extract dimensions based on input shape
+   (let-values (((N H W)
+                 (cond
+                  ;; 3D input: (C, H, W) - treat as batch of 1
+                  ((= ndim 3)
+                   (values 1 (cadr input-shape) (caddr input-shape)))
+                  
+                  ;; 4D input: (N, C, H, W)
+                  ((= ndim 4)
+                   (values (car input-shape) 
+                           (caddr input-shape) 
+                           (cadddr input-shape)))
+                  
+                  (else
+                   (error 'batch-norm-2d 
+                          (format #f "Expected 3D or 4D input, got ~AD" ndim))))))
      
+     (let ((spatial-size (* H W))
+           (batch-spatial (* N H W)))
+       
+       (if training?
+           ;; Training mode: compute batch statistics and set up gradients
+           (let ((means (with-dtype dtype (vec C 0.0)))
+                 (vars (with-dtype dtype (vec C 0.0)))
+                 (normalized-data (with-dtype dtype (vec (* N C spatial-size) 0.0)))
+                 (output-data (with-dtype dtype (vec (* N C spatial-size) 0.0))))
+             
+             ;; Compute mean for each channel across batch and spatial dims
+             (with-dtype dtype
+                         (do ((c 0 (+ c 1)))
+                             ((= c C))
+                           (let ((sum 0.0))
+                             (do ((n 0 (+ n 1)))
+                                 ((= n N))
+                               (do ((i 0 (+ i 1)))
+                                   ((= i spatial-size))
+                                 (let ((idx (+ (* n C spatial-size)
+                                               (* c spatial-size)
+                                               i)))
+                                   (set! sum (+ sum (elt-ref input-data idx))))))
+                             (elt-set! means c (/ sum batch-spatial)))))
+             
+             ;; Compute variance for each channel
+             (with-dtype dtype
+                         (do ((c 0 (+ c 1)))
+                             ((= c C))
+                           (let ((mean (elt-ref means c))
+                                 (sum-sq 0.0))
+                             (do ((n 0 (+ n 1)))
+                                 ((= n N))
+                               (do ((i 0 (+ i 1)))
+                                   ((= i spatial-size))
+                                 (let* ((idx (+ (* n C spatial-size)
+                                                (* c spatial-size)
+                                                i))
+                                        (val (elt-ref input-data idx))
+                                        (diff (- val mean)))
+                                   (set! sum-sq (+ sum-sq (* diff diff))))))
+                             (elt-set! vars c (/ sum-sq batch-spatial)))))
+             
+             ;; Update running statistics
+             (do ((c 0 (+ c 1)))
+                 ((= c C))
+               (with-dtype dtype
+                           (let ((new-mean (elt-ref means c))
+                                 (new-var (elt-ref vars c))
+                                 (old-mean (elt-ref running-mean c))
+                                 (old-var (elt-ref running-var c)))
+                             (elt-set! running-mean c
+                                       (+ (* (- 1.0 momentum) old-mean)
+                                          (* momentum new-mean)))
+                             (elt-set! running-var c
+                                       (+ (* (- 1.0 momentum) old-var)
+                                          (* momentum new-var))))))
+             
+             ;; Normalize and apply gamma/beta
+             (with-dtype dtype
+                         (do ((c 0 (+ c 1)))
+                             ((= c C))
+                           (let* ((mean (elt-ref means c))
+                                  (var (elt-ref vars c))
+                                  (gamma-val (elt-ref (tensor-data gamma) c))
+                                  (beta-val (elt-ref (tensor-data beta) c))
+                                  (std (sqrt (+ var epsilon))))
+                             
+                             (do ((n 0 (+ n 1)))
+                                 ((= n N))
+                               (do ((i 0 (+ i 1)))
+                                   ((= i spatial-size))
+                                 (let ((idx (+ (* n C spatial-size)
+                                               (* c spatial-size)
+                                               i)))
+                                   (let* ((x-val (elt-ref input-data idx))
+                                          (normalized (/ (- x-val mean) std)))
+                                     ;; Store normalized value for backward
+                                     (elt-set! normalized-data idx normalized)
+                                     ;; Apply scale and shift
+                                     (elt-set! output-data idx
+                                               (+ (* gamma-val normalized) 
+                                                  beta-val)))))))))
+             
+             (let ((result (make-base-tensor output-data input-shape dtype
+                                             requires-grad?)))
+               
+               ;; Set up backward function
+               (when requires-grad?
+                 (set-backward-fn!
+                  result
+                  (lambda ()
+                    (let ((grad-out (tensor-grad result)))
+                      
+                      ;; Gradient w.r.t. gamma: sum of grad_out * normalized
+                      (when (tensor-requires-grad? gamma)
+                        (let ((grad-gamma (with-dtype dtype (vec C 0.0))))
+                          (with-dtype dtype
+                                      (do ((c 0 (+ c 1)))
+                                          ((= c C))
+                                        (let ((sum 0.0))
+                                          (do ((n 0 (+ n 1)))
+                                              ((= n N))
+                                            (do ((i 0 (+ i 1)))
+                                                ((= i spatial-size))
+                                              (let ((idx (+ (* n C spatial-size)
+                                                            (* c spatial-size)
+                                                            i)))
+                                                (set! sum (+ sum (* (elt-ref grad-out idx)
+                                                                    (elt-ref normalized-data idx)))))))
+                                          (elt-set! grad-gamma c sum))))
+                          (add-to-grad! gamma grad-gamma)))
+                      
+                      ;; Gradient w.r.t. beta: sum of grad_out
+                      (when (tensor-requires-grad? beta)
+                        (let ((grad-beta (with-dtype dtype (vec C 0.0))))
+                          (with-dtype dtype
+                                      (do ((c 0 (+ c 1)))
+                                          ((= c C))
+                                        (let ((sum 0.0))
+                                          (do ((n 0 (+ n 1)))
+                                              ((= n N))
+                                            (do ((i 0 (+ i 1)))
+                                                ((= i spatial-size))
+                                              (let ((idx (+ (* n C spatial-size)
+                                                            (* c spatial-size)
+                                                            i)))
+                                                (set! sum (+ sum (elt-ref grad-out idx))))))
+                                          (elt-set! grad-beta c sum))))
+                          (add-to-grad! beta grad-beta)))
+                      
+                      ;; Gradient w.r.t. input
+                      (when (tensor-requires-grad? input)
+                        (let ((grad-input (with-dtype dtype (vec (* N C spatial-size) 0.0))))
+                          
+                          (with-dtype dtype
+                                      (do ((c 0 (+ c 1)))
+                                          ((= c C))
+                                        (let* ((var (elt-ref vars c))
+                                               (std (sqrt (+ var epsilon)))
+                                               (gamma-val (elt-ref (tensor-data gamma) c)))
+                                          
+                                          ;; Compute mean of grad_out for this channel
+                                          (let ((grad-out-sum 0.0))
+                                            (do ((n 0 (+ n 1)))
+                                                ((= n N))
+                                              (do ((i 0 (+ i 1)))
+                                                  ((= i spatial-size))
+                                                (let ((idx (+ (* n C spatial-size)
+                                                              (* c spatial-size)
+                                                              i)))
+                                                  (set! grad-out-sum (+ grad-out-sum (elt-ref grad-out idx))))))
+                                            
+                                            ;; Compute mean of grad_out * normalized
+                                            (let ((grad-norm-sum 0.0))
+                                              (do ((n 0 (+ n 1)))
+                                                  ((= n N))
+                                                (do ((i 0 (+ i 1)))
+                                                    ((= i spatial-size))
+                                                  (let ((idx (+ (* n C spatial-size)
+                                                                (* c spatial-size)
+                                                                i)))
+                                                    (set! grad-norm-sum (+ grad-norm-sum 
+                                                                           (* (elt-ref grad-out idx)
+                                                                              (elt-ref normalized-data idx)))))))
+                                              
+                                              (let ((grad-out-mean (/ grad-out-sum batch-spatial))
+                                                    (grad-norm-mean (/ grad-norm-sum batch-spatial)))
+                                                
+                                                ;; Compute gradient for each element
+                                                (do ((n 0 (+ n 1)))
+                                                    ((= n N))
+                                                  (do ((i 0 (+ i 1)))
+                                                      ((= i spatial-size))
+                                                    (let ((idx (+ (* n C spatial-size)
+                                                                  (* c spatial-size)
+                                                                  i)))
+                                                      (let ((grad-val (elt-ref grad-out idx))
+                                                            (norm-val (elt-ref normalized-data idx)))
+                                                        ;; dL/dx = (gamma/std) * (dL/dy - mean(dL/dy) - norm * mean(dL/dy * norm))
+                                                        (elt-set! grad-input idx
+                                                                  (* (/ gamma-val std)
+                                                                     (- grad-val
+                                                                        grad-out-mean
+                                                                        (* norm-val grad-norm-mean))))))))))))))
+                          
+                          (add-to-grad! input grad-input)))))
+                  (list input gamma beta)))
+               
+               result))
+           
+           ;; Eval mode: use running statistics (no gradients)
+           (let ((output-data (with-dtype dtype (vec (* N C spatial-size) 0.0))))
+             
+             (with-dtype dtype
+                         (do ((c 0 (+ c 1)))
+                             ((= c C))
+                           (let* ((mean (elt-ref running-mean c))
+                                  (var (elt-ref running-var c))
+                                  (gamma-val (elt-ref (tensor-data gamma) c))
+                                  (beta-val (elt-ref (tensor-data beta) c))
+                                  (std (sqrt (+ var epsilon))))
+                             
+                             (do ((n 0 (+ n 1)))
+                                 ((= n N))
+                               (do ((i 0 (+ i 1)))
+                                   ((= i spatial-size))
+                                 (let ((idx (+ (* n C spatial-size)
+                                               (* c spatial-size)
+                                               i)))
+                                   (let ((normalized 
+                                          (/ (- (elt-ref input-data idx) mean) std)))
+                                     (elt-set! output-data idx
+                                               (+ (* gamma-val normalized) 
+                                                  beta-val)))))))))
+             
+             (make-base-tensor output-data input-shape dtype #f)))))))
+       
        ((parameters self)
         (list gamma beta))
      

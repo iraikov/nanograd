@@ -27,6 +27,9 @@
              (extension nanograd-diagnostics (source "gradient-diagnostics.scm")
                         (csc-options "-O3" "-d1")
                         (component-dependencies nanograd-autograd))
+             (extension nanograd-training (source "training.scm")
+                        (csc-options "-O0" "-d2")
+                        (component-dependencies nanograd-autograd))
              )
 
  (test-dependencies test)
