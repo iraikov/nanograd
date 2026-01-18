@@ -1,4 +1,4 @@
-;; Comprehensive unit tests for complete neural network training examples
+;; Unit tests for complete neural network training
 
 (import scheme
         (chicken base)
@@ -6,100 +6,22 @@
         (chicken random)
         (srfi 1)
         (srfi 4)
+        test
         nanograd-autograd
         nanograd-layer
         nanograd-optimizer
         nanograd-diagnostics)
 
 ;;; ==================================================================
-;;; Test Framework
-;;; ==================================================================
-
-(define *test-count* 0)
-(define *test-passed* 0)
-(define *test-failed* 0)
-
-(define (reset-test-stats!)
-  (set! *test-count* 0)
-  (set! *test-passed* 0)
-  (set! *test-failed* 0))
-
-(define (test-summary)
-  (printf "\n")
-  (printf "========================================\n")
-  (printf "TEST SUMMARY\n")
-  (printf "========================================\n")
-  (printf "Total tests:  ~A\n" *test-count*)
-  (printf "Passed:       ~A\n" *test-passed*)
-  (printf "Failed:       ~A\n" *test-failed*)
-  (printf "Success rate: ~A%\n" 
-          (if (> *test-count* 0)
-              (* 100.0 (/ *test-passed* *test-count*))
-              0))
-  (printf "========================================\n\n"))
-
-(define (assert-equal actual expected tolerance name)
-  (set! *test-count* (+ *test-count* 1))
-  (let ((diff (abs (- actual expected))))
-    (if (<= diff tolerance)
-        (begin
-          (set! *test-passed* (+ *test-passed* 1))
-          (printf "  O ~A\n" name))
-        (begin
-          (set! *test-failed* (+ *test-failed* 1))
-          (printf "  X ~A\n" name)
-          (printf "    Expected: ~A, Got: ~A, Diff: ~A\n" 
-                  expected actual diff)))))
-
-(define (assert-less-than actual threshold name)
-  (set! *test-count* (+ *test-count* 1))
-  (if (< actual threshold)
-      (begin
-        (set! *test-passed* (+ *test-passed* 1))
-        (printf "  O ~A\n" name))
-      (begin
-        (set! *test-failed* (+ *test-failed* 1))
-        (printf "  X ~A\n" name)
-        (printf "    Expected < ~A, Got: ~A\n" threshold actual))))
-
-(define (assert-greater-than actual threshold name)
-  (set! *test-count* (+ *test-count* 1))
-  (if (> actual threshold)
-      (begin
-        (set! *test-passed* (+ *test-passed* 1))
-        (printf "  O ~A\n" name))
-      (begin
-        (set! *test-failed* (+ *test-failed* 1))
-        (printf "  X ~A\n" name)
-        (printf "    Expected > ~A, Got: ~A\n" threshold actual))))
-
-(define (assert-in-range actual min-val max-val name)
-  (set! *test-count* (+ *test-count* 1))
-  (if (and (>= actual min-val) (<= actual max-val))
-      (begin
-        (set! *test-passed* (+ *test-passed* 1))
-        (printf "  O ~A\n" name))
-      (begin
-        (set! *test-failed* (+ *test-failed* 1))
-        (printf "  X ~A\n" name)
-        (printf "    Expected in [~A, ~A], Got: ~A\n" 
-                min-val max-val actual))))
-
-(define (assert-true condition name)
-  (set! *test-count* (+ *test-count* 1))
-  (if condition
-      (begin
-        (set! *test-passed* (+ *test-passed* 1))
-        (printf "  O ~A\n" name))
-      (begin
-        (set! *test-failed* (+ *test-failed* 1))
-        (printf "  X ~A\n" name))))
-
-;;; ==================================================================
 ;;; Helper Functions
 ;;; ==================================================================
 
+(define (approx-equal? actual expected tolerance)
+  "Check if two numbers are approximately equal within tolerance"
+  (<= (abs (- actual expected)) tolerance))
+
 (define (argmax vec)
+  "Find index of maximum value in f32vector"
   (let loop ((i 1) (max-i 0) (max-val (f32vector-ref vec 0)))
     (if (= i (f32vector-length vec))
         max-i
@@ -110,29 +32,35 @@
 
 (define (set-random-seed! seed)
   "Set random seed for reproducibility"
-  (set-pseudo-random-seed! (number->string seed))
-  )
+  (set-pseudo-random-seed! (number->string seed)))
+
+(define (in-range? val min-val max-val)
+  "Check if value is in range [min-val, max-val]"
+  (and (>= val min-val) (<= val max-val)))
+
+(define-syntax test-approximate
+  (syntax-rules ()
+    ((test-approximate name expected actual tolerance)
+     (test-assert name (approx-equal? actual expected tolerance)))))
 
 ;;; ==================================================================
 ;;; Linear Regression with SGD
 ;;; ==================================================================
 
-(define (test-linear-regression-sgd)
-  (printf "\n=== Testing Linear Regression with SGD ===\n")
+(test-group "Linear Regression with SGD"
   
-  ;; Fixed seed for reproducibility
   (set-random-seed! 42)
   
   ;; Generate deterministic data: y = 3x + 2
   (define training-data
     (list
-     (cons 0.0 2.0)    ; 3*0 + 2 = 2
-     (cons 1.0 5.0)    ; 3*1 + 2 = 5
-     (cons -1.0 -1.0)  ; 3*(-1) + 2 = -1
-     (cons 2.0 8.0)    ; 3*2 + 2 = 8
-     (cons -2.0 -4.0)  ; 3*(-2) + 2 = -4
-     (cons 0.5 3.5)    ; 3*0.5 + 2 = 3.5
-     (cons -0.5 0.5))) ; 3*(-0.5) + 2 = 0.5
+     (cons 0.0 2.0)
+     (cons 1.0 5.0)
+     (cons -1.0 -1.0)
+     (cons 2.0 8.0)
+     (cons -2.0 -4.0)
+     (cons 0.5 3.5)
+     (cons -0.5 0.5)))
   
   ;; Create model
   (define model
@@ -141,15 +69,15 @@
       (make-dense-layer 1 1 activation: (make-identity)))
      name: "LinearRegression"))
   
-  ;; Initialize parameters to known values
+  ;; Initialize parameters
   (let ((params (parameters model)))
-    (f32vector-set! (tensor-data (car params)) 0 0.5)  ; weight
-    (f32vector-set! (tensor-data (cadr params)) 0 0.5)) ; bias
+    (f32vector-set! (tensor-data (car params)) 0 0.5)
+    (f32vector-set! (tensor-data (cadr params)) 0 0.5))
   
   ;; Create optimizer
   (define optimizer (make-sgd (parameters model) learning-rate: 0.1))
   
-  ;; Train for fixed epochs
+  ;; Train
   (do ((epoch 1 (+ epoch 1)))
       ((> epoch 50))
     
@@ -170,36 +98,33 @@
          (weight (f32vector-ref (tensor-data (car params)) 0))
          (bias (f32vector-ref (tensor-data (cadr params)) 0)))
     
-    (assert-in-range weight 2.5 3.5
-                    "Weight converges near 3.0")
-    (assert-in-range bias 1.5 2.5
-                    "Bias converges near 2.0")
+    (test-assert "Weight converges near 3.0"
+      (in-range? weight 2.5 3.5))
     
-    ;; Test predictions
+    (test-assert "Bias converges near 2.0"
+      (in-range? bias 1.5 2.5))
+    
+    ;; Test prediction
     (let* ((test-x (make-tensor32 (f32vector 3.0) '(1)))
            (pred (forward model test-x))
-           (pred-val (f32vector-ref (tensor-data pred) 0))
-           (expected 11.0))  ; 3*3 + 2 = 11
+           (pred-val (f32vector-ref (tensor-data pred) 0)))
       
-      (assert-in-range pred-val 10.0 12.0
-                      "Prediction for x=3 is near 11.0"))))
+      (test-assert "Prediction for x=3 is near 11.0"
+        (in-range? pred-val 10.0 12.0)))))
 
 ;;; ==================================================================
 ;;; Linear Regression Optimizer Comparison
 ;;; ==================================================================
 
-(define (test-optimizer-comparison)
-  (printf "\n=== Testing Optimizer Comparison ===\n")
+(test-group "Optimizer Comparison"
   
-  ;; Simple dataset
   (define data
     (list (cons 0.0 1.0)
           (cons 1.0 3.0)
           (cons 2.0 5.0)
-          (cons 3.0 7.0)))  ; y = 2x + 1
+          (cons 3.0 7.0)))
   
-  ;; Test each optimizer
-  (define (test-optimizer name make-opt expected-range)
+  (define (test-optimizer name make-opt max-loss)
     (set-random-seed! 42)
     
     (let ((model (make-sequential
@@ -238,28 +163,26 @@
            data)
           
           (let ((avg-loss (/ total-loss (length data))))
-            (assert-less-than avg-loss (cdr expected-range)
-                             (format #f "~A achieves low loss" name)))))))
+            (test-assert (format #f "~A achieves low loss (< ~A)" name max-loss)
+              (< avg-loss max-loss)))))))
   
-  ;; Test different optimizers
   (test-optimizer "SGD" 
                  (lambda (p) (make-sgd p learning-rate: 0.1))
-                 (cons 0.0 0.5))
+                 0.5)
   
   (test-optimizer "Adam"
                  (lambda (p) (make-adam p learning-rate: 0.1))
-                 (cons 0.0 0.1))
+                 0.1)
   
   (test-optimizer "RMSprop"
                  (lambda (p) (make-rmsprop p learning-rate: 0.1))
-                 (cons 0.0 0.1)))
+                 0.1))
 
 ;;; ==================================================================
 ;;; Binary Classification
 ;;; ==================================================================
 
-(define (test-binary-classification)
-  (printf "\n=== Testing Binary Classification ===\n")
+(test-group "Binary Classification"
   
   (set-random-seed! 123)
   
@@ -326,20 +249,19 @@
      training-data)
     
     (let ((accuracy (* 100.0 (/ correct (length training-data)))))
-      (assert-greater-than accuracy 80.0
-                          "Binary classification achieves >80% accuracy")
+      (test-assert "Binary classification achieves >80% accuracy"
+        (> accuracy 80.0))
       (printf "    Final accuracy: ~A%\n" accuracy))))
 
 ;;; ==================================================================
-;;; Multi-class Classification (XOR-like)
+;;; Multi-class Classification
 ;;; ==================================================================
 
-(define (test-multiclass-classification)
-  (printf "\n=== Testing Multi-class Classification ===\n")
+(test-group "Multi-class Classification"
   
   (set-random-seed! 456)
   
-  ;; Create 3-class dataset with clear separation
+  ;; Create 3-class dataset
   (define training-data
     (append
      ;; Class 0: bottom-left
@@ -377,7 +299,6 @@
       ((> epoch 100))
     
     (for-each
-     
      (lambda (sample)
        (let* ((x (make-tensor32 (car sample) '(2)))
               (target-class (cdr sample))
@@ -387,12 +308,9 @@
                 (logits (forward model x))
                 (probs (softmax logits))
                 (loss (cross-entropy-loss probs target)))
-           (if (zero? (modulo epoch 10))
-               (printf "Loss at epoch ~A: ~A\n" epoch (tensor-data loss)))
            (backward! loss)
            (step! optimizer)
            (zero-grad-layer! model))))
-     
      training-data))
   
   ;; Test accuracy
@@ -408,32 +326,28 @@
      training-data)
     
     (let ((accuracy (* 100.0 (/ correct (length training-data)))))
-      (assert-greater-than accuracy 70.0
-                          "Multi-class achieves >70% accuracy")
+      (test-assert "Multi-class achieves >70% accuracy"
+        (> accuracy 70.0))
       (printf "    Final accuracy: ~A%\n" accuracy))))
 
 ;;; ==================================================================
 ;;; Learning Rate Decay
 ;;; ==================================================================
 
-(define (test-learning-rate-decay)
-  (printf "\n=== Testing Learning Rate Decay ===\n")
+(test-group "Learning Rate Decay"
   
   (set-random-seed! 789)
   
-  ;; Simple dataset
   (define data
     (list (cons 0.0 1.0)
           (cons 1.0 2.0)
           (cons 2.0 3.0)))
   
-  ;; Create model
   (define model
     (make-sequential
      (list (make-dense-layer 1 1 activation: (make-identity)))))
   
-  (define optimizer (make-sgd (parameters model) 
-                              learning-rate: 1.0))  ; High initial LR
+  (define optimizer (make-sgd (parameters model) learning-rate: 1.0))
   
   (define initial-lr (get-learning-rate optimizer))
   
@@ -460,32 +374,29 @@
   
   (let ((final-lr (get-learning-rate optimizer)))
     
-    ;; Verify LR decreased
-    (assert-less-than final-lr initial-lr
-                     "Learning rate decreased during training")
+    (test-assert "Learning rate decreased during training"
+      (< final-lr initial-lr))
     
-    ;; Verify specific decay amount
     (let ((expected-final-lr (/ 1.0 (+ 1.0 (* 0.1 20)))))
-      (assert-equal final-lr expected-final-lr 0.01
-                   "Learning rate matches decay formula"))))
+      (test-approximate "Learning rate matches decay formula"
+        expected-final-lr
+        final-lr
+        0.01))))
 
 ;;; ==================================================================
 ;;; Batch Training vs Sequential
 ;;; ==================================================================
 
-(define (test-batch-training)
-  (printf "\n=== Testing Batch Training ===\n")
+(test-group "Batch Training"
   
   (set-random-seed! 101)
   
-  ;; Dataset
   (define data
     (list (cons (f32vector 0.0 0.0) 0.0)
           (cons (f32vector 1.0 0.0) 1.0)
           (cons (f32vector 0.0 1.0) 1.0)
-          (cons (f32vector 1.0 1.0) 0.0)))  ; XOR
+          (cons (f32vector 1.0 1.0) 0.0)))
   
-  ;; Model for batch training
   (define model-batch
     (make-sequential
      (list
@@ -494,21 +405,21 @@
   
   (define opt-batch (make-adam (parameters model-batch) learning-rate: 0.1))
   
-  ;; Train with batches (accumulate gradients)
+  ;; Train with batches
   (do ((epoch 0 (+ epoch 1)))
       ((= epoch 50))
     
-    ;; Accumulate gradients over all samples
+    ;; Accumulate gradients
     (for-each
      (lambda (sample)
        (let* ((x (make-tensor32 (car sample) '(2)))
               (target (make-tensor32 (f32vector (cdr sample)) '(1)))
               (pred (forward model-batch x))
               (loss (mse-loss pred target)))
-         (backward! loss)))  ; Don't update yet
+         (backward! loss)))
      data)
     
-    ;; Update once per epoch (batch update)
+    ;; Update once per epoch
     (step! opt-batch)
     (zero-grad-layer! model-batch))
   
@@ -525,29 +436,26 @@
      data)
     
     (let ((avg-loss (/ total-loss (length data))))
-      (assert-less-than avg-loss 0.3
-                       "Batch training achieves low loss on XOR"))))
+      (test-assert "Batch training achieves low loss on XOR"
+        (< avg-loss 0.3)))))
 
 ;;; ==================================================================
 ;;; Overfitting Detection
 ;;; ==================================================================
 
-(define (test-overfitting-detection)
-  (printf "\n=== Testing Overfitting Detection ===\n")
+(test-group "Overfitting Detection"
   
   (set-random-seed! 202)
   
-  ;; Small training set
   (define train-data
     (list (cons (f32vector 0.0) 0.0)
           (cons (f32vector 1.0) 1.0)))
   
-  ;; Separate test set
   (define test-data
     (list (cons (f32vector 0.5) 0.5)
           (cons (f32vector 1.5) 1.5)))
   
-  ;; Very large model (prone to overfitting)
+  ;; Very large model
   (define model
     (make-sequential
      (list
@@ -572,7 +480,7 @@
          (zero-grad-layer! model)))
      train-data))
   
-  ;; Measure train vs test loss
+  ;; Measure loss
   (define (compute-loss dataset)
     (let ((total 0.0))
       (for-each
@@ -588,10 +496,9 @@
   (let ((train-loss (compute-loss train-data))
         (test-loss (compute-loss test-data)))
     
-    (assert-less-than train-loss 0.01
-                     "Training loss very low (overfitting)")
+    (test-assert "Training loss very low (overfitting)"
+      (< train-loss 0.01))
     
-    ;; Test loss should be higher (sign of overfitting)
     (printf "    Train loss: ~A, Test loss: ~A\n" train-loss test-loss)
     (printf "    Gap indicates ~A\n" 
             (if (> test-loss (* 2.0 train-loss))
@@ -602,16 +509,13 @@
 ;;; Convergence Speed Comparison
 ;;; ==================================================================
 
-(define (test-convergence-speed)
-  (printf "\n=== Testing Optimizer Convergence Speed ===\n")
+(test-group "Optimizer Convergence Speed"
   
-  ;; Simple problem
   (define data
     (list (cons 0.0 0.0)
           (cons 1.0 2.0)
-          (cons 2.0 4.0)))  ; y = 2x
+          (cons 2.0 4.0)))
   
-  ;; Test convergence speed
   (define (test-optimizer name make-opt)
     (set-random-seed! 42)
     
@@ -661,7 +565,6 @@
         
         epochs-to-converge)))
   
-  ;; Compare optimizers
   (let ((sgd-epochs (test-optimizer "SGD" 
                                    (lambda (p) (make-sgd p learning-rate: 0.1))))
         (adam-epochs (test-optimizer "Adam"
@@ -675,28 +578,22 @@
 ;;; Gradient Clipping Integration
 ;;; ==================================================================
 
-(define (test-gradient-clipping-integration)
-  (printf "\n=== Testing Gradient Clipping in Training ===\n")
+(test-group "Gradient Clipping in Training"
   
   (set-random-seed! 303)
   
-  ;; Dataset with large values (may cause gradient issues)
   (define data
     (list (cons (f32vector 10.0) 20.0)
           (cons (f32vector 20.0) 40.0)
           (cons (f32vector 30.0) 60.0)))
   
-  ;; Create model
   (define model
     (make-sequential
      (list (make-dense-layer 1 1 activation: (make-identity)))))
   
-  ;; High learning rate (would normally cause problems)
   (define optimizer (make-sgd (parameters model) learning-rate: 0.5))
   
-  ;; Train with gradient clipping
   (let ((max-grad-norm 0.0)
-        (max-grad-norm-after-clip 0.0)
         (max-clip-norm 1.0))
     (do ((epoch 0 (+ epoch 1)))
         ((= epoch 20))
@@ -713,33 +610,22 @@
            (let ((grad-norm (clip-gradients! (parameters model) max-norm: max-clip-norm)))
              (if grad-norm (set! max-grad-norm (max max-grad-norm grad-norm))))
            
-           ;; Track max gradient AFTER clipping
-           (let ((params (parameters model)))
-             (let ((grad (tensor-grad (car params))))
-               (let ((g (f32vector-ref grad 0)))
-                 (let ((norm (sqrt (* g g))))
-                   (set! max-grad-norm-after-clip 
-                         (max max-grad-norm-after-clip norm))))))
-
-           
            (step! optimizer)
            (zero-grad-layer! model)))
        data))
     
     (printf "    Max gradient norm observed: ~A\n" max-grad-norm)
-    (assert-true (finite? max-grad-norm)
-                "Gradients remain finite during training")))
+    (test-assert "Gradients remain finite during training"
+      (finite? max-grad-norm))))
 
 ;;; ==================================================================
 ;;; Model Persistence (Parameter Extraction)
 ;;; ==================================================================
 
-(define (test-parameter-extraction)
-  (printf "\n=== Testing Parameter Extraction ===\n")
+(test-group "Parameter Extraction"
   
   (set-random-seed! 404)
   
-  ;; Create and train model
   (define model
     (make-sequential
      (list (make-dense-layer 2 3 activation: (make-relu))
@@ -762,58 +648,30 @@
            (zero-grad-layer! model)))
        data)))
   
-  ;; Extract parameters
   (let ((params (parameters model)))
     
-    (assert-equal (length params) 4 0
-                 "Correct number of parameters (2 layers × 2)")
+    (test "Correct number of parameters"
+      4
+      (length params))
     
-    ;; Verify parameters are tensors with data
-    (let ((all-have-data? 
-           (every (lambda (p)
-                   (and (tensor? p)
-                        (> (f32vector-length (tensor-data p)) 0)))
-                 params)))
-      
-      (assert-true all-have-data?
-                  "All parameters are valid tensors with data"))
+    (test-assert "All parameters are valid tensors with data"
+      (every (lambda (p)
+              (and (tensor? p)
+                   (> (f32vector-length (tensor-data p)) 0)))
+            params))
     
-    ;; Count total parameters
     (let ((total-params
            (fold (lambda (p acc)
                   (+ acc (f32vector-length (tensor-data p))))
                 0
                 params)))
       
-      ;; Layer 1: 2*3 weights + 3 biases = 9
-      ;; Layer 2: 3*1 weights + 1 bias = 4
-      ;; Total = 13
-      (assert-equal total-params 13 0
-                   "Total parameter count correct"))))
+      (test "Total parameter count correct"
+        13
+        total-params))))
 
 ;;; ==================================================================
 ;;; Run All Tests
 ;;; ==================================================================
 
-(define (run-all-network-tests)
-  (reset-test-stats!)
-  (printf "\n")
-  (printf "========================================\n")
-  (printf "COMPLETE NETWORK TRAINING TESTS\n")
-  (printf "========================================\n")
-  
-  (test-linear-regression-sgd)
-  (test-optimizer-comparison)
-  (test-binary-classification)
-  (test-multiclass-classification)
-  (test-learning-rate-decay)
-  (test-batch-training)
-  (test-overfitting-detection)
-  (test-convergence-speed)
-  (test-gradient-clipping-integration)
-  (test-parameter-extraction)
-  
-  (test-summary))
-
-;; Run all tests
-(run-all-network-tests)
+(test-exit)

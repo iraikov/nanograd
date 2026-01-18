@@ -2,9 +2,9 @@
 
 (include-relative "test-autograd.scm")
 (include-relative "test-layer.scm")
-(include-relative "optimizer.scm")
-(include-relative "network.scm")
-(include-relative "serialization.scm")
+(include-relative "test-optimizer.scm")
+(include-relative "test-network.scm")
+(include-relative "test-serialization.scm")
 (include-relative "test-gelu-silu.scm")
 (include-relative "test-batchnorm.scm")
 (include-relative "test-tensor-slice.scm")

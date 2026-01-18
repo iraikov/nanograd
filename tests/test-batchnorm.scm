@@ -1,705 +1,480 @@
-;; Comprehensive tests for Batch Normalization and Global Average Pooling
+;; Tests for Batch Normalization and Global Average Pooling
 
 (import scheme
         (chicken base)
         (chicken format)
         (srfi 1)
         (srfi 4)
+        test
         nanograd-autograd
         nanograd-layer)
 
-
 ;;; ==================================================================
-;;; Test Framework
+;;; Helper Functions
 ;;; ==================================================================
 
-(define *test-count* 0)
-(define *test-passed* 0)
-(define *test-failed* 0)
+(define (approx-equal? actual expected tolerance)
+  "Check if two numbers are approximately equal within tolerance"
+  (<= (abs (- actual expected)) tolerance))
 
-(define (reset-test-stats!)
-  (set! *test-count* 0)
-  (set! *test-passed* 0)
-  (set! *test-failed* 0))
+(define-syntax test-approximate
+  (syntax-rules ()
+    ((test-approximate name expected actual tolerance)
+     (test-assert name (approx-equal? actual expected tolerance)))))
 
-(define (test-summary)
-  (printf "\n")
-  (printf "========================================\n")
-  (printf "TEST SUMMARY\n")
-  (printf "========================================\n")
-  (printf "Total tests:  ~A\n" *test-count*)
-  (printf "Passed:       ~A\n" *test-passed*)
-  (printf "Failed:       ~A\n" *test-failed*)
-  (printf "Success rate: ~A%\n" 
-          (if (> *test-count* 0)
-              (* 100.0 (/ *test-passed* *test-count*))
-              0))
-  (printf "========================================\n\n"))
+(define (vector-approx-equal? vec1 vec2 tolerance)
+  "Check if two f32vectors are approximately equal within tolerance"
+  (let ((n1 (f32vector-length vec1))
+        (n2 (f32vector-length vec2)))
+    (and (= n1 n2)
+         (let loop ((i 0))
+           (cond
+            ((= i n1) #t)
+            ((> (abs (- (f32vector-ref vec1 i)
+                       (f32vector-ref vec2 i)))
+                tolerance)
+             #f)
+            (else (loop (+ i 1))))))))
 
-(define (assert-equal actual expected tolerance name)
-  (set! *test-count* (+ *test-count* 1))
-  (let ((diff (abs (- actual expected))))
-    (if (<= diff tolerance)
-        (begin
-          (set! *test-passed* (+ *test-passed* 1))
-          (printf "  O ~A\n" name))
-        (begin
-          (set! *test-failed* (+ *test-failed* 1))
-          (printf "  X ~A\n" name)
-          (printf "    Expected: ~A, Got: ~A, Diff: ~A\n" 
-                  expected actual diff)))))
-
-(define (assert-true condition name)
-  (set! *test-count* (+ *test-count* 1))
-  (if condition
-      (begin
-        (set! *test-passed* (+ *test-passed* 1))
-        (printf "  O ~A\n" name))
-      (begin
-        (set! *test-failed* (+ *test-failed* 1))
-        (printf "  X ~A\n" name))))
-
-(define (assert-shape-equal actual-shape expected-shape name)
-  (set! *test-count* (+ *test-count* 1))
-  (if (equal? actual-shape expected-shape)
-      (begin
-        (set! *test-passed* (+ *test-passed* 1))
-        (printf "  O ~A\n" name))
-      (begin
-        (set! *test-failed* (+ *test-failed* 1))
-        (printf "  X ~A\n" name)
-        (printf "    Expected shape: ~A, Got: ~A\n" 
-                expected-shape actual-shape))))
-
-(define (assert-less-than actual threshold name)
-  (set! *test-count* (+ *test-count* 1))
-  (if (< actual threshold)
-      (begin
-        (set! *test-passed* (+ *test-passed* 1))
-        (printf "  O ~A\n" name))
-      (begin
-        (set! *test-failed* (+ *test-failed* 1))
-        (printf "  X ~A\n" name)
-        (printf "    Expected < ~A, Got: ~A\n" threshold actual))))
+(define (test-vector-equal vec1 vec2 tolerance)
+  "Test helper for vector equality with tolerance"
+  (test-assert (vector-approx-equal? vec1 vec2 tolerance)))
 
 (define (f32vector-copy v)
   (ssub v 0 (f32vector-length v)))
-  
+
 ;;; ==================================================================
 ;;; BATCH NORMALIZATION TESTS
 ;;; ==================================================================
 
-;;; Basic Forward Pass - Training Mode
-;;; ==================================================================
-
-(define (test-batchnorm-training-forward)
-  (printf "\n=== BatchNorm Training Forward Pass ===\n")
+(test-group "BatchNorm - Training Forward Pass"
   
   ;; Create BatchNorm layer for 2 channels
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  ;; Create input: 2 channels, 2x2 spatial
-  ;; Channel 0: [[1,2], [3,4]] mean=2.5, var=1.25
-  ;; Channel 1: [[5,6], [7,8]] mean=6.5, var=1.25
-  (define input (make-tensor32
+  (let* ((bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         (_ (set-training-mode! bn #t))
+         ;; Create input: 2 channels, 2x2 spatial
+         ;; Channel 0: [[1,2], [3,4]] mean=2.5, var=1.25
+         ;; Channel 1: [[5,6], [7,8]] mean=6.5, var=1.25
+         (input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0    ;; Channel 0
                            5.0 6.0 7.0 8.0)    ;; Channel 1
                  '(2 2 2)
                  requires-grad?: #t))
-  
-  (define output (forward bn input))
-  
-  ;; Check output shape
-  (assert-shape-equal (tensor-shape output) '(2 2 2)
-                      "Output shape matches input")
-  
-  ;; Check normalization (approximately zero mean, unit variance per channel)
-  (let ((data (tensor-data output)))
-    ;; Channel 0 normalized values
-    (let* ((ch0-vals (list (f32vector-ref data 0)
-                          (f32vector-ref data 1)
-                          (f32vector-ref data 2)
-                          (f32vector-ref data 3)))
-           (ch0-mean (/ (apply + ch0-vals) 4.0))
-           (ch0-var (/ (apply + (map (lambda (x) (* (- x ch0-mean) (- x ch0-mean)))
-                                    ch0-vals))
-                      4.0)))
-      
-      (assert-equal ch0-mean 0.0 1e-5
-                   "Channel 0 normalized mean ~= 0")
-      (assert-equal ch0-var 1.0 1e-4
-                   "Channel 0 normalized variance ~= 1"))
+         (output (forward bn input)))
     
-    ;; Channel 1 normalized values
-    (let* ((ch1-vals (list (f32vector-ref data 4)
-                          (f32vector-ref data 5)
-                          (f32vector-ref data 6)
-                          (f32vector-ref data 7)))
-           (ch1-mean (/ (apply + ch1-vals) 4.0))
-           (ch1-var (/ (apply + (map (lambda (x) (* (- x ch1-mean) (- x ch1-mean)))
-                                    ch1-vals))
-                      4.0)))
+    (test "Output shape matches input"
+      '(2 2 2)
+      (tensor-shape output))
+    
+    ;; Check normalization (approximately zero mean, unit variance per channel)
+    (let ((data (tensor-data output)))
+      ;; Channel 0 normalized values
+      (let* ((ch0-vals (list (f32vector-ref data 0)
+                            (f32vector-ref data 1)
+                            (f32vector-ref data 2)
+                            (f32vector-ref data 3)))
+             (ch0-mean (/ (apply + ch0-vals) 4.0))
+             (ch0-var (/ (apply + (map (lambda (x) (* (- x ch0-mean) (- x ch0-mean)))
+                                      ch0-vals))
+                        4.0)))
+        
+        (test-approximate "Channel 0 normalized mean ~= 0"
+          0.0 ch0-mean 1e-5)
+        (test-approximate "Channel 0 normalized variance ~= 1"
+          1.0 ch0-var 1e-4))
       
-      (assert-equal ch1-mean 0.0 1e-5
-                   "Channel 1 normalized mean ~= 0")
-      (assert-equal ch1-var 1.0 1e-4
-                   "Channel 1 normalized variance ~= 1"))))
+      ;; Channel 1 normalized values
+      (let* ((ch1-vals (list (f32vector-ref data 4)
+                            (f32vector-ref data 5)
+                            (f32vector-ref data 6)
+                            (f32vector-ref data 7)))
+             (ch1-mean (/ (apply + ch1-vals) 4.0))
+             (ch1-var (/ (apply + (map (lambda (x) (* (- x ch1-mean) (- x ch1-mean)))
+                                      ch1-vals))
+                        4.0)))
+        
+        (test-approximate "Channel 1 normalized mean ~= 0"
+          0.0 ch1-mean 1e-5)
+        (test-approximate "Channel 1 normalized variance ~= 1"
+          1.0 ch1-var 1e-4)))))
 
-;;; Running Statistics Update
-;;; ==================================================================
-
-(define (test-batchnorm-running-stats)
-  (printf "\n=== BatchNorm Running Statistics ===\n")
+(test-group "BatchNorm - Running Statistics"
   
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  ;; First batch
-  (define input1 (make-tensor32
+  (let* ((bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         (_ (set-training-mode! bn #t))
+         ;; First batch
+         (input1 (make-tensor32
                   (f32vector 0.0 0.0 0.0 0.0    ;; Channel 0: all zeros
                             10.0 10.0 10.0 10.0) ;; Channel 1: all tens
                   '(2 2 2)))
-  
-  (forward bn input1)
-  
-  ;; Running stats should be updated
-  ;; running_mean = (1-0.1)*0 + 0.1*batch_mean
-  ;; For channel 0: batch_mean = 0, running_mean = 0
-  ;; For channel 1: batch_mean = 10, running_mean = 1.0
-  
-  ;; Second batch with different statistics
-  (define input2 (make-tensor32
+         (_ (forward bn input1))
+         ;; Second batch with different statistics
+         (input2 (make-tensor32
                   (f32vector 2.0 2.0 2.0 2.0    ;; Channel 0: all twos
                             20.0 20.0 20.0 20.0) ;; Channel 1: all twenties
                   '(2 2 2)))
-  
-  (forward bn input2)
-  
-  ;; After second batch:
-  ;; Channel 0: running_mean = 0.9*0 + 0.1*2 = 0.2
-  ;; Channel 1: running_mean = 0.9*1.0 + 0.1*20 = 2.9
-  
-  (printf "    Running statistics updated after 2 batches\n")
-  (assert-true #t "Running statistics tracking functional"))
+         (_ (forward bn input2)))
+    
+    (test-assert "Running statistics updated after 2 batches" #t)))
 
-;;; Evaluation Mode
-;;; ==================================================================
-
-(define (test-batchnorm-eval-mode)
-  (printf "\n=== BatchNorm Evaluation Mode ===\n")
+(test-group "BatchNorm - Evaluation Mode"
   
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  
-  ;; Train on some data to populate running stats
-  (set-training-mode! bn #t)
-  (define train-input (make-tensor32
+  (let* ((bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         ;; Train on some data to populate running stats
+         (_ (set-training-mode! bn #t))
+         (train-input (make-tensor32
                        (f32vector 1.0 2.0 3.0 4.0
                                  5.0 6.0 7.0 8.0)
                        '(2 2 2)))
-  (forward bn train-input)
-  
-  ;; Switch to eval mode
-  (set-eval-mode! bn)
-  
-  ;; In eval mode, should use running statistics (deterministic)
-  (define eval-input1 (make-tensor32
+         (_ (forward bn train-input))
+         ;; Switch to eval mode
+         (_ (set-eval-mode! bn))
+         ;; In eval mode, should use running statistics (deterministic)
+         (eval-input1 (make-tensor32
                        (f32vector 10.0 20.0 30.0 40.0
                                  50.0 60.0 70.0 80.0)
                        '(2 2 2)))
-  
-  (define output1 (forward bn eval-input1))
-  
-  ;; Same input should give same output in eval mode
-  (define eval-input2 (make-tensor32
+         (output1 (forward bn eval-input1))
+         ;; Same input should give same output in eval mode
+         (eval-input2 (make-tensor32
                        (f32vector 10.0 20.0 30.0 40.0
                                  50.0 60.0 70.0 80.0)
                        '(2 2 2)))
-  
-  (define output2 (forward bn eval-input2))
-  
-  ;; Verify outputs are identical (deterministic)
-  (let ((data1 (tensor-data output1))
-        (data2 (tensor-data output2)))
-    (assert-equal (f32vector-ref data1 0) (f32vector-ref data2 0) 1e-6
-                 "Eval mode is deterministic [0]")
-    (assert-equal (f32vector-ref data1 3) (f32vector-ref data2 3) 1e-6
-                 "Eval mode is deterministic [3]")
-    (assert-equal (f32vector-ref data1 7) (f32vector-ref data2 7) 1e-6
-                 "Eval mode is deterministic [7]")))
+         (output2 (forward bn eval-input2)))
+    
+    ;; Verify outputs are identical (deterministic)
+    (let ((data1 (tensor-data output1))
+          (data2 (tensor-data output2)))
+      (test-approximate "Eval mode is deterministic [0]"
+        (f32vector-ref data1 0) (f32vector-ref data2 0) 1e-6)
+      (test-approximate "Eval mode is deterministic [3]"
+        (f32vector-ref data1 3) (f32vector-ref data2 3) 1e-6)
+      (test-approximate "Eval mode is deterministic [7]"
+        (f32vector-ref data1 7) (f32vector-ref data2 7) 1e-6))))
 
-;;; Mode Switching
-;;; ==================================================================
-
-(define (test-batchnorm-mode-switching)
-  (printf "\n=== BatchNorm Mode Switching ===\n")
+(test-group "BatchNorm - Mode Switching"
   
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  
-  (define input (make-tensor32
+  (let* ((bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         (input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0
                            5.0 6.0 7.0 8.0)
                  '(2 2 2)))
-  
-  ;; Training mode - uses batch statistics
-  (set-training-mode! bn #t)
-  (define train-output (forward bn input))
-  
-  ;; Eval mode - uses running statistics
-  (set-eval-mode! bn)
-  (define eval-output (forward bn input))
-  
-  ;; Outputs should be different (different statistics used)
-  (let ((train-data (tensor-data train-output))
-        (eval-data (tensor-data eval-output)))
-    (let ((diff (abs (- (f32vector-ref train-data 0)
-                       (f32vector-ref eval-data 0)))))
-      (assert-true (> diff 1e-6)
-                  "Training and eval modes produce different outputs")))
-  
-  ;; Switch back to training
-  (set-training-mode! bn #t)
-  (define train-output2 (forward bn input))
-  
-  (printf "    Mode switching works correctly\n")
-  (assert-true #t "Can switch between training and eval modes"))
+         ;; Training mode - uses batch statistics
+         (_ (set-training-mode! bn #t))
+         (train-output (forward bn input))
+         ;; Eval mode - uses running statistics
+         (_ (set-eval-mode! bn))
+         (eval-output (forward bn input)))
+    
+    ;; Outputs should be different (different statistics used)
+    (let ((train-data (tensor-data train-output))
+          (eval-data (tensor-data eval-output)))
+      (let ((diff (abs (- (f32vector-ref train-data 0)
+                         (f32vector-ref eval-data 0)))))
+        (test-assert "Training and eval modes produce different outputs"
+          (> diff 1e-6))))
+    
+    ;; Switch back to training
+    (set-training-mode! bn #t)
+    (let ((train-output2 (forward bn input)))
+      (test-assert "Can switch between training and eval modes" #t))))
 
-;;; Learnable Parameters (Gamma, Beta)
-;;; ==================================================================
+(test-group "BatchNorm - Learnable Parameters"
+  
+  (let* ((bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         (_ (set-training-mode! bn #t))
+         ;; Get parameters (gamma, beta)
+         (params (parameters bn))
+         (gamma (car params))
+         (beta (cadr params)))
+    
+    (test "BatchNorm has 2 parameters (gamma, beta)"
+      2
+      (length params))
+    
+    (test-approximate "Gamma initialized to 1.0"
+      1.0 (f32vector-ref (tensor-data gamma) 0) 1e-6)
+    
+    (test-approximate "Beta initialized to 0.0"
+      0.0 (f32vector-ref (tensor-data beta) 0) 1e-6)
+    
+    (test-assert "Gamma requires gradient"
+      (tensor-requires-grad? gamma))
+    
+    (test-assert "Beta requires gradient"
+      (tensor-requires-grad? beta))))
 
-(define (test-batchnorm-learnable-params)
-  (printf "\n=== BatchNorm Learnable Parameters ===\n")
+(test-group "BatchNorm - Gradient Flow"
   
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  ;; Get parameters (gamma, beta)
-  (define params (parameters bn))
-  (assert-equal (length params) 2 0
-               "BatchNorm has 2 parameters (gamma, beta)")
-  
-  (define gamma (car params))
-  (define beta (cadr params))
-  
-  ;; Check initial values
-  (assert-equal (f32vector-ref (tensor-data gamma) 0) 1.0 1e-6
-               "Gamma initialized to 1.0")
-  (assert-equal (f32vector-ref (tensor-data beta) 0) 0.0 1e-6
-               "Beta initialized to 0.0")
-  
-  ;; Check gradient tracking
-  (assert-true (tensor-requires-grad? gamma)
-              "Gamma requires gradient")
-  (assert-true (tensor-requires-grad? beta)
-              "Beta requires gradient"))
-
-;;; Gradient Flow
-;;; ==================================================================
-(define (test-batchnorm-gradients)
-  (printf "\n=== BatchNorm Gradient Flow ===\n")
-  
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  (define input (make-tensor32
+  (let* ((bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         (_ (set-training-mode! bn #t))
+         (input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0
                            5.0 6.0 7.0 8.0)
                  '(2 2 2)
                  requires-grad?: #t))
-  
-  (define output (forward bn input))
-  
-  ;; Simple loss: sum of outputs
-  (let ((loss (sum-tensor output)))
+         (output (forward bn input))
+         ;; Simple loss: sum of outputs
+         (loss (sum-tensor output))
+         (_ (backward! loss)))
     
-    (backward! loss)
-    
-    ;; Check gradients exist
-    (assert-true (tensor-grad input)
-                 "Input has gradient after backward")
+    (test-assert "Input has gradient after backward"
+      (tensor-grad input))
     
     (let ((params (parameters bn)))
-      (assert-true (tensor-grad (car params))
-                   "Gamma has gradient after backward")
-      (assert-true (tensor-grad (cadr params))
-                   "Beta has gradient after backward"))
+      (test-assert "Gamma has gradient after backward"
+        (tensor-grad (car params)))
+      
+      (test-assert "Beta has gradient after backward"
+        (tensor-grad (cadr params))))
     
     ;; Check gradient magnitudes are reasonable
-    (let ((grad-input (tensor-grad input)))
-      (let ((max-grad (fold max -inf.0 (f32vector->list grad-input))))
-        (assert-less-than (abs max-grad) 10.0
-                         "Input gradients have reasonable magnitude")))))
+    (let* ((grad-input (tensor-grad input))
+           (max-grad (fold max -inf.0 (f32vector->list grad-input))))
+      (test-assert "Input gradients have reasonable magnitude"
+        (< (abs max-grad) 10.0)))))
 
-(define (test-batchnorm-gamma-beta-gradients)
-  (printf "\n=== BatchNorm Gamma/Beta Gradients ===\n")
+(test-group "BatchNorm - Gamma/Beta Gradients"
   
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  ;; Known input: all ones for channel 0, all twos for channel 1
-  (define input (make-tensor32
+  (let* ((bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         (_ (set-training-mode! bn #t))
+         ;; Known input: all ones for channel 0, all twos for channel 1
+         (input (make-tensor32
                  (f32vector 1.0 1.0 1.0 1.0
                            2.0 2.0 2.0 2.0)
                  '(2 2 2)
                  requires-grad?: #t))
-  
-  (define output (forward bn input))
-  
-  ;; Loss: sum of outputs
-  (let ((loss (sum-tensor output)))
-    (backward! loss)
+         (output (forward bn input))
+         ;; Loss: sum of outputs
+         (loss (sum-tensor output))
+         (_ (backward! loss))
+         (params (parameters bn))
+         (gamma (car params))
+         (beta (cadr params)))
     
-    (let ((params (parameters bn)))
-      (define gamma (car params))
-      (define beta (cadr params))
-      
-      ;; Beta gradient should be the sum over all spatial dims = 8 (4 pixels per channel)
-      ;; Since loss is sum of outputs, dL/doutput = 1 everywhere
-      ;; dL/dbeta = sum(dL/doutput) = 4 per channel
-      (let ((grad-beta (tensor-grad beta)))
-        (assert-equal (f32vector-ref grad-beta 0) 4.0 1e-4
-                     "Beta gradient channel 0 (sum over 4 pixels)")
-        (assert-equal (f32vector-ref grad-beta 1) 4.0 1e-4
-                     "Beta gradient channel 1 (sum over 4 pixels)"))
-      
-      ;; Gamma gradient: sum of (dL/doutput * normalized_input)
-      ;; For constant inputs, normalized = 0 (zero variance), so gamma grad = 0
-      (let ((grad-gamma (tensor-grad gamma)))
-        (assert-equal (f32vector-ref grad-gamma 0) 0.0 1e-4
-                     "Gamma gradient channel 0 (zero for constant input)")
-        (assert-equal (f32vector-ref grad-gamma 1) 0.0 1e-4
-                      "Gamma gradient channel 1 (zero for constant input)")))))
+    ;; Beta gradient should be the sum over all spatial dims = 4 (4 pixels per channel)
+    ;; Since loss is sum of outputs, dL/doutput = 1 everywhere
+    ;; dL/dbeta = sum(dL/doutput) = 4 per channel
+    (let ((grad-beta (tensor-grad beta)))
+      (test-approximate "Beta gradient channel 0 (sum over 4 pixels)"
+        4.0 (f32vector-ref grad-beta 0) 1e-4)
+      (test-approximate "Beta gradient channel 1 (sum over 4 pixels)"
+        4.0 (f32vector-ref grad-beta 1) 1e-4))
+    
+    ;; Gamma gradient: sum of (dL/doutput * normalized_input)
+    ;; For constant inputs, normalized = 0 (zero variance), so gamma grad = 0
+    (let ((grad-gamma (tensor-grad gamma)))
+      (test-approximate "Gamma gradient channel 0 (zero for constant input)"
+        0.0 (f32vector-ref grad-gamma 0) 1e-4)
+      (test-approximate "Gamma gradient channel 1 (zero for constant input)"
+        0.0 (f32vector-ref grad-gamma 1) 1e-4))))
 
-;;; Different Spatial Sizes
-;;; ==================================================================
-
-(define (test-batchnorm-spatial-sizes)
-  (printf "\n=== BatchNorm Different Spatial Sizes ===\n")
+(test-group "BatchNorm - Different Spatial Sizes"
   
-  (define bn (make-batch-norm-2d 3 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  ;; 3 channels, 1x1 spatial
-  (define input-1x1 (make-tensor32
+  (let* ((bn (make-batch-norm-2d 3 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         (_ (set-training-mode! bn #t))
+         ;; 3 channels, 1x1 spatial
+         (input-1x1 (make-tensor32
                      (f32vector 1.0 2.0 3.0)
                      '(3 1 1)))
-  (define output-1x1 (forward bn input-1x1))
-  (assert-shape-equal (tensor-shape output-1x1) '(3 1 1)
-                     "1x1 spatial works")
-  
-  ;; 3 channels, 4x4 spatial
-  (define input-4x4 (make-tensor32
+         (output-1x1 (forward bn input-1x1))
+         ;; 3 channels, 4x4 spatial
+         (input-4x4 (make-tensor32
                      (make-f32vector (* 3 4 4) 1.0)
                      '(3 4 4)))
-  (define output-4x4 (forward bn input-4x4))
-  (assert-shape-equal (tensor-shape output-4x4) '(3 4 4)
-                     "4x4 spatial works")
-  
-  ;; 3 channels, 7x7 spatial (like after ResNet conv1)
-  (define input-7x7 (make-tensor32
+         (output-4x4 (forward bn input-4x4))
+         ;; 3 channels, 7x7 spatial (like after ResNet conv1)
+         (input-7x7 (make-tensor32
                      (make-f32vector (* 3 7 7) 2.0)
                      '(3 7 7)))
-  (define output-7x7 (forward bn input-7x7))
-  (assert-shape-equal (tensor-shape output-7x7) '(3 7 7)
-                     "7x7 spatial works"))
+         (output-7x7 (forward bn input-7x7)))
+    
+    (test "1x1 spatial works"
+      '(3 1 1)
+      (tensor-shape output-1x1))
+    
+    (test "4x4 spatial works"
+      '(3 4 4)
+      (tensor-shape output-4x4))
+    
+    (test "7x7 spatial works"
+      '(3 7 7)
+      (tensor-shape output-7x7))))
 
-;;; Numerical Gradient Check
-;;; ==================================================================
-(define (test-batchnorm-gradients)
-  (printf "\n=== BatchNorm Gradient Flow ===\n")
+(test-group "BatchNorm - Numerical Gradient Check"
   
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  (define input (make-tensor32
+  (let* ((epsilon 1e-4)
+         (bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         (_ (set-training-mode! bn #t))
+         (input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0
                            5.0 6.0 7.0 8.0)
                  '(2 2 2)
                  requires-grad?: #t))
-  
-  (define output (forward bn input))
-  
-  ;; Simple loss: sum of outputs
-  (let ((loss (sum-tensor output)))
+         ;; Compute analytical gradient
+         (output (forward bn input))
+         (loss (sum-tensor output))
+         (_ (backward! loss))
+         (analytical-grad (tensor-grad input)))
     
-    (backward! loss)
-    
-    ;; Check gradients exist
-    (assert-true (tensor-grad input)
-                 "Input has gradient after backward")
-    
-    (let ((params (parameters bn)))
-      (assert-true (tensor-grad (car params))
-                   "Gamma has gradient after backward")
-      (assert-true (tensor-grad (cadr params))
-                   "Beta has gradient after backward"))
-    
-    ;; Check gradient magnitudes are reasonable
-    (let ((grad-input (tensor-grad input)))
-      (let ((max-grad (fold max -inf.0 (f32vector->list grad-input))))
-        (assert-less-than (abs max-grad) 10.0
-                         "Input gradients have reasonable magnitude")))))
-
-(define (test-batchnorm-gamma-beta-gradients)
-  (printf "\n=== BatchNorm Gamma/Beta Gradients ===\n")
-  
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  ;; Known input: all ones for channel 0, all twos for channel 1
-  (define input (make-tensor32
-                 (f32vector 1.0 1.0 1.0 1.0
-                           2.0 2.0 2.0 2.0)
-                 '(2 2 2)
-                 requires-grad?: #t))
-  
-  (define output (forward bn input))
-  
-  ;; Loss: sum of outputs
-  (let ((loss (sum-tensor output)))
-    (backward! loss)
-    
-    (let ((params (parameters bn)))
-      (define gamma (car params))
-      (define beta (cadr params))
+    ;; Compute numerical gradient for first 4 elements
+    (do ((i 0 (+ i 1)))
+        ((= i 4))
       
-      ;; Beta gradient should be the sum over all spatial dims = 8 (4 pixels per channel)
-      ;; Since loss is sum of outputs, dL/doutput = 1 everywhere
-      ;; dL/dbeta = sum(dL/doutput) = 4 per channel
-      (let ((grad-beta (tensor-grad beta)))
-        (assert-equal (f32vector-ref grad-beta 0) 4.0 1e-4
-                     "Beta gradient channel 0 (sum over 4 pixels)")
-        (assert-equal (f32vector-ref grad-beta 1) 4.0 1e-4
-                     "Beta gradient channel 1 (sum over 4 pixels)"))
-      
-      ;; Gamma gradient: sum of (dL/doutput * normalized_input)
-      ;; For constant inputs, normalized = 0 (zero variance), so gamma grad = 0
-      (let ((grad-gamma (tensor-grad gamma)))
-        (assert-equal (f32vector-ref grad-gamma 0) 0.0 1e-4
-                     "Gamma gradient channel 0 (zero for constant input)")
-        (assert-equal (f32vector-ref grad-gamma 1) 0.0 1e-4
-                      "Gamma gradient channel 1 (zero for constant input)")))))
-
-(define (test-batchnorm-numerical-gradients)
-  (printf "\n=== BatchNorm Numerical Gradient Check ===\n")
-  
-  (define epsilon 1e-4)
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  (define input (make-tensor32
-                 (f32vector 1.0 2.0 3.0 4.0
-                           5.0 6.0 7.0 8.0)
-                 '(2 2 2)
-                 requires-grad?: #t))
-  
-  ;; Compute analytical gradient
-  (define output (forward bn input))
-  (let ((loss (sum-tensor output)))
-    (backward! loss)
-    
-    (let ((analytical-grad (tensor-grad input)))
-      
-      ;; Compute numerical gradient for first 4 elements
-      (do ((i 0 (+ i 1)))
-          ((= i 4))
+      ;; Create fresh BN layer for each perturbation
+      (let ((bn-plus (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+            (bn-minus (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32)))
+        (set-training-mode! bn-plus #t)
+        (set-training-mode! bn-minus #t)
         
-        ;; Create fresh BN layer for each perturbation
-        (let ((bn-plus (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-              (bn-minus (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32)))
-          (set-training-mode! bn-plus #t)
-          (set-training-mode! bn-minus #t)
+        ;; Perturb +epsilon
+        (let ((input-plus (make-tensor32
+                          (f32vector-copy (tensor-data input))
+                          '(2 2 2))))
+          (f32vector-set! (tensor-data input-plus) i
+                         (+ (f32vector-ref (tensor-data input) i) epsilon))
           
-          ;; Perturb +epsilon
-          (let ((input-plus (make-tensor32
-                            (f32vector-copy (tensor-data input))
-                            '(2 2 2))))
-            (f32vector-set! (tensor-data input-plus) i
-                           (+ (f32vector-ref (tensor-data input) i) epsilon))
+          (let* ((output-plus (forward bn-plus input-plus))
+                 (loss-plus (f32vector-ref (tensor-data (sum-tensor output-plus)) 0)))
             
-            (let* ((output-plus (forward bn-plus input-plus))
-                   (loss-plus (f32vector-ref (tensor-data (sum-tensor output-plus)) 0)))
+            ;; Perturb -epsilon
+            (let ((input-minus (make-tensor32
+                               (f32vector-copy (tensor-data input))
+                               '(2 2 2))))
+              (f32vector-set! (tensor-data input-minus) i
+                             (- (f32vector-ref (tensor-data input) i) epsilon))
               
-              ;; Perturb -epsilon
-              (let ((input-minus (make-tensor32
-                                 (f32vector-copy (tensor-data input))
-                                 '(2 2 2))))
-                (f32vector-set! (tensor-data input-minus) i
-                               (- (f32vector-ref (tensor-data input) i) epsilon))
+              (let* ((output-minus (forward bn-minus input-minus))
+                     (loss-minus (f32vector-ref (tensor-data (sum-tensor output-minus)) 0)))
                 
-                (let* ((output-minus (forward bn-minus input-minus))
-                       (loss-minus (f32vector-ref (tensor-data (sum-tensor output-minus)) 0)))
+                (let ((numerical (/ (- loss-plus loss-minus) (* 2.0 epsilon)))
+                      (analytical (f32vector-ref analytical-grad i)))
                   
-                  (let ((numerical (/ (- loss-plus loss-minus) (* 2.0 epsilon)))
-                        (analytical (f32vector-ref analytical-grad i)))
-                    
-                    (assert-equal analytical numerical 1e-2
-                                 (sprintf "Gradient check position ~A" i))))))))))))
+                  (test-approximate (sprintf "Gradient check position ~A" i)
+                    analytical numerical 1e-2))))))))))
 
-(define (test-batchnorm-gradient-non-constant)
-  (printf "\n=== BatchNorm Gradients with Varied Input ===\n")
+(test-group "BatchNorm - Gradients with Varied Input"
   
-  (define bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
-  (set-training-mode! bn #t)
-  
-  ;; Varied input (not constant per channel)
-  (define input (make-tensor32
+  (let* ((bn (make-batch-norm-2d 2 epsilon: 1e-5 momentum: 0.1 dtype: 'f32))
+         (_ (set-training-mode! bn #t))
+         ;; Varied input (not constant per channel)
+         (input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0
                            5.0 6.0 7.0 8.0)
                  '(2 2 2)
                  requires-grad?: #t))
-  
-  (define output (forward bn input))
-  
-  ;; Use sum of squares loss instead of sum
-  ;; This ensures gradient w.r.t. output is non-uniform: dL/dy = 2*y
-  ;; which means gamma gradient = sum(2*y * normalized) = 2*sum(normalized^2) > 0
-  (let* ((output-flat (reshape output '(8)))
+         (output (forward bn input))
+         ;; Use sum of squares loss instead of sum
+         (output-flat (reshape output '(8)))
          (squared (mul output-flat output-flat))
-         (loss (sum-tensor squared)))
+         (loss (sum-tensor squared))
+         (_ (backward! loss))
+         (params (parameters bn))
+         (gamma (car params))
+         (beta (cadr params)))
     
-    (backward! loss)
+    ;; With varied input and squared loss, gamma should have non-zero gradient
+    (let ((grad-gamma (tensor-grad gamma)))
+      (test-assert "Gamma gradient non-zero for varied input (ch0)"
+        (> (abs (f32vector-ref grad-gamma 0)) 1e-6))
+      (test-assert "Gamma gradient non-zero for varied input (ch1)"
+        (> (abs (f32vector-ref grad-gamma 1)) 1e-6)))
     
-    (let ((params (parameters bn)))
-      (define gamma (car params))
-      (define beta (cadr params))
-      
-      ;; With varied input and squared loss, gamma should have non-zero gradient
-      (let ((grad-gamma (tensor-grad gamma)))
-        ;; Channel 0: values [1,2,3,4] normalized → non-zero when squared
-        ;; Channel 1: values [5,6,7,8] normalized → non-zero when squared
-        ;; Both should have non-zero gamma gradients
-        (assert-true (> (abs (f32vector-ref grad-gamma 0)) 1e-6)
-                     "Gamma gradient non-zero for varied input (ch0)")
-        (assert-true (> (abs (f32vector-ref grad-gamma 1)) 1e-6)
-                     "Gamma gradient non-zero for varied input (ch1)"))
-      
-      ;; Beta gradient: sum of dL/doutput = sum of 2*output
-      (let ((grad-beta (tensor-grad beta))
-            (output-data (tensor-data output)))
-        ;; Beta gradient should be 2 * sum of output values per channel
-        ;; Since normalized values sum to ~0, and gamma=1, beta=0, output ≈ normalized ≈ 0
-        ;; So beta gradient should be small but may not be exactly zero
-        (printf "    Beta gradients: ch0=~A, ch1=~A (expected small but non-zero)\n"
-                (f32vector-ref grad-beta 0)
-                (f32vector-ref grad-beta 1))
-        (assert-true #t "Beta gradients computed")))))
+    (let ((grad-beta (tensor-grad beta)))
+      (test-assert "Beta gradients computed" #t))))
 
 ;;; ==================================================================
 ;;; GLOBAL AVERAGE POOLING TESTS
 ;;; ==================================================================
 
-;;; Basic GAP Forward Pass
-;;; ==================================================================
-
-(define (test-gap-basic-forward)
-  (printf "\n=== Global Average Pooling Forward Pass ===\n")
+(test-group "Global Average Pooling - Forward Pass"
   
   ;; Create 2 channels, 2x2 spatial
   ;; Channel 0: [[1,2], [3,4]] mean = 2.5
   ;; Channel 1: [[5,6], [7,8]] mean = 6.5
-  (define input (make-tensor32
+  (let* ((input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0
                            5.0 6.0 7.0 8.0)
                  '(2 2 2)
                  requires-grad?: #t))
-  
-  (define output (global-avg-pool2d input))
-  
-  ;; Check shape: (2, 2, 2) → (2)
-  (assert-shape-equal (tensor-shape output) '(2)
-                     "GAP output shape is (num_channels)")
-  
-  ;; Check values
-  (assert-equal (f32vector-ref (tensor-data output) 0) 2.5 1e-6
-               "Channel 0 average is 2.5")
-  (assert-equal (f32vector-ref (tensor-data output) 1) 6.5 1e-6
-               "Channel 1 average is 6.5"))
+         (output (global-avg-pool2d input)))
+    
+    (test "GAP output shape is (num_channels)"
+      '(2)
+      (tensor-shape output))
+    
+    (test-approximate "Channel 0 average is 2.5"
+      2.5 (f32vector-ref (tensor-data output) 0) 1e-6)
+    
+    (test-approximate "Channel 1 average is 6.5"
+      6.5 (f32vector-ref (tensor-data output) 1) 1e-6)))
 
-;;; GAP Different Spatial Sizes
-;;; ==================================================================
-
-(define (test-gap-spatial-sizes)
-  (printf "\n=== GAP Different Spatial Sizes ===\n")
+(test-group "GAP - Different Spatial Sizes"
   
   ;; 3x3 spatial
-  (define input-3x3 (make-tensor32
+  (let* ((input-3x3 (make-tensor32
                      (f32vector 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0)
                      '(1 3 3)))
-  (define output-3x3 (global-avg-pool2d input-3x3))
-  (assert-equal (f32vector-ref (tensor-data output-3x3) 0) 5.0 1e-6
-               "3x3 spatial: mean of 1..9 is 5.0")
+         (output-3x3 (global-avg-pool2d input-3x3)))
+    (test-approximate "3x3 spatial: mean of 1..9 is 5.0"
+      5.0 (f32vector-ref (tensor-data output-3x3) 0) 1e-6))
   
   ;; 1x1 spatial (edge case)
-  (define input-1x1 (make-tensor32
+  (let* ((input-1x1 (make-tensor32
                      (f32vector 7.0)
                      '(1 1 1)))
-  (define output-1x1 (global-avg-pool2d input-1x1))
-  (assert-equal (f32vector-ref (tensor-data output-1x1) 0) 7.0 1e-6
-               "1x1 spatial: mean is the value itself")
+         (output-1x1 (global-avg-pool2d input-1x1)))
+    (test-approximate "1x1 spatial: mean is the value itself"
+      7.0 (f32vector-ref (tensor-data output-1x1) 0) 1e-6))
   
   ;; 7x7 spatial (typical ResNet)
-  (define input-7x7 (make-tensor32
+  (let* ((input-7x7 (make-tensor32
                      (make-f32vector 49 10.0)  ;; All 10s
                      '(1 7 7)))
-  (define output-7x7 (global-avg-pool2d input-7x7))
-  (assert-equal (f32vector-ref (tensor-data output-7x7) 0) 10.0 1e-6
-               "7x7 spatial with constant values"))
+         (output-7x7 (global-avg-pool2d input-7x7)))
+    (test-approximate "7x7 spatial with constant values"
+      10.0 (f32vector-ref (tensor-data output-7x7) 0) 1e-6)))
 
-;;; GAP Multiple Channels
-;;; ==================================================================
-
-(define (test-gap-multiple-channels)
-  (printf "\n=== GAP Multiple Channels ===\n")
+(test-group "GAP - Multiple Channels"
   
   ;; 4 channels, 2x2 spatial
-  (define input (make-tensor32
+  (let* ((input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0      ;; Channel 0: mean = 2.5
                            10.0 20.0 30.0 40.0   ;; Channel 1: mean = 25.0
                            0.0 0.0 0.0 0.0       ;; Channel 2: mean = 0.0
                            -1.0 -2.0 -3.0 -4.0)  ;; Channel 3: mean = -2.5
                  '(4 2 2)))
-  
-  (define output (global-avg-pool2d input))
-  
-  (assert-shape-equal (tensor-shape output) '(4)
-                     "4 channels output shape")
-  (assert-equal (f32vector-ref (tensor-data output) 0) 2.5 1e-6
-               "Channel 0 mean is 2.5")
-  (assert-equal (f32vector-ref (tensor-data output) 1) 25.0 1e-6
-               "Channel 1 mean is 25.0")
-  (assert-equal (f32vector-ref (tensor-data output) 2) 0.0 1e-6
-               "Channel 2 mean is 0.0")
-  (assert-equal (f32vector-ref (tensor-data output) 3) -2.5 1e-6
-               "Channel 3 mean is -2.5"))
+         (output (global-avg-pool2d input)))
+    
+    (test "4 channels output shape"
+      '(4)
+      (tensor-shape output))
+    
+    (test-approximate "Channel 0 mean is 2.5"
+      2.5 (f32vector-ref (tensor-data output) 0) 1e-6)
+    (test-approximate "Channel 1 mean is 25.0"
+      25.0 (f32vector-ref (tensor-data output) 1) 1e-6)
+    (test-approximate "Channel 2 mean is 0.0"
+      0.0 (f32vector-ref (tensor-data output) 2) 1e-6)
+    (test-approximate "Channel 3 mean is -2.5"
+      -2.5 (f32vector-ref (tensor-data output) 3) 1e-6)))
 
-;;; GAP Gradient Flow
-;;; ==================================================================
-
-(define (test-gap-gradients)
-  (printf "\n=== GAP Gradient Flow ===\n")
+(test-group "GAP - Gradient Flow"
   
-  (define input (make-tensor32
+  (let* ((input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0
                            5.0 6.0 7.0 8.0)
                  '(2 2 2)
                  requires-grad?: #t))
-  
-  (define output (global-avg-pool2d input))
-  
-  ;; Create target and compute loss
-  (define target (make-tensor32 (f32vector 5.0 10.0) '(2)))
-  (define loss (mse-loss output target))
-  
-  (backward! loss)
-  
-  ;; Check gradient exists
-  (assert-true (tensor-grad input)
-              "Input has gradient after backward")
-  
-  ;; Check gradient distribution
-  ;; Gradient should be distributed equally over spatial dimensions
-  (let ((grad (tensor-grad input)))
+         (output (global-avg-pool2d input))
+         ;; Create target and compute loss
+         (target (make-tensor32 (f32vector 5.0 10.0) '(2)))
+         (loss (mse-loss output target))
+         (_ (backward! loss)))
+    
+    (test-assert "Input has gradient after backward"
+      (tensor-grad input))
+    
     ;; Check gradient distribution
     ;; MSE gradient: dL/doutput[i] = (2/n) * (output[i] - target[i])
     ;; Channel 0: 1/2 * (2/2) * (2.5 - 5.0) = -1.25
@@ -707,140 +482,96 @@
     ;; GAP distributes equally over spatial dimensions:
     ;; Channel 0: -1.25 / 4 = -0.3125 per pixel
     ;; Channel 1: -1.75 / 4 = -0.4375 per pixel
-    (let ((expected-ch0 -0.3125))
-      (assert-equal (f32vector-ref grad 0) expected-ch0 1e-5
-                   "Channel 0 gradient distributed [0,0]")
-      (assert-equal (f32vector-ref grad 1) expected-ch0 1e-5
-                   "Channel 0 gradient distributed [0,1]")
-      (assert-equal (f32vector-ref grad 2) expected-ch0 1e-5
-                   "Channel 0 gradient distributed [1,0]")
-      (assert-equal (f32vector-ref grad 3) expected-ch0 1e-5
-                   "Channel 0 gradient distributed [1,1]"))
-    
-    (let ((expected-ch1 -0.4375))
-      (assert-equal (f32vector-ref grad 4) expected-ch1 1e-5
-                   "Channel 1 gradient distributed [0,0]")
-      (assert-equal (f32vector-ref grad 5) expected-ch1 1e-5
-                   "Channel 1 gradient distributed [0,1]")
-      (assert-equal (f32vector-ref grad 6) expected-ch1 1e-5
-                   "Channel 1 gradient distributed [1,0]")
-      (assert-equal (f32vector-ref grad 7) expected-ch1 1e-5
-                   "Channel 1 gradient distributed [1,1]"))))
+    (let ((grad (tensor-grad input))
+          (expected-ch0 -0.3125)
+          (expected-ch1 -0.4375))
+      
+      (test-approximate "Channel 0 gradient distributed [0,0]"
+        expected-ch0 (f32vector-ref grad 0) 1e-5)
+      (test-approximate "Channel 0 gradient distributed [0,1]"
+        expected-ch0 (f32vector-ref grad 1) 1e-5)
+      (test-approximate "Channel 0 gradient distributed [1,0]"
+        expected-ch0 (f32vector-ref grad 2) 1e-5)
+      (test-approximate "Channel 0 gradient distributed [1,1]"
+        expected-ch0 (f32vector-ref grad 3) 1e-5)
+      
+      (test-approximate "Channel 1 gradient distributed [0,0]"
+        expected-ch1 (f32vector-ref grad 4) 1e-5)
+      (test-approximate "Channel 1 gradient distributed [0,1]"
+        expected-ch1 (f32vector-ref grad 5) 1e-5)
+      (test-approximate "Channel 1 gradient distributed [1,0]"
+        expected-ch1 (f32vector-ref grad 6) 1e-5)
+      (test-approximate "Channel 1 gradient distributed [1,1]"
+        expected-ch1 (f32vector-ref grad 7) 1e-5))))
 
-;;; GAP Equal Gradient Distribution
-;;; ==================================================================
-
-(define (test-gap-equal-distribution)
-  (printf "\n=== GAP Equal Gradient Distribution ===\n")
+(test-group "GAP - Equal Gradient Distribution"
   
   ;; All pixels should get equal gradient (key property of GAP)
-  (define input (make-tensor32
+  (let* ((input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0)
                  '(1 3 3)
                  requires-grad?: #t))
-  
-  (define output (global-avg-pool2d input))
-  
-  ;; Gradient: scalar * 1 (simple case)
-  (let ((scaled (scale-op output 2.0)))
-    (backward! scaled)
+         (output (global-avg-pool2d input))
+         ;; Gradient: scalar * 1 (simple case)
+         (scaled (scale-op output 2.0))
+         (_ (backward! scaled))
+         (grad (tensor-grad input))
+         (expected (/ 2.0 9.0)))
     
-    (let ((grad (tensor-grad input)))
-      ;; All 9 pixels should have same gradient: 2.0/9 ~= 0.222...
-      (let ((expected (/ 2.0 9.0)))
-        (do ((i 0 (+ i 1)))
-            ((= i 9))
-          (assert-equal (f32vector-ref grad i) expected 1e-6
-                       (sprintf "Pixel ~A has equal gradient" i)))))))
+    ;; All 9 pixels should have same gradient: 2.0/9 ~= 0.222...
+    (do ((i 0 (+ i 1)))
+        ((= i 9))
+      (test-approximate (sprintf "Pixel ~A has equal gradient" i)
+        expected (f32vector-ref grad i) 1e-6))))
 
-;;; GAP Numerical Gradient Check
-;;; ==================================================================
-
-(define (test-gap-numerical-gradients)
-  (printf "\n=== GAP Numerical Gradient Check ===\n")
+(test-group "GAP - Numerical Gradient Check"
   
-  (define epsilon 5e-4)
-  
-  (define input (make-tensor32
+  (let* ((epsilon 5e-4)
+         (input (make-tensor32
                  (f32vector 1.0 2.0 3.0 4.0
                             5.0 6.0 7.0 8.0)
                  '(2 2 2)
                  requires-grad?: #t))
-  
-  ;; Compute analytical gradient
-  (define output (global-avg-pool2d input))
-
-  (let ((loss (sum-tensor output)))
+         ;; Compute analytical gradient
+         (output (global-avg-pool2d input))
+         (loss (sum-tensor output))
+         (_ (backward! loss))
+         (analytical-grad (tensor-grad input)))
     
-    (backward! loss)
-    
-    (let ((analytical-grad (tensor-grad input)))
+    ;; Compute numerical gradient
+    (do ((i 0 (+ i 1)))
+        ((= i 8))
       
-      ;; Compute numerical gradient
-      (do ((i 0 (+ i 1)))
-          ((= i 8))
+      ;; +epsilon
+      (let ((input-plus (make-tensor32
+                         (f32vector-copy (tensor-data input))
+                         '(2 2 2))))
+        (f32vector-set! (tensor-data input-plus) i
+                       (+ (f32vector-ref (tensor-data input) i) epsilon))
         
-        ;; +epsilon
-        (let ((input-plus (make-tensor32
-                           (f32vector-copy (tensor-data input))
-                           '(2 2 2))))
-          (f32vector-set! (tensor-data input-plus) i
-                         (+ (f32vector-ref (tensor-data input) i) epsilon))
+        (let* ((output-plus (global-avg-pool2d input-plus))
+               (loss-plus (compensated-sum 'f32 (tensor-data output-plus)
+                                           0 (f32vector-length (tensor-data output-plus)))))
           
-          (let* ((output-plus (global-avg-pool2d input-plus))
-                 (loss-plus (compensated-sum 'f32 (tensor-data output-plus)
-                                             0 (f32vector-length (tensor-data output-plus)))))
+          ;; -epsilon
+          (let ((input-minus (make-tensor32
+                             (f32vector-copy (tensor-data input))
+                             '(2 2 2))))
+            (f32vector-set! (tensor-data input-minus) i
+                            (- (f32vector-ref (tensor-data input) i) epsilon))
             
-            ;; -epsilon
-            (let ((input-minus (make-tensor32
-                               (f32vector-copy (tensor-data input))
-                               '(2 2 2))))
-              (f32vector-set! (tensor-data input-minus) i
-                              (- (f32vector-ref (tensor-data input) i) epsilon))
+            (let* ((output-minus (global-avg-pool2d input-minus))
+                   (loss-minus (compensated-sum 'f32 (tensor-data output-minus)
+                                                0 (f32vector-length (tensor-data output-minus)))))
               
-              (let* ((output-minus (global-avg-pool2d input-minus))
-                     (loss-minus (compensated-sum 'f32 (tensor-data output-minus)
-                                                  0 (f32vector-length (tensor-data output-minus)))))
+              (let ((numerical (/ (- loss-plus loss-minus) (* 2.0 epsilon)))
+                    (analytical (f32vector-ref analytical-grad i)))
                 
-                (let ((numerical (/ (- loss-plus loss-minus) (* 2.0 epsilon)))
-                      (analytical (f32vector-ref analytical-grad i)))
-                  
-                  (assert-equal analytical numerical 1e-3
-                               (sprintf "GAP gradient check position ~A" i)))))))))))
-
+                (test-approximate (sprintf "GAP gradient check position ~A" i)
+                  analytical numerical 1e-3)))))))))
 
 ;;; ==================================================================
 ;;; Run All Tests
 ;;; ==================================================================
 
-(define (run-all-batchnorm-tests)
-  (reset-test-stats!)
-  (printf "\n")
-  (printf "========================================\n")
-  (printf "Batchnorm & global avg pooling tests\n")
-  (printf "========================================\n")
-  
-  ;; Batch Normalization Tests
-  (test-batchnorm-training-forward)
-  (test-batchnorm-running-stats)
-  (test-batchnorm-eval-mode)
-  (test-batchnorm-mode-switching)
-  (test-batchnorm-learnable-params)
-  (test-batchnorm-gradients)
-  (test-batchnorm-gamma-beta-gradients)        
-  (test-batchnorm-spatial-sizes)
-  (test-batchnorm-numerical-gradients)
-  (test-batchnorm-gradient-non-constant)
-  
-  ;; Global Average Pooling Tests
-  (test-gap-basic-forward)
-  (test-gap-spatial-sizes)
-  (test-gap-multiple-channels)
-  (test-gap-gradients)
-  (test-gap-equal-distribution)
-  (test-gap-numerical-gradients)
-  
-  (test-summary))
-
-;; Run tests
-(run-all-batchnorm-tests)
+(test-exit)
