@@ -546,7 +546,7 @@
          (lambda (layer)
            (let ((params (parameters layer)))
              (printf "  ~A: ~A parameters\n"
-                     (get-name layer)
+                     (layer-name layer)
                      (fold (lambda (p acc)
                              (+ acc (apply * (tensor-shape p))))
                            0 params))))
@@ -566,7 +566,7 @@
                                       weight-decay: 0.0001)))
             
             ;; Training loop
-            (let ((num-epochs 100)
+            (let ((num-epochs 150)
                   (best-acc 0.0))
               
               (printf "Training for ~A epochs...\n" num-epochs)
@@ -580,14 +580,14 @@
                               (train-epoch-batched model optimizer train-data
                                                   batch-size: 16
                                                   gradient-diagnostics: (= epoch 1))))
-                  (printf "Epoch ~A/~A - Loss: ~,4f - Acc: ~,2f%"
+                  (printf "Epoch ~A/~A - Loss: ~A - Acc: ~A%"
                           epoch num-epochs avg-loss (* 100.0 accuracy))
                   
                   ;; Evaluate every 10 epochs
                   (when (= (modulo epoch 10) 0)
                     (let-values (((test-acc confusion) 
                                   (evaluate-batched model test-data batch-size: 32)))
-                      (printf " - Test Acc: ~,2f%" (* 100.0 test-acc))
+                      (printf " - Test Acc: ~A%" (* 100.0 test-acc))
                       ;; Save best model
                       (when (> test-acc best-acc)
                         (set! best-acc test-acc)
@@ -608,7 +608,7 @@
               (printf "Final Evaluation on Test Set:\n")
               (let-values (((test-acc confusion) 
                             (evaluate-batched model test-data batch-size: 32)))
-                (printf "Test Accuracy: ~,2f%\n" (* 100.0 test-acc))
+                (printf "Test Accuracy: ~A%\n" (* 100.0 test-acc))
                 (print-confusion-matrix confusion))
               
               (printf "\n")
@@ -618,7 +618,7 @@
               (let-values (((test-acc confusion) 
                             (evaluate-batched model test-data)))
                 (do ((class 0 (+ class 1)))
-                    ((= i num-classes))
+                    ((= class num-classes))
                   (let ((total 0)
                         (correct 0))
                     (do ((pred 0 (+ pred 1)))
@@ -627,7 +627,7 @@
                         (set! total (+ total (vector-ref confusion idx)))
                         (when (= class pred)
                           (set! correct (vector-ref confusion idx)))))
-                    (printf "  ~A: ~,2f% (~A/~A)\n" 
+                    (printf "  ~A: ~A% (~A/~A)\n" 
                             (vector-ref class-names class)
                             (* 100 (/ correct total))
                             correct
@@ -657,9 +657,9 @@
                             (vector-ref class-names true-class)
                             (vector-ref class-names pred-class))
                     (if (= pred-class true-class)
-                        (printf "✓")
-                        (printf "✗"))
-                    (printf " (confidence: ~,1f%)\n" 
+                        (printf "O")
+                        (printf "X"))
+                    (printf " (confidence: ~A%)\n" 
                             (* 100 (f32vector-ref pred-data pred-class))))))
               
               (printf "\n========================================\n")
