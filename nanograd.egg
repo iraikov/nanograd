@@ -9,7 +9,7 @@
 
  ; A list of eggs nanograd depends on.
  (dependencies test srfi-1 srfi-4 srfi-42 srfi-69
-               mathh vector-lib blas yasos s11n)
+               mathh vector-lib blas yasos s11n array-morphisms)
 
  (author "Ivan Raikov")
 
@@ -29,6 +29,10 @@
              (extension nanograd-training (source "training.scm")
                         (csc-options "-O3" "-d1")
                         (component-dependencies nanograd-autograd))
+             (extension nanograd-array-morphisms
+                        (source "array-morphisms-nanograd.scm")
+                        (csc-options "-O0" "-d2")
+                        (component-dependencies nanograd-autograd nanograd-layer))
              )
 
  (test-dependencies test)
