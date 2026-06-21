@@ -15,6 +15,15 @@
    ;; Gradient operations
    zero-grad! backward!
    set-backward-fn! add-to-grad!
+   set-grad!
+
+   ;; Strict/lazy tensor predicates and operations
+   strict-tensor? lazy-tensor?
+   tensor-force tensor-morphism-value
+   lazy-tensor-mv
+
+   ;; Shared backward topo-sort (for lazy tensor integration)
+   backward-impl!
    
    ;; Arithmetic operations
    add sub mul div safe-div
@@ -102,7 +111,17 @@
   
   (define-operation (zero-grad! obj))
   (define-operation (backward! obj))
-  
+
+  ;; Strict/lazy tensor predicates (extend the tensor protocol for
+  ;; array-morphisms lazy tensor integration)
+  (define-predicate strict-tensor?)
+  (define-predicate lazy-tensor?)
+  (define-operation (tensor-force obj))           ; lazy -> strict (identity for strict)
+  (define-operation (tensor-morphism-value obj))  ; returns morphism or #f
+  ;; Returns the underlying morph-variable of a lazy-tensor directly from
+  ;; the closure, avoiding any address-keyed hash table lookup.
+  (define-operation (lazy-tensor-mv obj))
+
   ;;; ==================================================================
   ;;; Base tensor implementation
   ;;; ==================================================================
@@ -120,6 +139,10 @@
      ((tensor? self) #t)
      ((tensor32? self) (eq? dtype 'f32))
      ((tensor64? self) (eq? dtype 'f64))
+     ((strict-tensor? self) #t)
+     ((lazy-tensor? self) #f)
+     ((tensor-force self) self)
+     ((tensor-morphism-value self) #f)
      
      ;; Accessors
      ((tensor-data self) data)
@@ -236,70 +259,50 @@
               (elt-set! grad i 0.0))))
         ))
 
-     ;; Topological sort backward (correct for DAGs with shared nodes)
+     ;; Topological sort backward (delegates to backward-impl!)
      ((backward! self)
       (when requires-grad?
-
         (when (detect-cycles self)
-          (error 'backward! 
+          (error 'backward!
                  "Computation graph contains cycles - cannot compute gradients"))
+        (backward-impl! self)))
 
-        
-        ;; Initialize gradient
-        (unless (gradient-initialized? grad dtype)
-          (fill-ones! grad dtype))
-        
-        ;; Build topological ordering using depth-first search
-        (let ((visited (make-hash-table eq?))
-              (topo-order '()))
-          
-          ;; DFS to build reverse topological order
-          (define (visit node)
-            (unless (hash-table-ref/default visited node #f)
-              (hash-table-set! visited node #t)
-              ;; Visit children first (post-order traversal)
-              (for-each visit (tensor-children node))
-              ;; Add to order after visiting children
-              (set! topo-order (cons node topo-order))))
-          
-          ;; Start DFS from this (output) tensor
-          (visit self)
-          
-          ;; Execute backward functions in topological order
-          ;; This ensures each backward function is called exactly once
-          ;; and gradients are accumulated in the correct order
-
-          (for-each
-           (lambda (node)
-             (let ((bwd-fn (tensor-backward-fn node)))
-               (when bwd-fn
-                 (bwd-fn))))
-           topo-order))))
-     
      ))
     )
 
+  (define (backward-impl! root)
+    "Shared topo-sort backward over any YASOS tensor graph.
+     Works for strict tensors, lazy tensors, and mixed graphs."
+    (unless (gradient-initialized? (tensor-grad root) (tensor-dtype root))
+      (fill-ones! (tensor-grad root) (tensor-dtype root)))
+    (let ((visited '())
+          (topo-order '()))
+      (define (visit node)
+        (unless (memq node visited)
+          (set! visited (cons node visited))
+          (for-each visit (tensor-children node))
+          (set! topo-order (cons node topo-order))))
+      (visit root)
+      (for-each
+       (lambda (node)
+         (let ((bwd-fn (tensor-backward-fn node)))
+           (when bwd-fn (bwd-fn))))
+       topo-order)))
+
   (define (detect-cycles tensor)
     "Returns #t if the computation graph contains cycles, #f otherwise"
-    (let ((visiting (make-hash-table eq?))  ; Currently in DFS stack
-          (visited (make-hash-table eq?)))   ; Completely processed
-      
+    (let ((visiting '())   ; nodes currently on the DFS stack
+          (visited  '()))  ; nodes completely processed
       (define (has-cycle? node)
         (cond
-         ;; Already completely visited - no cycle from this node
-         ((hash-table-ref/default visited node #f) #f)
-         ;; Currently visiting - found a back edge (cycle!)
-         ((hash-table-ref/default visiting node #f) #t)
+         ((memq node visited)  #f)
+         ((memq node visiting) #t)
          (else
-          ;; Mark as visiting
-          (hash-table-set! visiting node #t)
-          ;; Check children
+          (set! visiting (cons node visiting))
           (let ((cycle-found? (any has-cycle? (tensor-children node))))
-            ;; Mark as visited and remove from visiting
-            (hash-table-set! visiting node #f)
-            (hash-table-set! visited node #t)
+            (set! visiting (filter (lambda (x) (not (eq? x node))) visiting))
+            (set! visited  (cons node visited))
             cycle-found?))))
-      
       (has-cycle? tensor)))
      
 

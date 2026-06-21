@@ -313,9 +313,8 @@
   ;; Loss should decrease after one Adam step
   (let* ((model (make-am-sequential
                  (list (make-am-dense-layer 1 1 activation: (make-identity) dtype: 'f64))))
-         (opt   (make-adam (am-parameters model) learning-rate: 0.1))
-         (ctx   (make-am-training-context)))
-    (let-values (((ctx-fwd ctx-bwd) ctx))
+         (opt   (make-adam (am-parameters model) learning-rate: 0.1)))
+    (let-values (((ctx-fwd ctx-bwd) (make-am-training-context)))
       (define (make-input) (make-lt '(1.0) '(1 1)))
       (define (make-target) (make-lt '(0.0) '(1 1)))
 

@@ -59,7 +59,7 @@
   (import scheme (chicken base) (chicken random))
   (import (only srfi-1 map filter fold for-each any every append-map filter-map iota))
   (import srfi-4)
-  (import (only srfi-69 make-hash-table hash-table-ref/default hash-table-set!))
+  (import (only srfi-69 make-hash-table hash-table-ref hash-table-ref/default hash-table-set! eq?-hash))
   (import yasos)
   (import datatype matchable)
   (import array-morphisms-core)
@@ -113,10 +113,22 @@
   ;;;; ================================================================
 
   (define (morphism->srfi4 m)
-    "Realize morphism m and extract its SRFI-4 data vector."
+    "Realize morphism m and return a row-major SRFI-4 vector.
+     Reads elements via multi-index access so that zero-copy transposed views
+     are correctly de-transposed rather than read flat."
     (cases array-morphism (realize m)
       (concrete-array (data shape strides offset dtype alloc-id batch-axis)
-        data)
+        (let ((n     (shape-size shape))
+              (nstrs (compute-strides shape)))
+          (if (and (= offset 0) (equal? strides nstrs))
+              data
+              (let ((fresh (allocate-typed-vector dtype n)))
+                (do ((i 0 (+ i 1)))
+                    ((= i n) fresh)
+                  (let* ((multi (linear-to-multi-index i shape))
+                         (phys  (multi-to-linear-index multi strides offset)))
+                    (typed-vector-set! fresh dtype i
+                                       (typed-vector-ref data dtype phys))))))))
       (else (error "morphism->srfi4: realization produced non-concrete result"))))
 
   (define (srfi4->morphism vec shape dtype)
@@ -843,26 +855,20 @@
        sorted)))
 
   (define (fresh-copy-morphism m)
-    "Copy a concrete-array to a fresh non-pooled buffer (alloc-id = -1).
-     Used to protect gradient outputs from being overwritten by the
-     buffer pool's greedy reuse of short-lived slots.
-
-     Background: when realize/ctx returns a concrete-array, its buffer
-     lives in the pool.  The greedy interval scheduler assigns lifetime
-     [N, N] to an output that nothing in the context reads again.  On
-     the next realize/ctx call in the same loop, the scheduler may
-     hand out the SAME physical buffer for an intermediate result,
-     overwriting the gradient before the optimizer sees it.  Copying
-     to a fresh alloc-id=-1 buffer breaks this aliasing."
+    "Copy a concrete-array to a fresh row-major non-pooled buffer (alloc-id = -1).
+     Reads elements via multi-index access (respecting source strides) so that
+     zero-copy transposed views are correctly de-transposed in the output."
     (cases array-morphism m
       (concrete-array (data shape strides offset dtype alloc-id batch-axis)
         (let* ((n     (shape-size shape))
-               (fresh (allocate-typed-vector dtype n)))
-          (let loop ((i 0))
-            (when (< i n)
-              (typed-vector-set! fresh dtype i (typed-vector-ref data dtype i))
-              (loop (+ i 1))))
-          (concrete-array fresh shape (compute-strides shape) 0 dtype -1 batch-axis)))
+               (fresh (allocate-typed-vector dtype n))
+               (nstrs (compute-strides shape)))
+          (do ((i 0 (+ i 1)))
+              ((= i n))
+            (let* ((multi (linear-to-multi-index i shape))
+                   (phys  (multi-to-linear-index multi strides offset)))
+              (typed-vector-set! fresh dtype i (typed-vector-ref data dtype phys))))
+          (concrete-array fresh shape nstrs 0 dtype -1 batch-axis)))
       (else (error "fresh-copy-morphism: expected concrete-array" m))))
 
   (define (am-realize-grads/ctx ctx parameters)
@@ -967,8 +973,12 @@
   ;; and fresh-copy overhead present in am-training-step (Approach A).
   ;; ============================================================
 
-  (define *ssa-state* #f)
-  ; State: (list joint-prog param-const-vals input-const-val)
+  ;; SSA state is keyed on the context object so each ctx gets its own
+  ;; compiled program.  This allows multiple models / batch sizes to
+  ;; coexist in the same session without recompiling on every call.
+  (define *ssa-state-table*
+    (make-hash-table eq? eq?-hash))
+  ; Each value: (list joint-prog param-const-vals input-const-val)
   ;   joint-prog       -- ssa-program with fwd+bwd bindings
   ;   param-const-vals -- list of (const-ref cid) for trainable parameters
   ;   input-const-val  -- (const-ref cid) for the input batch, or #f
@@ -976,11 +986,13 @@
   (define (am-training-step/ssa ctx optimizer model loss-fn x-lt)
     "Training step using pre-compiled SSA forward+backward program.
 
-     First call compiles the joint program; subsequent calls replay it.
+     First call for a given ctx compiles the joint program; subsequent calls
+     replay it.  Each ctx has its own compiled program, so multiple models
+     and batch sizes can coexist in the same session.
      Parameters updated in-place by the optimizer are automatically
      reflected in SSA constants across steps without re-registration."
     (let ((params (am-parameters model)))
-      (unless *ssa-state*
+      (unless (hash-table-ref/default *ssa-state-table* ctx #f)
         (let* ((out-lt       (forward model x-lt))
                (loss-lt      (loss-fn out-lt))
                (loss-mv      (lazy-tensor-morph-variable loss-lt))
@@ -994,11 +1006,12 @@
                                params))
                (loss-val     (ssa-loss-binding-val fwd-prog))
                (joint        (ssa-vjp fwd-prog p-vals loss-val)))
-          (set! *ssa-state* (list joint p-vals x-const-val))))
+          (hash-table-set! *ssa-state-table* ctx (list joint p-vals x-const-val))))
 
-      (let* ((joint         (car  *ssa-state*))
-             (p-ids         (cadr *ssa-state*))
-             (x-const-val   (caddr *ssa-state*))
+      (let* ((state         (hash-table-ref *ssa-state-table* ctx))
+             (joint         (car  state))
+             (p-ids         (cadr state))
+             (x-const-val   (caddr state))
              (x-mv          (lazy-tensor-morph-variable x-lt))
              (x-concrete    (am:var-value x-mv)))
         ;; Replace input constant with this step's batch

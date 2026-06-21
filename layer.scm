@@ -387,8 +387,6 @@
 
   ;; Efficient dense layer that handles both 1D and 2D inputs
   ;; Uses BLAS GEMM for batch operations
-  ;; Replace the make-dense-layer in layer.scm with this corrected version
-;; The key fix: use the correct GEMM operation to get (batch-size, output-dim) layout
 
 (define (make-dense-layer input-dim output-dim 
                           #!key 

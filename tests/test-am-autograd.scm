@@ -30,21 +30,28 @@
   (and (= (length l1) (length l2))
        (every approx= l1 l2)))
 
+(define (concrete->list c)
+  "Read a concrete-array into a row-major list, respecting strides and offset."
+  (cases array-morphism c
+    (concrete-array (data shape strides offset dtype alloc-id batch-axis)
+      (let ((rank (vector-length shape)))
+        (define (traverse dim base)
+          (if (= dim rank)
+              (list (f64vector-ref data base))
+              (apply append
+                     (map (lambda (i)
+                            (traverse (+ dim 1) (+ base (* i (vector-ref strides dim)))))
+                          (iota (vector-ref shape dim))))))
+        (traverse 0 offset)))
+    (else (error "concrete->list: not a concrete-array"))))
+
 (define (value-list mv)
-  (let ((c (realize (var-value mv))))
-    (cases array-morphism c
-      (concrete-array (data shape strides offset dtype alloc-id batch-axis)
-        (map (lambda (i) (f64vector-ref data i)) (iota (shape-size shape))))
-      (else (error "value-list: unexpected non-concrete")))))
+  (concrete->list (realize (var-value mv))))
 
 (define (grad-list mv)
   (let ((g (var-grad mv)))
     (unless g (error "grad-list: no gradient on" mv))
-    (let ((c (realize g)))
-      (cases array-morphism c
-        (concrete-array (data shape strides offset dtype alloc-id batch-axis)
-          (map (lambda (i) (f64vector-ref data i)) (iota (shape-size shape))))
-        (else (error "grad-list: non-concrete gradient"))))))
+    (concrete->list (realize g))))
 
 (define (make-fv lst shape)
   "Make a requires-grad=#t morph-variable from a flat f64 list."
