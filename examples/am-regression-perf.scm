@@ -23,9 +23,13 @@
 (import (only srfi-1 map fold filter take drop last iota append-map))
 (import srfi-4)
 (import array-morphisms-core array-morphisms-realization array-morphisms-context)
+(import array-morphisms-blas-exec)
+(import array-morphisms-blas-egg-backend)
 (import (prefix array-morphisms-grad am:))
 (import nanograd-autograd nanograd-layer nanograd-optimizer)
 (import nanograd-array-morphisms)
+
+(register-blas-backend! (make-blas-egg-backend))
 
 
 ;;; ============================================================
@@ -238,12 +242,13 @@
   "Run one SSA training step and print a timing breakdown."
   (printf "~A\n" step-label)
 
-  ;; Full step (compile on first call, replay on subsequent)
+  ;; Full step (compile on first call, replay on subsequent).
+  ;; y-lt is passed as an extra-input so its SSA constant is updated each step.
   (define-values (loss-lt t-total)
     (call/timed (lambda ()
                   (am-training-step/ssa ctx opt model-ssa
                                         (lambda (out-lt) (am-mse-loss out-lt y-lt))
-                                        x-lt))))
+                                        x-lt y-lt))))
   (printf "  total step:     ~A\n" (fmt-ms t-total))
 
   ;; Context stats

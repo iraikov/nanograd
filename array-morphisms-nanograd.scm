@@ -983,42 +983,60 @@
   ;   param-const-vals -- list of (const-ref cid) for trainable parameters
   ;   input-const-val  -- (const-ref cid) for the input batch, or #f
 
-  (define (am-training-step/ssa ctx optimizer model loss-fn x-lt)
+  (define (am-training-step/ssa ctx optimizer model loss-fn x-lt . extra-inputs)
     "Training step using pre-compiled SSA forward+backward program.
 
      First call for a given ctx compiles the joint program; subsequent calls
      replay it.  Each ctx has its own compiled program, so multiple models
      and batch sizes can coexist in the same session.
      Parameters updated in-place by the optimizer are automatically
-     reflected in SSA constants across steps without re-registration."
+     reflected in SSA constants across steps without re-registration.
+
+     extra-inputs: additional lazy tensors whose values change every step
+     (e.g. the target tensor for supervised learning).  Pass each one here
+     AND capture it in loss-fn so its SSA constant is found at compile time
+     and updated on every replay step."
     (let ((params (am-parameters model)))
       (unless (hash-table-ref/default *ssa-state-table* ctx #f)
-        (let* ((out-lt       (forward model x-lt))
-               (loss-lt      (loss-fn out-lt))
-               (loss-mv      (lazy-tensor-morph-variable loss-lt))
-               (fwd-prog     (morphism-to-ssa loss-mv))
-               (x-mv         (lazy-tensor-morph-variable x-lt))
-               (x-const-val  (ssa-constant-id fwd-prog (am:var-value x-mv)))
-               (p-vals       (filter-map
-                               (lambda (p)
-                                 (ssa-constant-id fwd-prog
-                                   (am:var-value (lazy-tensor-morph-variable p))))
-                               params))
-               (loss-val     (ssa-loss-binding-val fwd-prog))
-               (joint        (ssa-vjp fwd-prog p-vals loss-val)))
-          (hash-table-set! *ssa-state-table* ctx (list joint p-vals x-const-val))))
+        (let* ((out-lt            (forward model x-lt))
+               (loss-lt           (loss-fn out-lt))
+               (loss-mv           (lazy-tensor-morph-variable loss-lt))
+               (fwd-prog          (morphism-to-ssa loss-mv))
+               (x-mv              (lazy-tensor-morph-variable x-lt))
+               (x-const-val       (ssa-constant-id fwd-prog (am:var-value x-mv)))
+               (p-vals            (filter-map
+                                    (lambda (p)
+                                      (ssa-constant-id fwd-prog
+                                        (am:var-value (lazy-tensor-morph-variable p))))
+                                    params))
+               (extra-const-vals  (map (lambda (ei)
+                                         (ssa-constant-id fwd-prog
+                                           (am:var-value (lazy-tensor-morph-variable ei))))
+                                       extra-inputs))
+               (loss-val          (ssa-loss-binding-val fwd-prog))
+               (joint             (ssa-vjp fwd-prog p-vals loss-val)))
+          (hash-table-set! *ssa-state-table* ctx
+                           (list joint p-vals x-const-val extra-const-vals))))
 
-      (let* ((state         (hash-table-ref *ssa-state-table* ctx))
-             (joint         (car  state))
-             (p-ids         (cadr state))
-             (x-const-val   (caddr state))
-             (x-mv          (lazy-tensor-morph-variable x-lt))
-             (x-concrete    (am:var-value x-mv)))
+      (let* ((state             (hash-table-ref *ssa-state-table* ctx))
+             (joint             (car   state))
+             (p-ids             (cadr  state))
+             (x-const-val       (caddr state))
+             (extra-const-vals  (cadddr state))
+             (x-mv              (lazy-tensor-morph-variable x-lt))
+             (x-concrete        (am:var-value x-mv)))
         ;; Replace input constant with this step's batch
         (when x-const-val
           (hash-table-set! (ssa-program-constants joint)
                            (ssa-value-id x-const-val)
                            x-concrete))
+        ;; Replace extra-input constants (e.g. target tensor) with this step's values
+        (for-each (lambda (ecv ei)
+                    (when ecv
+                      (hash-table-set! (ssa-program-constants joint)
+                                       (ssa-value-id ecv)
+                                       (am:var-value (lazy-tensor-morph-variable ei)))))
+                  extra-const-vals extra-inputs)
         ;; Execute joint forward+backward program
         (let* ((results   (ssa-realize/ctx ctx joint))
                (loss-arr  (car results))
