@@ -300,29 +300,13 @@
         ((string=? name "Identity") lt)
 
         ((string=? name "ReLU")
-         ;; relu(x) = 0.5 * (x + |x|)
-         (let* ((abs-x  (am:var-abs mv))
-                (sum    (am:var+ mv abs-x))
-                (half   (am:make-var (morph-from-list '(0.5) '(1) dt) #f)))
-           (get-or-make-lazy (am:var* sum half))))
+         (get-or-make-lazy (am:var-relu mv)))
 
         ((string=? name "Sigmoid")
-         ;; sigmoid(x) = 1 / (1 + exp(-x))
-         (let* ((neg-x  (am:var-negate mv))
-                (ex     (am:var-exp neg-x))
-                (one    (am:make-var (morph-from-list '(1.0) '(1) dt) #f))
-                (denom  (am:var+ one ex)))
-           (get-or-make-lazy (am:var/ one denom))))
+         (get-or-make-lazy (am:var-sigmoid mv)))
 
         ((string=? name "Tanh")
-         ;; tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
-         (let* ((two    (am:make-var (morph-from-list '(2.0) '(1) dt) #f))
-                (two-x  (am:var* mv two))
-                (e2x    (am:var-exp two-x))
-                (one    (am:make-var (morph-from-list '(1.0) '(1) dt) #f)))
-           (get-or-make-lazy
-            (am:var/ (am:var- e2x one)
-                     (am:var+ e2x one)))))
+         (get-or-make-lazy (am:var-tanh mv)))
 
         ((string=? name "GeLU")
          ;; gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
@@ -976,8 +960,11 @@
   ;; SSA state is keyed on the context object so each ctx gets its own
   ;; compiled program.  This allows multiple models / batch sizes to
   ;; coexist in the same session without recompiling on every call.
+  ;; Keyed by morphism-context-id (a gensym), which is GC-stable (interned symbol).
+  ;; Must NOT be keyed on the context object directly: CHICKEN's major GC moves
+  ;; records, invalidating eq?-hash buckets and silently triggering recompilation.
   (define *ssa-state-table*
-    (make-hash-table eq? eq?-hash))
+    (make-hash-table))
   ; Each value: (list joint-prog param-const-vals input-const-val)
   ;   joint-prog       -- ssa-program with fwd+bwd bindings
   ;   param-const-vals -- list of (const-ref cid) for trainable parameters
@@ -996,8 +983,9 @@
      (e.g. the target tensor for supervised learning).  Pass each one here
      AND capture it in loss-fn so its SSA constant is found at compile time
      and updated on every replay step."
-    (let ((params (am-parameters model)))
-      (unless (hash-table-ref/default *ssa-state-table* ctx #f)
+    (let* ((ctx-id (morphism-context-id ctx))
+           (params (am-parameters model)))
+      (unless (hash-table-ref/default *ssa-state-table* ctx-id #f)
         (let* ((out-lt            (forward model x-lt))
                (loss-lt           (loss-fn out-lt))
                (loss-mv           (lazy-tensor-morph-variable loss-lt))
@@ -1015,10 +1003,10 @@
                                        extra-inputs))
                (loss-val          (ssa-loss-binding-val fwd-prog))
                (joint             (ssa-vjp fwd-prog p-vals loss-val)))
-          (hash-table-set! *ssa-state-table* ctx
+          (hash-table-set! *ssa-state-table* ctx-id
                            (list joint p-vals x-const-val extra-const-vals))))
 
-      (let* ((state             (hash-table-ref *ssa-state-table* ctx))
+      (let* ((state             (hash-table-ref *ssa-state-table* ctx-id))
              (joint             (car   state))
              (p-ids             (cadr  state))
              (x-const-val       (caddr state))
