@@ -33,11 +33,12 @@
    am-mse-loss
    am-cross-entropy-loss
 
-   ;; AM-backed layers (satisfy nanograd layer? protocol)
-   make-am-dense-layer
-   make-am-conv2d-layer
-   make-am-batch-norm
-   make-am-sequential
+    ;; AM-backed layers (satisfy nanograd layer? protocol)
+    make-am-dense-layer
+    make-am-conv2d-layer
+    make-am-batch-norm
+    make-am-sequential
+    make-am-flatten
 
    ;; Parameter / gradient helpers
    am-parameters
@@ -50,6 +51,7 @@
    am-realize-grads/ctx
    am-training-step
    am-training-step/ssa
+   am-replay-plan-stats
    am-finalize-context!
    am-reset-context!
 
@@ -57,7 +59,7 @@
    fresh-copy-morphism)
 
   (import scheme (chicken base) (chicken random))
-  (import (only srfi-1 map filter fold for-each any every append-map filter-map iota))
+  (import (only srfi-1 map filter fold for-each any every append-map filter-map iota make-list))
   (import srfi-4)
   (import (only srfi-69 make-hash-table hash-table-ref hash-table-ref/default hash-table-set! eq?-hash))
   (import yasos)
@@ -507,6 +509,32 @@
 
 
   ;;;; ================================================================
+  ;;;; Broadcast helper for 1-D channel parameters
+  ;;;;
+  ;;;; AM binary broadcasting aligns dimensions from the right, so a bias
+  ;;;; or gamma/beta of shape [C] applied to a tensor of shape [N C ...]
+  ;;;; does not line up with the channel axis.  Reshape the parameter to
+  ;;;; [1 C 1 ...] so the trailing 1s match the trailing spatial dims and
+  ;;;; the C aligns with the channel axis.
+  ;;;; ================================================================
+
+  (define (broadcast-channel-param mv target-rank)
+    "Reshape a 1-D channel parameter morph-variable so it can be added or
+     multiplied into tensors of rank target-rank where the channel axis is 1.
+     [C] -> [1 C 1 ... 1] with (target-rank - 2) trailing ones."
+    (let* ((shape (vector->list (morph-shape (am:var-value mv))))
+           (rank (length shape)))
+      (cond
+       ((= rank 1)
+        (let* ((C (car shape))
+               (trailing-ones (make-list (max 0 (- target-rank 2)) 1))
+               (new-shape (cons 1 (cons C trailing-ones))))
+          (am:var-reshape mv new-shape)))
+       ((= rank target-rank) mv)
+       (else (error "broadcast-channel-param: unsupported parameter shape"
+                    shape target-rank)))))
+
+  ;;;; ================================================================
   ;;;; make-am-conv2d-layer
   ;;;;
   ;;;; 2-D convolution layer using im2col + matmul + col2im.
@@ -518,78 +546,88 @@
   ;;;;   y   = W @ col + b        ; [N, out_ch, OH*OW]
   ;;;; ================================================================
 
+  (define (compute-conv-output-size input-size kernel-size stride padding)
+    "Compute output spatial size for conv2d."
+    (+ 1 (quotient (+ input-size (* 2 padding) (- kernel-size)) stride)))
+
   (define (make-am-conv2d-layer in-channels out-channels kernel-size
-                                #!key
-                                (stride 1)
-                                (padding 0)
-                                (activation (make-identity))
-                                (dtype 'f64))
+                                 #!key
+                                 (stride 1)
+                                 (padding 0)
+                                 (activation (make-identity))
+                                 (dtype 'f64))
     (let* ((KH (if (pair? kernel-size) (car kernel-size) kernel-size))
-           (KW (if (pair? kernel-size) (cdr kernel-size) kernel-size))
-           (fan-in  (* in-channels KH KW))
-           (W-data  (he-init-vector (* out-channels fan-in) fan-in dtype))
-           (b-data  (zero-vector out-channels dtype))
-           (W-mv    (am:make-var
-                     (make-morphism W-data (list out-channels fan-in) dtype)
-                     #t))
-           (b-mv    (am:make-var
-                     (make-morphism b-data (list out-channels) dtype)
-                     #t))
-           (W-lt    (get-or-make-lazy W-mv))
-           (b-lt    (get-or-make-lazy b-mv)))
-      (object
-       ((layer? self) #t)
-       ((conv2d-layer? self) #t)
-       ((layer-name self) "am-conv2d")
-       ((layer-input-size self) in-channels)
-       ((layer-output-size self) out-channels)
-       ((layer-activation self) activation)
-       ((layer-norm self) #f)
+            (KW (if (pair? kernel-size)
+                    (if (null? (cdr kernel-size)) (car kernel-size) (cadr kernel-size))
+                    kernel-size))
+            (fan-in  (* in-channels KH KW))
+            (W-data  (he-init-vector (* out-channels fan-in) fan-in dtype))
+            (b-data  (zero-vector out-channels dtype))
+            (W-mv    (am:make-var
+                      (make-morphism W-data (list out-channels fan-in) dtype)
+                      #t))
+            (b-mv    (am:make-var
+                      (make-morphism b-data (list out-channels) dtype)
+                      #t))
+            (W-lt    (get-or-make-lazy W-mv))
+            (b-lt    (get-or-make-lazy b-mv)))
+       (object
+        ((layer? self) #t)
+        ((conv2d-layer? self) #t)
+        ((layer-name self) "am-conv2d")
+        ((layer-input-size self) in-channels)
+        ((layer-output-size self) out-channels)
+        ((layer-activation self) activation)
+        ((layer-norm self) #f)
 
-       ((parameters self) (list W-lt b-lt))
+        ((parameters self) (list W-lt b-lt))
 
-       ((zero-grad-layer! self)
-        (am:zero-grad! W-mv)
-        (am:zero-grad! b-mv))
+        ((zero-grad-layer! self)
+         (am:zero-grad! W-mv)
+         (am:zero-grad! b-mv))
 
-       ((set-training-mode! self training?) (if #f #f))
-       ((set-eval-mode! self) (if #f #f))
+        ((set-training-mode! self training?) (if #f #f))
+        ((set-eval-mode! self) (if #f #f))
 
-       ((forward self x-lt)
-        (let* ((x-mv   (lazy-tensor-morph-variable x-lt))
-               (x-morph (am:var-value x-mv))
-               (x-shape (morph-shape x-morph))
-               (N      (if (= (vector-length x-shape) 4)
-                           (vector-ref x-shape 0) 1))
-               ;; col shape: [N, in_ch*KH*KW, OH*OW]
-               (col-mv  (var-im2col x-mv
-                                    (list KH KW)
-                                    stride
-                                    padding))
-               ;; W @ col: [out_ch, in_ch*KH*KW] @ [N, in_ch*KH*KW, OH*OW]
-               ;; We need batched matmul. For each batch element:
-               ;;   W @ col[n] = [out_ch, OH*OW]
-               ;; Simplify: reshape col to [N*OH*OW, in_ch*KH*KW], transpose W,
-               ;; multiply, reshape back.
-               (col-v   (am:var-value col-mv))
-               (col-sh  (morph-shape col-v))
-               (OH_OW   (vector-ref col-sh (- (vector-length col-sh) 1)))
-               ;; Reshape col to [N*OH_OW, fan_in]
-               (col-r   (am:var-reshape col-mv (list (* N OH_OW) fan-in)))
-               ;; W^T: [fan_in, out_channels]
-               (WT-mv   (am:var-transpose W-mv '(1 0)))
-               ;; result: [N*OH_OW, out_channels]
-               (res-mv  (am:var-matmul col-r WT-mv))
-               ;; Reshape to [N, OH_OW, out_channels] then transpose to [N, out_ch, OH_OW]
-               (res-r   (am:var-reshape res-mv (list N OH_OW out-channels)))
-               (res-t   (am:var-transpose res-r '(0 2 1)))
-               ;; Add bias: b shape [out_ch], broadcast over N and OH_OW
-               (pre     (am:var+ res-t b-mv)))
-          (activation-forward-am activation (get-or-make-lazy pre))))
+        ((forward self x-lt)
+         (let* ((x-mv    (lazy-tensor-morph-variable x-lt))
+                (x-morph (am:var-value x-mv))
+                (x-shape (morph-shape x-morph))
+                (rank    (vector-length x-shape))
+                (N       (if (= rank 4) (vector-ref x-shape 0) 1))
+                (C       (if (= rank 4) (vector-ref x-shape 1) (vector-ref x-shape 0)))
+                (H       (if (= rank 4) (vector-ref x-shape 2) (vector-ref x-shape 1)))
+                (W       (if (= rank 4) (vector-ref x-shape 3) (vector-ref x-shape 2)))
+                (OH      (compute-conv-output-size H KH stride padding))
+                (OW      (compute-conv-output-size W KW stride padding))
+                (OH_OW   (* OH OW))
+                ;; col shape: [N, in_ch*KH*KW, OH*OW]
+                (col-mv  (var-im2col x-mv
+                                     (list KH KW)
+                                     stride
+                                     padding))
+                ;; Batched matmul using im2col:
+                ;;   col: [N*OH_OW, fan_in]  (reshaped)
+                ;;   W^T: [fan_in, out_ch]
+                ;;   res: [N*OH_OW, out_ch]
+                ;; Then reshape/transpose to [N, out_ch, OH, OW].
+                (col-r   (am:var-reshape col-mv (list (* N OH_OW) fan-in)))
+                (WT-mv   (am:var-transpose W-mv '(1 0)))
+                (res-mv   (am:var-matmul col-r WT-mv))
+                ;; Add bias BEFORE reshape: [N*OH_OW, out_ch] + [out_ch].
+                ;; This is flat-bias-broadcast-eligible and triggers ri-gemm-epilogue
+                ;; in the SSA replay plan (matmul + bias fused into one BLAS call).
+                (pre-flat (am:var+ res-mv b-mv))
+                (act-flat (activation-forward-am activation (get-or-make-lazy pre-flat)))
+                (act-mv   (lazy-tensor-morph-variable act-flat))
+                (act-r    (am:var-reshape act-mv (list N OH_OW out-channels)))
+                (act-t    (am:var-transpose act-r '(0 2 1)))
+                (act-4d   (am:var-reshape act-t (list N out-channels OH OW))))
+           (get-or-make-lazy act-4d)))
 
-       ((layer->serializable self) #f)
-       ((save-layer self filepath) (if #f #f))
-       )))
+        ((layer->serializable self) #f)
+        ((save-layer self filepath) (if #f #f))
+        )))
 
 
   ;;;; ================================================================
@@ -649,48 +687,97 @@
                (x-v   (am:var-value x-mv))
                (dt    (morph-dtype x-v))
                (eps-v (am:make-var (morph-from-list (list epsilon) '(1) dt) #f)))
-          (if training?
-              ;; Training: normalize over batch dimension
-              (let* ((mu    (am:var-mean x-mv '(0) #t))
-                     (diff  (am:var- x-mv mu))
-                     (var   (am:var-mean (am:var-pow diff
-                                                     (am:make-var (morph-from-list '(2.0) '(1) dt) #f))
-                                         '(0) #t))
-                     (std   (am:var-sqrt (am:var+ var eps-v)))
-                     (xhat  (am:var/ diff std))
-                     (out   (am:var+ (am:var* gamma-mv xhat) beta-mv)))
-                ;; Update running stats (in-place mutation of the concrete vector)
-                (let* ((mu-c    (realize (am:var-value mu)))
-                       (var-c   (realize (am:var-value var)))
-                       (mu-data  (cases array-morphism mu-c
-                                   (concrete-array (data shape strides offset dtype2 alloc-id batch-axis) data)
-                                   (else (morphism->srfi4 mu-c))))
-                       (var-data (cases array-morphism var-c
-                                   (concrete-array (data shape strides offset dtype2 alloc-id batch-axis) data)
-                                   (else (morphism->srfi4 var-c))))
-                       (n       num-features))
-                  (let loop ((i 0))
-                    (when (< i n)
-                      (typed-vector-set! rm-data dtype i
-                        (+ (* (- 1.0 momentum) (typed-vector-ref rm-data dtype i))
-                           (* momentum (typed-vector-ref mu-data dtype i))))
-                      (typed-vector-set! rv-data dtype i
-                        (+ (* (- 1.0 momentum) (typed-vector-ref rv-data dtype i))
-                           (* momentum (typed-vector-ref var-data dtype i))))
-                      (loop (+ i 1)))))
-                (get-or-make-lazy out))
-              ;; Eval: use running statistics
-              (let* ((rm-lt  (get-or-make-lazy rm-mv))
-                     (rv-lt  (get-or-make-lazy rv-mv))
-                     (std    (am:var-sqrt (am:var+ rv-mv eps-v)))
-                     (xhat   (am:var/ (am:var- x-mv rm-mv) std))
-                     (out    (am:var+ (am:var* gamma-mv xhat) beta-mv)))
-                (get-or-make-lazy out)))))
+           (if training?
+               ;; Training: normalize over batch dimension
+               (let* ((mu    (am:var-mean x-mv '(0) #t))
+                      (diff  (am:var- x-mv mu))
+                      (var   (am:var-mean (am:var-pow diff
+                                                      (am:make-var (morph-from-list '(2.0) '(1) dt) #f))
+                                          '(0) #t))
+                      (std   (am:var-sqrt (am:var+ var eps-v)))
+                      (xhat  (am:var/ diff std))
+                      (x-rank (vector-length (morph-shape x-v)))
+                      (gamma-bcast (broadcast-channel-param gamma-mv x-rank))
+                      (beta-bcast  (broadcast-channel-param beta-mv x-rank))
+                      (out   (am:var+ (am:var* gamma-bcast xhat) beta-bcast)))
+                 ;; Update running stats (in-place mutation of the concrete vector)
+                 (let* ((mu-c    (realize (am:var-value mu)))
+                        (var-c   (realize (am:var-value var)))
+                        (mu-data  (cases array-morphism mu-c
+                                    (concrete-array (data shape strides offset dtype2 alloc-id batch-axis) data)
+                                    (else (morphism->srfi4 mu-c))))
+                        (var-data (cases array-morphism var-c
+                                    (concrete-array (data shape strides offset dtype2 alloc-id batch-axis) data)
+                                    (else (morphism->srfi4 var-c))))
+                        (n       num-features))
+                   (let loop ((i 0))
+                     (when (< i n)
+                       (typed-vector-set! rm-data dtype i
+                         (+ (* (- 1.0 momentum) (typed-vector-ref rm-data dtype i))
+                            (* momentum (typed-vector-ref mu-data dtype i))))
+                       (typed-vector-set! rv-data dtype i
+                         (+ (* (- 1.0 momentum) (typed-vector-ref rv-data dtype i))
+                            (* momentum (typed-vector-ref var-data dtype i))))
+                       (loop (+ i 1)))))
+                 (get-or-make-lazy out))
+               ;; Eval: use running statistics
+               (let* ((rm-lt  (get-or-make-lazy rm-mv))
+                      (rv-lt  (get-or-make-lazy rv-mv))
+                      (std    (am:var-sqrt (am:var+ rv-mv eps-v)))
+                      (xhat   (am:var/ (am:var- x-mv rm-mv) std))
+                      (x-rank (vector-length (morph-shape x-v)))
+                      (gamma-bcast (broadcast-channel-param gamma-mv x-rank))
+                      (beta-bcast  (broadcast-channel-param beta-mv x-rank))
+                      (out    (am:var+ (am:var* gamma-bcast xhat) beta-bcast)))
+                 (get-or-make-lazy out)))))
 
        ((layer->serializable self) #f)
        ((save-layer self filepath) (if #f #f))
        )))
 
+
+  ;;;; ================================================================
+  ;;;; make-am-flatten
+  ;;;;
+  ;;;; Flatten trailing dimensions for conv-to-dense transitions.
+  ;;;;   4D: (N, C, H, W) -> (N, C*H*W)
+  ;;;;   3D: (C, H, W)    -> (C*H*W)
+  ;;;;   2D/1D: identity
+  ;;;; ================================================================
+
+  (define (make-am-flatten #!key (name "Flatten"))
+    "Flatten layer for AM-backed models."
+    (object
+     ((layer? self) #t)
+     ((flatten-layer? self) #t)
+     ((layer-name self) name)
+     ((layer-input-size self) #f)
+     ((layer-output-size self) #f)
+     ((layer-activation self) (make-identity))
+     ((layer-norm self) #f)
+
+     ((parameters self) '())
+     ((zero-grad-layer! self) (void))
+     ((set-training-mode! self training?) (void))
+     ((set-eval-mode! self) (void))
+
+     ((forward self x-lt)
+      (let* ((mv (lazy-tensor-morph-variable x-lt))
+             (shape (vector->list (morph-shape (am:var-value mv))))
+             (rank (length shape)))
+        (cond
+         ((= rank 4)
+          (let ((N (car shape))
+                (flat (apply * (cdr shape))))
+            (get-or-make-lazy (am:var-reshape mv (list N flat)))))
+         ((= rank 3)
+          (let ((flat (apply * shape)))
+            (get-or-make-lazy (am:var-reshape mv (list flat)))))
+         ((or (= rank 2) (= rank 1)) x-lt)
+         (else (error 'make-am-flatten "cannot flatten tensor of rank" rank)))))
+
+     ((layer->serializable self) #f)
+     ((save-layer self filepath) (if #f #f))))
 
   ;;;; ================================================================
   ;;;; make-am-sequential
@@ -1043,5 +1130,13 @@
           (am-reset-context! ctx)
           ;; Return loss as a lazy tensor
           (get-or-make-lazy (am:make-var loss-arr #f))))))
+
+  (define (am-replay-plan-stats ctx)
+    "Return alist of (tag . count) for the SSA replay plan compiled for ctx."
+    (let* ((ctx-id (morphism-context-id ctx))
+           (state  (hash-table-ref/default *ssa-state-table* ctx-id #f)))
+      (if state
+          (replay-plan-stats (car state))
+          '())))
 
 ) ; end module array-morphisms-nanograd

@@ -31,7 +31,7 @@
                         (component-dependencies nanograd-autograd))
              (extension nanograd-array-morphisms
                         (source "array-morphisms-nanograd.scm")
-                        (csc-options "-O0" "-d2")
+                        (csc-options "-O2" "-d1")
                         (component-dependencies nanograd-autograd nanograd-layer))
              )
 
