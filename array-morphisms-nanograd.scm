@@ -487,10 +487,10 @@
   ;;;; grad-fn that calls col2im-morph for the backward pass.
   ;;;; ================================================================
 
-  (define (var-im2col x-mv kernel-size stride padding)
+  (define (var-im2col x-mv kernel-size stride padding #!key (layout 'nchw))
     "Differentiable im2col: wraps structural im2col-morph with col2im backward."
     (let* ((x-morph  (am:var-value x-mv))
-           (col      (im2col-morph x-morph kernel-size stride padding))
+           (col      (im2col-morph x-morph kernel-size stride padding layout: layout))
            (col-mv   (am:make-var col #f)))
       (when (am:var-requires-grad? x-mv)
         ;; grad-fn: g_col -> g_x via col2im
@@ -594,36 +594,34 @@
                 (x-morph (am:var-value x-mv))
                 (x-shape (morph-shape x-morph))
                 (rank    (vector-length x-shape))
+                ;; Detect NHWC input: rank-4 with channels at index 3 matching in-channels
+                (nhwc-in? (and (= rank 4)
+                               (= (vector-ref x-shape 3) in-channels)))
                 (N       (if (= rank 4) (vector-ref x-shape 0) 1))
-                (C       (if (= rank 4) (vector-ref x-shape 1) (vector-ref x-shape 0)))
-                (H       (if (= rank 4) (vector-ref x-shape 2) (vector-ref x-shape 1)))
-                (W       (if (= rank 4) (vector-ref x-shape 3) (vector-ref x-shape 2)))
+                ;; NHWC: [N,H,W,C];  NCHW: [N,C,H,W]
+                (H       (if nhwc-in? (vector-ref x-shape 1)
+                             (if (= rank 4) (vector-ref x-shape 2) (vector-ref x-shape 1))))
+                (W       (if nhwc-in? (vector-ref x-shape 2)
+                             (if (= rank 4) (vector-ref x-shape 3) (vector-ref x-shape 2))))
                 (OH      (compute-conv-output-size H KH stride padding))
                 (OW      (compute-conv-output-size W KW stride padding))
-                (OH_OW   (* OH OW))
-                ;; col shape: [N, in_ch*KH*KW, OH*OW]
+                ;; col-mv: [N*OH_OW, fan_in] (matmul-ready; no reshape needed)
                 (col-mv  (var-im2col x-mv
                                      (list KH KW)
                                      stride
-                                     padding))
-                ;; Batched matmul using im2col:
-                ;;   col: [N*OH_OW, fan_in]  (reshaped)
-                ;;   W^T: [fan_in, out_ch]
-                ;;   res: [N*OH_OW, out_ch]
-                ;; Then reshape/transpose to [N, out_ch, OH, OW].
-                (col-r   (am:var-reshape col-mv (list (* N OH_OW) fan-in)))
+                                     padding
+                                     layout: (if nhwc-in? 'nhwc 'nchw)))
+                ;; Batched matmul: col [N*OH_OW, fan_in] x W^T [fan_in, out_ch] = [N*OH_OW, out_ch]
                 (WT-mv   (am:var-transpose W-mv '(1 0)))
-                (res-mv   (am:var-matmul col-r WT-mv))
-                ;; Add bias BEFORE reshape: [N*OH_OW, out_ch] + [out_ch].
-                ;; This is flat-bias-broadcast-eligible and triggers ri-gemm-epilogue
-                ;; in the SSA replay plan (matmul + bias fused into one BLAS call).
+                (res-mv  (am:var-matmul col-mv WT-mv))
+                ;; Add bias [N*OH_OW, out_ch] + [out_ch]; fused with GEMM in SSA replay.
                 (pre-flat (am:var+ res-mv b-mv))
                 (act-flat (activation-forward-am activation (get-or-make-lazy pre-flat)))
                 (act-mv   (lazy-tensor-morph-variable act-flat))
-                (act-r    (am:var-reshape act-mv (list N OH_OW out-channels)))
-                (act-t    (am:var-transpose act-r '(0 2 1)))
-                (act-4d   (am:var-reshape act-t (list N out-channels OH OW))))
-           (get-or-make-lazy act-4d)))
+                ;; act-flat [N*OH_OW, out_ch] is contiguous; reshape to NHWC [N,OH,OW,out_ch]
+                ;; is a zero-copy ri-view (no transpose needed).
+                (act-nhwc (am:var-reshape act-mv (list N OH OW out-channels))))
+           (get-or-make-lazy act-nhwc)))
 
         ((layer->serializable self) #f)
         ((save-layer self filepath) (if #f #f))
