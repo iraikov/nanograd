@@ -535,15 +535,77 @@
                     shape target-rank)))))
 
   ;;;; ================================================================
+  ;;;; var-conv2d
+  ;;;;
+  ;;;; Differentiable conv2d as a single SSA op 'conv2d-fwd.
+  ;;;; Avoids the intermediate col buffer that im2col + reshape + matmul
+  ;;;; would allocate.
+  ;;;;
+  ;;;;   x-mv:  input               NCHW [N,C,H,W] or NHWC [N,H,W,C]
+  ;;;;   wt-mv: transposed weights   [fan_in, out_ch]
+  ;;;;   b-mv:  bias                 [out_ch]
+  ;;;;   output morph-variable:      [N*OH*OW, out_ch]
+  ;;;;
+  ;;;; Backward is handled by compute-vjp! in ssa.scm which emits
+  ;;;; 'conv2d-bwd-data, 'conv2d-bwd-weights, and '(reduce sum) ops.
+  ;;;; ================================================================
+
+  (define (var-conv2d x-mv wt-mv b-mv kernel-size stride padding layout)
+    (let* ((x-morph  (am:var-value x-mv))
+           (wt-morph (am:var-value wt-mv))
+           (x-shape  (morph-shape x-morph))
+           (wt-shape (morph-shape wt-morph))
+           (nhwc?    (eq? layout 'nhwc))
+           (rank     (vector-length x-shape))
+           (N   (if (= rank 4) (vector-ref x-shape 0) 1))
+           (C   (if nhwc?
+                    (vector-ref x-shape 3)
+                    (if (= rank 4) (vector-ref x-shape 1) (vector-ref x-shape 0))))
+           (H   (if nhwc?
+                    (vector-ref x-shape 1)
+                    (if (= rank 4) (vector-ref x-shape 2) (vector-ref x-shape 1))))
+           (W   (if nhwc?
+                    (vector-ref x-shape 2)
+                    (if (= rank 4) (vector-ref x-shape 3) (vector-ref x-shape 2))))
+           (KH  (if (pair? kernel-size) (car kernel-size) kernel-size))
+           (KW  (if (pair? kernel-size) (cadr kernel-size) kernel-size))
+           (SH  (if (pair? stride)  (car stride)   stride))
+           (SW  (if (pair? stride)  (cadr stride)  stride))
+           (PH  (if (pair? padding) (car padding)  padding))
+           (PW  (if (pair? padding) (cadr padding) padding))
+           (OH      (compute-conv-output-size H KH SH PH))
+           (OW      (compute-conv-output-size W KW SW PW))
+           (out-ch  (vector-ref wt-shape 1))
+           (out-shape (vector (* N OH OW) out-ch))
+           (dtype   (morph-dtype x-morph))
+           (out-morph
+            (morphism-expr
+             (gensym 'conv2d-)
+             'conv2d-fwd
+             (list x-morph wt-morph (am:var-value b-mv))
+             (lambda (indices) indices)
+             out-shape
+             dtype
+             `((kernel-size    . (,KH ,KW))
+               (stride         . (,SH ,SW))
+               (padding        . (,PH ,PW))
+               (spatial-output . (,OH ,OW))
+               ,@(if nhwc? '((layout . nhwc)) '()))
+             0))
+           (out-mv (am:make-var out-morph #f)))
+      (am:morph-variable-parents-set! out-mv (list x-mv wt-mv b-mv))
+      out-mv))
+
+
+  ;;;; ================================================================
   ;;;; make-am-conv2d-layer
   ;;;;
-  ;;;; 2-D convolution layer using im2col + matmul + col2im.
+  ;;;; 2-D convolution layer using var-conv2d (fused im2col + GEMM + bias).
   ;;;;   W: [out-ch, in-ch*KH*KW]  He-initialized
   ;;;;   b: [out-ch]               zero-initialized
   ;;;;
   ;;;; Forward:
-  ;;;;   col = im2col(x)          ; [N, in_ch*KH*KW, OH*OW]
-  ;;;;   y   = W @ col + b        ; [N, out_ch, OH*OW]
+  ;;;;   y = conv2d-fwd(x, W^T, b)  ; fused, output [N*OH*OW, out_ch]
   ;;;; ================================================================
 
   (define (compute-conv-output-size input-size kernel-size stride padding)
@@ -605,17 +667,11 @@
                              (if (= rank 4) (vector-ref x-shape 3) (vector-ref x-shape 2))))
                 (OH      (compute-conv-output-size H KH stride padding))
                 (OW      (compute-conv-output-size W KW stride padding))
-                ;; col-mv: [N*OH_OW, fan_in] (matmul-ready; no reshape needed)
-                (col-mv  (var-im2col x-mv
-                                     (list KH KW)
-                                     stride
-                                     padding
-                                     layout: (if nhwc-in? 'nhwc 'nchw)))
-                ;; Batched matmul: col [N*OH_OW, fan_in] x W^T [fan_in, out_ch] = [N*OH_OW, out_ch]
+                ;; WT: [fan_in, out_ch] — transposed view of W [out_ch, fan_in]
                 (WT-mv   (am:var-transpose W-mv '(1 0)))
-                (res-mv  (am:var-matmul col-mv WT-mv))
-                ;; Add bias [N*OH_OW, out_ch] + [out_ch]; fused with GEMM in SSA replay.
-                (pre-flat (am:var+ res-mv b-mv))
+                ;; Fused im2col + GEMM + bias in single SSA op; output [N*OH*OW, out_ch]
+                (pre-flat (var-conv2d x-mv WT-mv b-mv (list KH KW) stride padding
+                                      (if nhwc-in? 'nhwc 'nchw)))
                 (act-flat (activation-forward-am activation (get-or-make-lazy pre-flat)))
                 (act-mv   (lazy-tensor-morph-variable act-flat))
                 ;; act-flat [N*OH_OW, out_ch] is contiguous; reshape to NHWC [N,OH,OW,out_ch]

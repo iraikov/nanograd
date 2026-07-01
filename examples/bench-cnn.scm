@@ -12,6 +12,8 @@
 (import nanograd-array-morphisms)
 (import (only array-morphisms-ssa replay-timing-reset! replay-timing-results))
 
+(define (ms/iter ms iters) (exact->inexact (/ ms iters)))
+
 (register-blas-backend! (make-blas-egg-backend))
 
 ;;; ---------------------------------------------------------------
@@ -127,7 +129,11 @@
   (printf "  forward only: ~A ms\n\n" ms))
 
 ;;; ---------------------------------------------------------------
-;;; 4. Direct im2col micro-benchmarks
+;;; 4. Micro-benchmarks: im2col, col2im, implicit GEMM, BLAS matmul
+;;;
+;;; im2col/col2im are used only in the non-SSA path or as standalone
+;;; ops.  The SSA training loop uses ri-conv-fwd / ri-conv-bwd-* which
+;;; fuse im2col+GEMM+bias into a single pass with no col buffer.
 ;;; ---------------------------------------------------------------
 
 (printf "-- execute-im2col-batched micro-benchmarks (~A iters each) --\n" 50)
@@ -136,38 +142,41 @@
 (let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
        (OH 28) (OW 28) (iters 50)
        (src (make-random-f32 (* N C H W)))
-       (out (make-f32vector (* N C KH KW OH OW) 0.0))
+       (out (make-f32vector (* N (* C KH KW) (* OH OW)) 0.0))
        (ms (time-ms (lambda ()
                       (do ((i 0 (+ i 1))) ((= i iters))
                         (execute-im2col-batched out src N C H W KH KW SH SW PH PW OH OW 'f32))))))
-  (printf "  conv1 [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (/ ms iters)))
+  (printf "  conv1 [~Ax~Ax~Ax~A] -> [~A,~A,~A]: ~A ms/iter\n"
+          N C H W N (* C KH KW) (* OH OW) (ms/iter ms iters)))
 
 ;; conv2: [32, 16, 28, 28] -> col [32, 144, 196]
 (let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
        (OH 14) (OW 14) (iters 50)
        (src (make-random-f32 (* N C H W)))
-       (out (make-f32vector (* N C KH KW OH OW) 0.0))
+       (out (make-f32vector (* N (* C KH KW) (* OH OW)) 0.0))
        (ms (time-ms (lambda ()
                       (do ((i 0 (+ i 1))) ((= i iters))
                         (execute-im2col-batched out src N C H W KH KW SH SW PH PW OH OW 'f32))))))
-  (printf "  conv2 [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (/ ms iters)))
+  (printf "  conv2 [~Ax~Ax~Ax~A] -> [~A,~A,~A]: ~A ms/iter\n"
+          N C H W N (* C KH KW) (* OH OW) (ms/iter ms iters)))
 
 ;; conv3: [32, 32, 14, 14] -> col [32, 288, 49]
 (let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
        (OH 7) (OW 7) (iters 50)
        (src (make-random-f32 (* N C H W)))
-       (out (make-f32vector (* N C KH KW OH OW) 0.0))
+       (out (make-f32vector (* N (* C KH KW) (* OH OW)) 0.0))
        (ms (time-ms (lambda ()
                       (do ((i 0 (+ i 1))) ((= i iters))
                         (execute-im2col-batched out src N C H W KH KW SH SW PH PW OH OW 'f32))))))
-  (printf "  conv3 [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (/ ms iters)))
+  (printf "  conv3 [~Ax~Ax~Ax~A] -> [~A,~A,~A]: ~A ms/iter\n"
+          N C H W N (* C KH KW) (* OH OW) (ms/iter ms iters)))
 
 (printf "\n-- execute-col2im-batched micro-benchmarks (~A iters each) --\n" 50)
 
 ;; col2im conv1 backward
 (let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
        (OH 28) (OW 28) (iters 50)
-       (col (make-random-f32 (* N C KH KW OH OW)))
+       (col (make-random-f32 (* N (* C KH KW) (* OH OW))))
        (col-shape (vector N (* C KH KW) (* OH OW)))
        (out (make-f32vector (* N C H W) 0.0))
        (out-shape (vector N C H W))
@@ -175,12 +184,12 @@
                       (do ((i 0 (+ i 1))) ((= i iters))
                         (execute-col2im-batched out out-shape col col-shape
                                                 KH KW SH SW PH PW 'f32))))))
-  (printf "  conv1 back [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (/ ms iters)))
+  (printf "  conv1 back [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
 
 ;; col2im conv2 backward
 (let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
        (OH 14) (OW 14) (iters 50)
-       (col (make-random-f32 (* N C KH KW OH OW)))
+       (col (make-random-f32 (* N (* C KH KW) (* OH OW))))
        (col-shape (vector N (* C KH KW) (* OH OW)))
        (out (make-f32vector (* N C H W) 0.0))
        (out-shape (vector N C H W))
@@ -188,7 +197,329 @@
                       (do ((i 0 (+ i 1))) ((= i iters))
                         (execute-col2im-batched out out-shape col col-shape
                                                 KH KW SH SW PH PW 'f32))))))
-  (printf "  conv2 back [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (/ ms iters)))
+  (printf "  conv2 back [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+;; col2im conv3 backward
+(let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 7) (OW 7) (iters 50)
+       (col (make-random-f32 (* N (* C KH KW) (* OH OW))))
+       (col-shape (vector N (* C KH KW) (* OH OW)))
+       (out (make-f32vector (* N C H W) 0.0))
+       (out-shape (vector N C H W))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-col2im-batched out out-shape col col-shape
+                                                KH KW SH SW PH PW 'f32))))))
+  (printf "  conv3 back [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(printf "\n-- execute-conv-fwd-nchw micro-benchmarks (~A iters each) --\n" 50)
+(printf "   (fused im2col+GEMM+bias, no col buffer -- same as ri-conv-fwd in SSA replay)\n")
+
+;; conv1: N=32, C=1, H=W=28, KH=KW=3, S=1, P=1, OH=OW=28, out-ch=16
+(let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
+       (OH 28) (OW 28) (out-ch 16) (fan-in (* C KH KW)) (iters 50)
+       (src (make-random-f32 (* N C H W)))
+       (wt  (make-random-f32 (* fan-in out-ch)))
+       (b   (make-f32vector out-ch 0.0))
+       (out (make-f32vector (* N OH OW out-ch) 0.0))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-fwd-nchw out src wt b N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv1 [~Ax~Ax~Ax~A] -> [~A,~A]: ~A ms/iter\n"
+          N C H W (* N OH OW) out-ch (ms/iter ms iters)))
+
+;; conv2: N=32, C=16, H=W=28, KH=KW=3, S=2, P=1, OH=OW=14, out-ch=32
+(let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 14) (OW 14) (out-ch 32) (fan-in (* C KH KW)) (iters 50)
+       (src (make-random-f32 (* N C H W)))
+       (wt  (make-random-f32 (* fan-in out-ch)))
+       (b   (make-f32vector out-ch 0.0))
+       (out (make-f32vector (* N OH OW out-ch) 0.0))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-fwd-nchw out src wt b N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv2 [~Ax~Ax~Ax~A] -> [~A,~A]: ~A ms/iter\n"
+          N C H W (* N OH OW) out-ch (ms/iter ms iters)))
+
+;; conv3: N=32, C=32, H=W=14, KH=KW=3, S=2, P=1, OH=OW=7, out-ch=64
+(let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 7) (OW 7) (out-ch 64) (fan-in (* C KH KW)) (iters 50)
+       (src (make-random-f32 (* N C H W)))
+       (wt  (make-random-f32 (* fan-in out-ch)))
+       (b   (make-f32vector out-ch 0.0))
+       (out (make-f32vector (* N OH OW out-ch) 0.0))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-fwd-nchw out src wt b N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv3 [~Ax~Ax~Ax~A] -> [~A,~A]: ~A ms/iter\n"
+          N C H W (* N OH OW) out-ch (ms/iter ms iters)))
+
+(printf "\n-- execute-conv-bwd-data-nchw micro-benchmarks (~A iters each) --\n" 50)
+
+(let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
+       (OH 28) (OW 28) (out-ch 16) (fan-in (* C KH KW)) (iters 50)
+       (g    (make-random-f32 (* N OH OW out-ch)))
+       (g-shape (vector (* N OH OW) out-ch))
+       (wt   (make-random-f32 (* fan-in out-ch)))
+       (dx   (make-f32vector (* N C H W) 0.0))
+       (x-shape (vector N C H W))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-data-nchw dx x-shape g g-shape wt N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv1 bwd-data [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 14) (OW 14) (out-ch 32) (fan-in (* C KH KW)) (iters 50)
+       (g    (make-random-f32 (* N OH OW out-ch)))
+       (g-shape (vector (* N OH OW) out-ch))
+       (wt   (make-random-f32 (* fan-in out-ch)))
+       (dx   (make-f32vector (* N C H W) 0.0))
+       (x-shape (vector N C H W))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-data-nchw dx x-shape g g-shape wt N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv2 bwd-data [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 7) (OW 7) (out-ch 64) (fan-in (* C KH KW)) (iters 50)
+       (g    (make-random-f32 (* N OH OW out-ch)))
+       (g-shape (vector (* N OH OW) out-ch))
+       (wt   (make-random-f32 (* fan-in out-ch)))
+       (dx   (make-f32vector (* N C H W) 0.0))
+       (x-shape (vector N C H W))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-data-nchw dx x-shape g g-shape wt N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv3 bwd-data [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(printf "\n-- execute-conv-bwd-weights-nchw micro-benchmarks (~A iters each) --\n" 50)
+
+(let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
+       (OH 28) (OW 28) (out-ch 16) (fan-in (* C KH KW)) (iters 50)
+       (g    (make-random-f32 (* N OH OW out-ch)))
+       (g-shape (vector (* N OH OW) out-ch))
+       (src  (make-random-f32 (* N C H W)))
+       (dwt  (make-f32vector (* fan-in out-ch) 0.0))
+       (wt-shape (vector fan-in out-ch))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-weights-nchw dwt wt-shape g g-shape src N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv1 bwd-wt [fan_in=~A, out_ch=~A]: ~A ms/iter\n" fan-in out-ch (ms/iter ms iters)))
+
+(let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 14) (OW 14) (out-ch 32) (fan-in (* C KH KW)) (iters 50)
+       (g    (make-random-f32 (* N OH OW out-ch)))
+       (g-shape (vector (* N OH OW) out-ch))
+       (src  (make-random-f32 (* N C H W)))
+       (dwt  (make-f32vector (* fan-in out-ch) 0.0))
+       (wt-shape (vector fan-in out-ch))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-weights-nchw dwt wt-shape g g-shape src N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv2 bwd-wt [fan_in=~A, out_ch=~A]: ~A ms/iter\n" fan-in out-ch (ms/iter ms iters)))
+
+(let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 7) (OW 7) (out-ch 64) (fan-in (* C KH KW)) (iters 50)
+       (g    (make-random-f32 (* N OH OW out-ch)))
+       (g-shape (vector (* N OH OW) out-ch))
+       (src  (make-random-f32 (* N C H W)))
+       (dwt  (make-f32vector (* fan-in out-ch) 0.0))
+       (wt-shape (vector fan-in out-ch))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-weights-nchw dwt wt-shape g g-shape src N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv3 bwd-wt [fan_in=~A, out_ch=~A]: ~A ms/iter\n" fan-in out-ch (ms/iter ms iters)))
+
+;;; ---------------------------------------------------------------
+;;; 4b. BLAS-backed conv micro-benchmarks
+;;;
+;;; Direct timing of execute-im2col-batched-mr and execute-conv-*-blas
+;;; (the functions used in the SSA BLAS dispatch path), to explain the
+;;; gap between standalone BLAS gemm timing and SSA per-step timing.
+;;; ---------------------------------------------------------------
+
+(printf "\n-- execute-im2col-batched-mr micro-benchmarks (~A iters each) --\n" 50)
+(printf "   (MR layout: [N*OH_OW, fan_in] -- used by BLAS conv path)\n")
+
+(let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
+       (OH 28) (OW 28) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (src (make-random-f32 (* N C H W)))
+       (out (make-f32vector (* M fan-in) 0.0))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-im2col-batched-mr out src N C H W KH KW SH SW PH PW OH OW 'f32))))))
+  (printf "  conv1 [~Ax~Ax~Ax~A] -> [~A,~A]: ~A ms/iter\n"
+          N C H W M fan-in (ms/iter ms iters)))
+
+(let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 14) (OW 14) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (src (make-random-f32 (* N C H W)))
+       (out (make-f32vector (* M fan-in) 0.0))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-im2col-batched-mr out src N C H W KH KW SH SW PH PW OH OW 'f32))))))
+  (printf "  conv2 [~Ax~Ax~Ax~A] -> [~A,~A]: ~A ms/iter\n"
+          N C H W M fan-in (ms/iter ms iters)))
+
+(let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 7) (OW 7) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (src (make-random-f32 (* N C H W)))
+       (out (make-f32vector (* M fan-in) 0.0))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-im2col-batched-mr out src N C H W KH KW SH SW PH PW OH OW 'f32))))))
+  (printf "  conv3 [~Ax~Ax~Ax~A] -> [~A,~A]: ~A ms/iter\n"
+          N C H W M fan-in (ms/iter ms iters)))
+
+(printf "\n-- execute-col2im-batched-mr micro-benchmarks (~A iters each) --\n" 50)
+
+(let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
+       (OH 28) (OW 28) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (col (make-random-f32 (* M fan-in)))
+       (out (make-f32vector (* N C H W) 0.0))
+       (out-shape (vector N C H W))
+       (col-shape (vector M fan-in))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-col2im-batched-mr out out-shape col col-shape KH KW SH SW PH PW 'f32))))))
+  (printf "  conv1 back [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 14) (OW 14) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (col (make-random-f32 (* M fan-in)))
+       (out (make-f32vector (* N C H W) 0.0))
+       (out-shape (vector N C H W))
+       (col-shape (vector M fan-in))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-col2im-batched-mr out out-shape col col-shape KH KW SH SW PH PW 'f32))))))
+  (printf "  conv2 back [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 7) (OW 7) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (col (make-random-f32 (* M fan-in)))
+       (out (make-f32vector (* N C H W) 0.0))
+       (out-shape (vector N C H W))
+       (col-shape (vector M fan-in))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-col2im-batched-mr out out-shape col col-shape KH KW SH SW PH PW 'f32))))))
+  (printf "  conv3 back [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(printf "\n-- execute-conv-fwd-blas micro-benchmarks (~A iters each) --\n" 50)
+(printf "   (im2col-mr + BLAS gemm + bias -- actual BLAS SSA path)\n")
+
+(let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
+       (OH 28) (OW 28) (out-ch 16) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (src (make-random-f32 (* N C H W)))
+       (wt  (make-random-f32 (* fan-in out-ch)))
+       (b   (make-f32vector out-ch 0.0))
+       (out (make-f32vector (* M out-ch) 0.0))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-fwd-blas out src wt b N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv1 [~Ax~Ax~Ax~A] -> [~A,~A]: ~A ms/iter\n"
+          N C H W M out-ch (ms/iter ms iters)))
+
+(let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 14) (OW 14) (out-ch 32) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (src (make-random-f32 (* N C H W)))
+       (wt  (make-random-f32 (* fan-in out-ch)))
+       (b   (make-f32vector out-ch 0.0))
+       (out (make-f32vector (* M out-ch) 0.0))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-fwd-blas out src wt b N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv2 [~Ax~Ax~Ax~A] -> [~A,~A]: ~A ms/iter\n"
+          N C H W M out-ch (ms/iter ms iters)))
+
+(let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 7) (OW 7) (out-ch 64) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (src (make-random-f32 (* N C H W)))
+       (wt  (make-random-f32 (* fan-in out-ch)))
+       (b   (make-f32vector out-ch 0.0))
+       (out (make-f32vector (* M out-ch) 0.0))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-fwd-blas out src wt b N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv3 [~Ax~Ax~Ax~A] -> [~A,~A]: ~A ms/iter\n"
+          N C H W M out-ch (ms/iter ms iters)))
+
+(printf "\n-- execute-conv-bwd-data-blas micro-benchmarks (~A iters each) --\n" 50)
+
+(let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
+       (OH 28) (OW 28) (out-ch 16) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (g     (make-random-f32 (* M out-ch)))
+       (g-shape (vector M out-ch))
+       (wt    (make-random-f32 (* fan-in out-ch)))
+       (dx    (make-f32vector (* N C H W) 0.0))
+       (x-shape (vector N C H W))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-data-blas dx x-shape g g-shape wt N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv1 bwd-data [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 14) (OW 14) (out-ch 32) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (g     (make-random-f32 (* M out-ch)))
+       (g-shape (vector M out-ch))
+       (wt    (make-random-f32 (* fan-in out-ch)))
+       (dx    (make-f32vector (* N C H W) 0.0))
+       (x-shape (vector N C H W))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-data-blas dx x-shape g g-shape wt N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv2 bwd-data [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 7) (OW 7) (out-ch 64) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (g     (make-random-f32 (* M out-ch)))
+       (g-shape (vector M out-ch))
+       (wt    (make-random-f32 (* fan-in out-ch)))
+       (dx    (make-f32vector (* N C H W) 0.0))
+       (x-shape (vector N C H W))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-data-blas dx x-shape g g-shape wt N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv3 bwd-data [~Ax~Ax~Ax~A]: ~A ms/iter\n" N C H W (ms/iter ms iters)))
+
+(printf "\n-- execute-conv-bwd-weights-blas micro-benchmarks (~A iters each) --\n" 50)
+
+(let* ((N 32) (C 1) (H 28) (W 28) (KH 3) (KW 3) (SH 1) (SW 1) (PH 1) (PW 1)
+       (OH 28) (OW 28) (out-ch 16) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (g     (make-random-f32 (* M out-ch)))
+       (g-shape (vector M out-ch))
+       (src   (make-random-f32 (* N C H W)))
+       (dwt   (make-f32vector (* fan-in out-ch) 0.0))
+       (wt-shape (vector fan-in out-ch))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-weights-blas dwt wt-shape g g-shape src N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv1 bwd-wt [fan_in=~A, out_ch=~A]: ~A ms/iter\n" fan-in out-ch (ms/iter ms iters)))
+
+(let* ((N 32) (C 16) (H 28) (W 28) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 14) (OW 14) (out-ch 32) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (g     (make-random-f32 (* M out-ch)))
+       (g-shape (vector M out-ch))
+       (src   (make-random-f32 (* N C H W)))
+       (dwt   (make-f32vector (* fan-in out-ch) 0.0))
+       (wt-shape (vector fan-in out-ch))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-weights-blas dwt wt-shape g g-shape src N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv2 bwd-wt [fan_in=~A, out_ch=~A]: ~A ms/iter\n" fan-in out-ch (ms/iter ms iters)))
+
+(let* ((N 32) (C 32) (H 14) (W 14) (KH 3) (KW 3) (SH 2) (SW 2) (PH 1) (PW 1)
+       (OH 7) (OW 7) (out-ch 64) (fan-in (* C KH KW)) (M (* N OH OW)) (iters 50)
+       (g     (make-random-f32 (* M out-ch)))
+       (g-shape (vector M out-ch))
+       (src   (make-random-f32 (* N C H W)))
+       (dwt   (make-f32vector (* fan-in out-ch) 0.0))
+       (wt-shape (vector fan-in out-ch))
+       (ms (time-ms (lambda ()
+                      (do ((i 0 (+ i 1))) ((= i iters))
+                        (execute-conv-bwd-weights-blas dwt wt-shape g g-shape src N C H W KH KW SH SW PH PW OH OW out-ch 'f32))))))
+  (printf "  conv3 bwd-wt [fan_in=~A, out_ch=~A]: ~A ms/iter\n" fan-in out-ch (ms/iter ms iters)))
 
 (printf "\n-- BLAS matmul micro-benchmarks (~A iters each) --\n" 50)
 
@@ -199,7 +530,7 @@
        (ms (time-ms (lambda ()
                       (do ((i 0 (+ i 1))) ((= i iters))
                         (realize (am:var-value (am:var-matmul a b))))))))
-  (printf "  conv1 matmul [~Ax~A]@[~Ax~A]: ~A ms/iter\n" M K K Nc (/ ms iters)))
+  (printf "  conv1 matmul [~Ax~A]@[~Ax~A]: ~A ms/iter\n" M K K Nc (ms/iter ms iters)))
 
 (let* ((M (* 32 14 14)) (K (* 16 9)) (Nc 32) (iters 50)
        (a (am:make-var (f32-morph (make-random-f32 (* M K)) (list M K)) #f))
@@ -207,7 +538,7 @@
        (ms (time-ms (lambda ()
                       (do ((i 0 (+ i 1))) ((= i iters))
                         (realize (am:var-value (am:var-matmul a b))))))))
-  (printf "  conv2 matmul [~Ax~A]@[~Ax~A]: ~A ms/iter\n" M K K Nc (/ ms iters)))
+  (printf "  conv2 matmul [~Ax~A]@[~Ax~A]: ~A ms/iter\n" M K K Nc (ms/iter ms iters)))
 
 (let* ((M (* 32 7 7)) (K (* 32 9)) (Nc 64) (iters 50)
        (a (am:make-var (f32-morph (make-random-f32 (* M K)) (list M K)) #f))
@@ -215,7 +546,7 @@
        (ms (time-ms (lambda ()
                       (do ((i 0 (+ i 1))) ((= i iters))
                         (realize (am:var-value (am:var-matmul a b))))))))
-  (printf "  conv3 matmul [~Ax~A]@[~Ax~A]: ~A ms/iter\n" M K K Nc (/ ms iters)))
+  (printf "  conv3 matmul [~Ax~A]@[~Ax~A]: ~A ms/iter\n" M K K Nc (ms/iter ms iters)))
 
 (let* ((M 32) (K (* 64 7 7)) (Nc 128) (iters 50)
        (a (am:make-var (f32-morph (make-random-f32 (* M K)) (list M K)) #f))
@@ -223,7 +554,7 @@
        (ms (time-ms (lambda ()
                       (do ((i 0 (+ i 1))) ((= i iters))
                         (realize (am:var-value (am:var-matmul a b))))))))
-  (printf "  dense1 matmul [~Ax~A]@[~Ax~A]: ~A ms/iter\n" M K K Nc (/ ms iters)))
+  (printf "  dense1 matmul [~Ax~A]@[~Ax~A]: ~A ms/iter\n" M K K Nc (ms/iter ms iters)))
 
 ;;; ---------------------------------------------------------------
 ;;; 5. SSA context stats
