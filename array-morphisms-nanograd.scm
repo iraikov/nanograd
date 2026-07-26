@@ -1166,24 +1166,24 @@
                                        (ssa-value-id ecv)
                                        (am:var-value (lazy-tensor-morph-variable ei)))))
                   extra-const-vals extra-inputs)
-        ;; Execute joint forward+backward program
-        (let* ((results   (ssa-realize/ctx ctx joint))
-               (loss-arr  (car results))
-               (grads     (cdr results)))
-          ;; Install gradients into morph-variables so optimizer can read them
-          (for-each (lambda (p g)
-                      (let ((mv (lazy-tensor-morph-variable p)))
-                        (am:zero-grad! mv)
-                        (am:accumulate-grad! mv g)))
-                    params grads)
-          ;; Finalize context after trace run, then reset for next step
-          (unless (eq? (context-mode ctx) 'replay)
-            (am-finalize-context! ctx))
-          (step! optimizer)
-          (am-zero-grad! model)
-          (am-reset-context! ctx)
-          ;; Return loss as a lazy tensor
-          (get-or-make-lazy (am:make-var loss-arr #f))))))
+         ;; Execute joint forward+backward program
+         (let* ((results   (ssa-realize/ctx ctx joint))
+                (loss-arr  (car results))
+                (grads     (cdr results)))
+           ;; Install gradients into morph-variables so optimizer can read them
+           (for-each (lambda (p g)
+                       (let ((mv (lazy-tensor-morph-variable p)))
+                         (am:zero-grad! mv)
+                         (am:accumulate-grad! mv g)))
+                     params grads)
+           ;; Finalize context after trace run, then reset for next step
+           (unless (eq? (context-mode ctx) 'replay)
+             (am-finalize-context! ctx))
+           (step! optimizer)
+           (am-zero-grad! model)
+           (am-reset-context! ctx)
+           ;; Return loss as a lazy tensor
+           (get-or-make-lazy (am:make-var loss-arr #f))))))
 
   (define (am-replay-plan-stats ctx)
     "Return alist of (tag . count) for the SSA replay plan compiled for ctx."

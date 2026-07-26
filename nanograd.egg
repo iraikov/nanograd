@@ -8,8 +8,12 @@
  (category math)
 
  ; A list of eggs nanograd depends on.
+ ; array-morphisms-blas (not 'blas' directly) provides the system-BLAS-backed
+ ; array-morphisms-blas-egg-backend module used by some of the array-morphisms
+ ; example/benchmark scripts (e.g. examples/bench-am-cnn-ssa.scm);
+ ; none of nanograd's own components import it directly.
  (dependencies test srfi-1 srfi-4 srfi-42 srfi-69
-               mathh vector-lib blas yasos s11n array-morphisms)
+               mathh vector-lib yasos s11n array-morphisms)
 
  (author "Ivan Raikov")
 
