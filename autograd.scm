@@ -126,6 +126,61 @@
   ;;; Base tensor implementation
   ;;; ==================================================================
 
+  (define (row-major-strides shape)
+    "Row-major strides of SHAPE, in elements."
+    (let loop ((dims (reverse shape)) (acc 1) (strides '()))
+      (if (null? dims)
+          strides
+          (loop (cdr dims) (* acc (car dims)) (cons acc strides)))))
+
+  (define (inverse-permutation axes)
+    "The permutation that undoes AXES."
+    (let ((inv (make-vector (length axes) 0)))
+      (let loop ((k 0) (as axes))
+        (unless (null? as)
+          (vector-set! inv (car as) k)
+          (loop (+ k 1) (cdr as))))
+      (vector->list inv)))
+
+  (define (permute-tensor-data src shape axes dtype)
+    "Copy the row-major array SRC of SHAPE into a new vector whose
+     dimension k is dimension (list-ref AXES k) of SRC."
+    (let* ((rank (length shape))
+           (size (apply * shape))
+           (dst (with-dtype dtype (vec size 0.0)))
+           (src-strides (row-major-strides shape))
+           (out-dims (list->vector (map (lambda (a) (list-ref shape a)) axes)))
+           (out-strides (list->vector
+                         (map (lambda (a) (list-ref src-strides a)) axes))))
+      (cond
+       ((= size 0) dst)
+       ((and (= rank 2) (equal? axes '(1 0)))
+        (let ((rows (car shape)) (cols (cadr shape)))
+          (do ((i 0 (+ i 1))) ((= i rows))
+            (do ((j 0 (+ j 1))) ((= j cols))
+              (with-dtype dtype
+                (elt-set! dst (+ (* j rows) i)
+                          (elt-ref src (+ (* i cols) j))))))
+          dst))
+       (else
+        ;; Walk the output in row-major order, keeping a counter per
+        ;; output dimension and the matching source offset.
+        (let ((counter (make-vector rank 0)))
+          (let loop ((out 0) (off 0))
+            (with-dtype dtype (elt-set! dst out (elt-ref src off)))
+            (when (< (+ out 1) size)
+              (let carry ((k (- rank 1)) (off off))
+                (let ((c (+ (vector-ref counter k) 1)))
+                  (if (< c (vector-ref out-dims k))
+                      (begin
+                        (vector-set! counter k c)
+                        (loop (+ out 1) (+ off (vector-ref out-strides k))))
+                      (begin
+                        (vector-set! counter k 0)
+                        (carry (- k 1)
+                               (- off (* (- c 1) (vector-ref out-strides k))))))))))
+          dst)))))
+
   (define (make-base-tensor data shape dtype requires-grad?)
     (let ((grad (if requires-grad?
                     (with-dtype dtype
@@ -182,48 +237,23 @@
      reshaped)))
      
      ((transpose-tensor self axes)
-      ;; Transpose tensor dimensions according to axes permutation
-      ;; e.g., (0 1 2 3) -> (0 2 3 1) for NCHW -> NHWC
-      (let* ((rank (length shape))
-             (new-shape (map (lambda (axis) (list-ref shape axis)) axes))
-             (size (apply * shape))
-             (new-data (with-dtype dtype (vec size 0.0)))
-             )
-   
-        ;; Compute strides for old and new layouts
-        (define (compute-strides shape)
-           (cdr (fold (lambda (dim acc)
-                        (cons (* dim (car acc)) acc))
-                      '(1)
-                      (reverse shape))))
-        
-        (let ((old-strides (compute-strides shape))
-              (new-strides (compute-strides new-shape)))
-
-          ;; Copy data with transposed indices
-          (let loop ((i 0))
-            (when (< i size)
-              ;; Convert flat index to multi-dimensional index
-              (let* ((indices (let idx-loop ((n i) (strides old-strides) (result '()))
-                                (if (null? strides)
-                                    (reverse result)
-                                    (let ((idx (quotient n (car strides))))
-                                      (idx-loop (remainder n (car strides))
-                                                (cdr strides)
-                                                (cons idx result))))))
-                     ;; Permute indices according to axes
-                     (new-indices (map (lambda (axis) (list-ref indices axis)) axes))
-                     ;; Convert back to flat index in new layout
-                     (new-idx (fold (lambda (idx stride acc)
-                                      (+ acc (* idx stride)))
-                                    0 new-indices new-strides)))
-
-                (with-dtype dtype
-                            (elt-set! new-data new-idx (elt-ref data i)))
-                
-                (loop (+ i 1)))))
-          
-          (make-base-tensor new-data new-shape dtype requires-grad?))))
+      ;; Transpose tensor dimensions according to axes permutation,
+      ;; e.g. (0 2 3 1) maps NCHW to NHWC.  The gradient is sent back
+      ;; through the inverse permutation.
+      (let* ((new-shape (map (lambda (axis) (list-ref shape axis)) axes))
+             (new-data (permute-tensor-data data shape axes dtype))
+             (result (make-base-tensor new-data new-shape dtype requires-grad?)))
+        (when requires-grad?
+          (let ((inverse (inverse-permutation axes)))
+            (set-backward-fn!
+             result
+             (lambda ()
+               (let ((g (tensor-grad result)))
+                 (when g
+                   (add-to-grad! self
+                                 (permute-tensor-data g new-shape inverse dtype)))))
+             (list self))))
+        result))
 
      ((get-strides self)
       ;; Calculate strides for the current shape
@@ -2118,6 +2148,14 @@
   ;;; ==================================================================
 
   ;; Mean Squared Error Loss with batch support
+  (define (scale-by-upstream! v loss-tensor dtype)
+    "Multiply the local gradient V of a scalar loss by the loss's own
+     gradient, so that losses compose (e.g. scaled or summed losses)."
+    (let ((up (with-dtype dtype (elt-ref (tensor-grad loss-tensor) 0))))
+      (unless (= up 1.0)
+        (with-dtype dtype (scal! (vector-length-for-dtype v dtype) up v)))
+      v))
+
   (define (mse-loss pred target #!key (reduction 'mean))
     "Mean Squared Error loss with batch support.
    
@@ -2173,7 +2211,7 @@
                                                (- (elt-ref data-pred i)
                                                   (elt-ref data-target i))))))
                    
-                    (add-to-grad! pred grad-pred)))
+                    (add-to-grad! pred (scale-by-upstream! grad-pred loss-tensor dtype))))
                 (list pred)))
              loss-tensor)))
       
@@ -2203,7 +2241,7 @@
                                             (- (elt-ref data-pred i)
                                                (elt-ref data-target i)))))
                     
-                    (add-to-grad! pred grad-pred)))
+                    (add-to-grad! pred (scale-by-upstream! grad-pred loss-tensor dtype))))
                 (list pred)))
              loss-tensor)))
         
@@ -2286,8 +2324,7 @@
                                                  ((= i n-classes))
                                                (elt-set! grad-log-probs i
                                                          (- (elt-ref data-target i)))))
-                                 (add-to-grad! log-probs grad-log-probs)
-                                 (backward! log-probs))
+                                 (add-to-grad! log-probs (scale-by-upstream! grad-log-probs loss-tensor dtype)))
                                (let ((grad-pred (with-dtype dtype (vec n-classes 0.0)))
                                      (data-pred (tensor-data pred)))
                                  (with-dtype dtype
@@ -2296,8 +2333,9 @@
                                                (elt-set! grad-pred i
                                                          (- (/ (elt-ref data-target i)
                                                                (max 1e-10 (elt-ref data-pred i)))))))
-                                 (add-to-grad! pred grad-pred))))
-                         (list pred)))
+                                 (add-to-grad! pred (scale-by-upstream! grad-pred loss-tensor dtype)))))
+                         ;; With logits the gradient goes through log-softmax.
+                         (if from-logits (list log-probs) (list pred))))
                       loss-tensor))))
          
                ;; Target is class index (scalar)
@@ -2322,16 +2360,16 @@
                                      (class-idx (inexact->exact (with-dtype dtype (elt-ref data-target 0)))))
                                  (with-dtype dtype
                                              (elt-set! grad-log-probs class-idx -1.0))
-                                 (add-to-grad! log-probs grad-log-probs)
-                                 (backward! log-probs))
+                                 (add-to-grad! log-probs (scale-by-upstream! grad-log-probs loss-tensor dtype)))
                                (let ((grad-pred (with-dtype dtype (vec n-classes 0.0)))
                                      (data-pred (tensor-data pred))
                                      (class-idx (inexact->exact (with-dtype dtype (elt-ref data-target 0)))))
                                  (with-dtype dtype
                                              (elt-set! grad-pred class-idx
                                                        (- (/ 1.0 (max 1e-10 (elt-ref data-pred class-idx))))))
-                                 (add-to-grad! pred grad-pred))))
-                         (list pred)))
+                                 (add-to-grad! pred (scale-by-upstream! grad-pred loss-tensor dtype)))))
+                         ;; With logits the gradient goes through log-softmax.
+                         (if from-logits (list log-probs) (list pred))))
                       loss-tensor))))
                
                (else
@@ -2397,8 +2435,7 @@
                                                  ((= i n))
                                                (elt-set! grad-log-probs i
                                                          (* (- scale) (elt-ref data-target i)))))
-                                 (add-to-grad! log-probs grad-log-probs)
-                                 (backward! log-probs))
+                                 (add-to-grad! log-probs (scale-by-upstream! grad-log-probs loss-tensor dtype)))
                                
                                ;; Direct gradient to pred
                                (let ((grad-pred (with-dtype dtype (vec n 0.0)))
@@ -2413,8 +2450,9 @@
                                                          (* (- scale)
                                                             (/ (elt-ref data-target i)
                                                                (max 1e-10 (elt-ref data-pred i)))))))
-                                 (add-to-grad! pred grad-pred))))
-                         (list pred)))
+                                 (add-to-grad! pred (scale-by-upstream! grad-pred loss-tensor dtype)))))
+                         ;; With logits the gradient goes through log-softmax.
+                         (if from-logits (list log-probs) (list pred))))
                       loss-tensor))))
                
                ;; Case 2: Target is class indices (batch_size,)
@@ -2456,8 +2494,7 @@
                                                      (offset (* b n-classes)))
                                                  (elt-set! grad-log-probs (+ offset class-idx)
                                                            (- scale)))))
-                                 (add-to-grad! log-probs grad-log-probs)
-                                 (backward! log-probs))
+                                 (add-to-grad! log-probs (scale-by-upstream! grad-log-probs loss-tensor dtype)))
                                ;; Direct gradient to probabilities
                                (let ((grad-pred (with-dtype dtype 
                                                             (vec (* batch-size n-classes) 0.0)))
@@ -2475,8 +2512,9 @@
                                                               (/ 1.0 (max 1e-10 
                                                                           (elt-ref data-pred 
                                                                                    (+ offset class-idx)))))))))
-                                 (add-to-grad! pred grad-pred))))
-                         (list pred)))
+                                 (add-to-grad! pred (scale-by-upstream! grad-pred loss-tensor dtype)))))
+                         ;; With logits the gradient goes through log-softmax.
+                         (if from-logits (list log-probs) (list pred))))
                       loss-tensor))))
                
                (else
@@ -2678,7 +2716,8 @@
                                                 (* (elt-ref grad-out i)
                                                    (elt-ref data-w i)))))
                         
-                        (let* ((dot-prod (with-dtype dtype (dot n grad-normalized data-x)))
+                        ;; dx = (gn - xhat * mean(gn . xhat)) / rms, xhat = x / rms
+                        (let* ((dot-prod (with-dtype dtype (dot n grad-normalized normalized-data)))
                                (mean-term (/ dot-prod (exact->inexact n)))
                                (grad-x (with-dtype dtype (vec n 0.0))))
                           
@@ -2793,7 +2832,8 @@
                                                          (elt-ref data-w i))))
                                           
                                           ;; Compute dot product using BLAS
-                                          (let* ((dot-prod (dot d-model grad-normalized x-row))
+                                          ;; dx = (gn - xhat * mean(gn . xhat)) / rms, xhat = x / rms
+                                          (let* ((dot-prod (dot d-model grad-normalized normalized-row))
                                                  (mean-term (/ dot-prod (exact->inexact d-model)))
                                                  (grad-row (vec d-model 0.0)))
                                             

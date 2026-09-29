@@ -541,8 +541,11 @@
                                (do ((i 0 (+ i 1)))
                                    ((= i batch-size))
                                  (let ((row-offset (* i output-dim)))
-                                   (axpy! output-dim 1.0 bias-data
-                                          biased-data offsetY: row-offset))))
+                                   (do ((j 0 (+ j 1)))
+                                        ((= j output-dim))
+                                      (elt-set! biased-data (+ row-offset j)
+                                                (+ (elt-ref biased-data (+ row-offset j))
+                                                   (elt-ref bias-data j)))))))
                              
                              (let ((biased-output (make-base-tensor biased-data
                                                                     (list batch-size output-dim)
@@ -563,8 +566,11 @@
                                             (do ((i 0 (+ i 1)))
                                                 ((= i batch-size))
                                               (let ((row-offset (* i output-dim)))
-                                                (axpy! output-dim 1.0 grad-biased
-                                                       grad-bias offsetX: row-offset))))
+                                                (do ((j 0 (+ j 1)))
+                                                    ((= j output-dim))
+                                                  (elt-set! grad-bias j
+                                                            (+ (elt-ref grad-bias j)
+                                                               (elt-ref grad-biased (+ row-offset j))))))))
                                           (add-to-grad! bias grad-bias)))))
                                   (list output bias)))
                                biased-output))
@@ -704,43 +710,82 @@
   ;;; ==================================================================
   
   (define (layer-norm x gamma beta #!key (epsilon 1e-5))
-    ;; Normalize across features, scale by gamma, shift by beta
+    "Layer normalization over the last axis of X.
+
+     Each row x_r of length D (the last dimension of X) is mapped to
+       y_r = gamma * (x_r - mean(x_r)) / sqrt(var(x_r) + epsilon) + beta
+     where var is the biased variance.  GAMMA and BETA are tensors of
+     shape (D).  Gradients flow to X, GAMMA and BETA."
     (let* ((dtype (tensor-dtype x))
+           (shape (tensor-shape x))
+           (d (last shape))
+           (n (apply * shape))
+           (rows (quotient n d))
            (data-x (tensor-data x))
-           (n (vector-length-for-dtype data-x dtype)))
-      
-      ;; Compute mean and variance
-      (define (compute-stats)
-        (let ((sum (with-dtype dtype
-                               (let loop ((i 0) (sum 0.0))
-                                 (if (= i n) sum
-                                     (loop (+ i 1) (+ sum (elt-ref data-x i))))))))
-          (let* ((mean (/ sum (exact->inexact n)))
-                 (var-sum (with-dtype dtype
-                                      (let loop ((i 0) (var-sum 0.0))
-                                        (if (= i n) var-sum
-                                            (let ((diff (- (elt-ref data-x i) mean)))
-                                              (loop (+ i 1) (+ var-sum (* diff diff)))))))))
-            (values mean (/ var-sum (exact->inexact n))))))
-      
-      (let-values (((mean variance) (compute-stats)))
-        (let* ((std (sqrt (+ variance epsilon)))
-               ;; Normalize, scale, shift
-               (normalized
-                (let ((norm-data (with-dtype dtype (vec n 0.0))))
-                  (with-dtype dtype
-                              (do ((i 0 (+ i 1)))
-                                  ((= i n))
-                                (elt-set! norm-data i
-                                          (/ (- (elt-ref data-x i) mean) std))))
-                  (make-base-tensor norm-data (tensor-shape x) dtype
-                                    (tensor-requires-grad? x)))))
-          
-          ;; scaled = normalized * gamma
-          (define scaled (mul normalized gamma))
-          
-          ;; output = scaled + beta
-          (add scaled beta)))))
+           (data-g (tensor-data gamma))
+           (data-b (tensor-data beta))
+           (xhat (with-dtype dtype (vec n 0.0)))
+           (rstd (make-f64vector rows 0.0))
+           (out (with-dtype dtype (vec n 0.0)))
+           (fd (exact->inexact d))
+           (requires-grad? (or (tensor-requires-grad? x)
+                               (tensor-requires-grad? gamma)
+                               (tensor-requires-grad? beta))))
+      (unless (= d (car (tensor-shape gamma)) (car (tensor-shape beta)))
+        (error 'layer-norm "gamma/beta length must equal the last dimension" d))
+      (do ((r 0 (+ r 1))) ((= r rows))
+        (let ((off (* r d)))
+          (let* ((mu (let loop ((j 0) (s 0.0))
+                       (if (= j d) (/ s fd)
+                           (loop (+ j 1)
+                                 (+ s (with-dtype dtype (elt-ref data-x (+ off j))))))))
+                 (var (let loop ((j 0) (s 0.0))
+                        (if (= j d) (/ s fd)
+                            (let ((c (- (with-dtype dtype (elt-ref data-x (+ off j))) mu)))
+                              (loop (+ j 1) (+ s (* c c)))))))
+                 (rs (/ 1.0 (sqrt (+ var epsilon)))))
+            (f64vector-set! rstd r rs)
+            (do ((j 0 (+ j 1))) ((= j d))
+              (let ((h (* (- (with-dtype dtype (elt-ref data-x (+ off j))) mu) rs)))
+                (with-dtype dtype
+                  (elt-set! xhat (+ off j) h)
+                  (elt-set! out (+ off j)
+                            (+ (* h (elt-ref data-g j)) (elt-ref data-b j)))))))))
+      (let ((result (make-base-tensor out shape dtype requires-grad?)))
+        (when requires-grad?
+          (set-backward-fn!
+           result
+           (lambda ()
+             (let ((g (tensor-grad result))
+                   (dg (with-dtype dtype (vec d 0.0)))
+                   (db (with-dtype dtype (vec d 0.0)))
+                   (dx (with-dtype dtype (vec n 0.0))))
+               (do ((r 0 (+ r 1))) ((= r rows))
+                 (let ((off (* r d)))
+                   ;; Row sums of dxhat and dxhat * xhat, dxhat = g * gamma.
+                   (let loop ((j 0) (s1 0.0) (s2 0.0))
+                     (if (< j d)
+                         (let* ((gj (with-dtype dtype (elt-ref g (+ off j))))
+                                (hj (with-dtype dtype (elt-ref xhat (+ off j))))
+                                (dh (* gj (with-dtype dtype (elt-ref data-g j)))))
+                           (with-dtype dtype
+                             (elt-set! dg j (+ (elt-ref dg j) (* gj hj)))
+                             (elt-set! db j (+ (elt-ref db j) gj)))
+                           (loop (+ j 1) (+ s1 dh) (+ s2 (* dh hj))))
+                         (let ((m1 (/ s1 fd)) (m2 (/ s2 fd))
+                               (rs (f64vector-ref rstd r)))
+                           (do ((j 0 (+ j 1))) ((= j d))
+                             (let* ((hj (with-dtype dtype (elt-ref xhat (+ off j))))
+                                    (dh (* (with-dtype dtype (elt-ref g (+ off j)))
+                                           (with-dtype dtype (elt-ref data-g j)))))
+                               (with-dtype dtype
+                                 (elt-set! dx (+ off j)
+                                           (* rs (- dh m1 (* hj m2))))))))))))
+               (when (tensor-requires-grad? x) (add-to-grad! x dx))
+               (when (tensor-requires-grad? gamma) (add-to-grad! gamma dg))
+               (when (tensor-requires-grad? beta) (add-to-grad! beta db))))
+           (list x gamma beta)))
+        result)))
 
 
   ;;; ==================================================================

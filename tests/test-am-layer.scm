@@ -11,7 +11,7 @@
 (import scheme (chicken base) (chicken format) (chicken random))
 (import test)
 (import (only srfi-1 iota map fold every filter append-map))
-(import (only srfi-4 f64vector-ref f64vector-length f64vector-set!))
+(import (only srfi-4 f64vector-ref f64vector-length f64vector-set! make-f64vector))
 (import datatype matchable)
 (import array-morphisms-core)
 (import array-morphisms-realization)
@@ -33,6 +33,14 @@
 (define (lists-approx= l1 l2)
   (and (= (length l1) (length l2))
        (every approx= l1 l2)))
+
+(define (list->f64vector* l)
+  (let ((v (make-f64vector (length l) 0.0)))
+    (let loop ((l l) (i 0))
+      (if (null? l) v (begin (f64vector-set! v i (car l)) (loop (cdr l) (+ i 1)))))))
+
+(define (f64vector->list* v)
+  (map (lambda (i) (f64vector-ref v i)) (iota (f64vector-length v))))
 
 (define (make-lt data shape)
   "Build a lazy tensor from flat f64 list and shape (list of ints)."
@@ -404,5 +412,24 @@
       (test-assert "conv output matches a direct convolution"
         (lists-approx= (lt-data out) expected)))))
 
+
+;;;; ============================================================
+;;;; activation-forward-am agrees with the strict activations
+;;;; ============================================================
+
+(test-group "activation-forward-am matches strict activation-forward"
+  (let* ((xs '(-2.5 -1.0 -0.3 0.0 0.4 1.2 3.0))
+         (n (length xs)))
+    (for-each
+     (lambda (make-act)
+       (let* ((act (make-act))
+              (strict (activation-forward
+                       act (make-tensor64 (list->f64vector* xs) (list n)
+                                          requires-grad?: #f)))
+              (lz (activation-forward-am act (make-lt xs (list n)))))
+         (test-assert (activation-name act)
+           (lists-approx= (f64vector->list* (tensor-data strict))
+                          (f64vector->list* (tensor-data lz))))))
+     (list make-relu make-sigmoid make-tanh make-gelu make-silu))))
 
 (test-exit)

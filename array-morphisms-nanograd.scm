@@ -372,7 +372,8 @@
                               (ep1 (am:var+ e2x one)))
                          (am:var/ em1 ep1)))
                 (cdf   (am:var* half (am:var+ one t))))
-           (get-or-make-lazy (am:var* mv (am:var* half cdf)))))
+           ;; cdf already holds 0.5 * (1 + tanh(...))
+           (get-or-make-lazy (am:var* mv cdf))))
 
         ((string=? name "SiLU")
          ;; silu(x) = x * sigmoid(x)
@@ -1187,7 +1188,14 @@
                                            (am:var-value (lazy-tensor-morph-variable ei))))
                                        extra-inputs))
                (loss-val          (ssa-loss-binding-val fwd-prog))
-               (joint             (ssa-vjp fwd-prog p-vals loss-val)))
+               (joint             (begin
+                                    ;; Gradients are installed by position, so every
+                                    ;; parameter must appear in the traced program.
+                                    (unless (= (length p-vals) (length params))
+                                      (error 'am-training-step/ssa
+                                             "some model parameters do not reach the loss"
+                                             (length params) (length p-vals)))
+                                    (ssa-vjp fwd-prog p-vals loss-val))))
           (hash-table-set! *ssa-state-table* ctx-id
                            (list joint p-vals x-const-val extra-const-vals))))
 
@@ -1214,6 +1222,10 @@
          (let* ((results   (ssa-realize/ctx ctx joint))
                 (loss-arr  (car results))
                 (grads     (cdr results)))
+           (unless (= (length grads) (length params))
+             (error 'am-training-step/ssa
+                    "some model parameters received no gradient"
+                    (length params) (length grads)))
            ;; Install gradients into morph-variables so optimizer can read them
            (for-each (lambda (p g)
                        (let ((mv (lazy-tensor-morph-variable p)))

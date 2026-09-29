@@ -33,6 +33,7 @@
     "test-gelu-silu"
     "test-batchnorm"
     "test-tensor-slice"
+    "test-gradcheck"
     "test-am-autograd"
     "test-am-layer"
     "test-am-network"
