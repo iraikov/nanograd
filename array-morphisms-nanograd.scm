@@ -51,6 +51,7 @@
    am-realize-grads/ctx
    am-training-step
    am-training-step/ssa
+   am-forward/ssa
    am-replay-plan-stats
    am-finalize-context!
    am-reset-context!
@@ -114,15 +115,58 @@
   ;;;; Type conversion helpers
   ;;;; ================================================================
 
+  ;; Operations that only the SSA engine can execute.  Their morphism-expr
+  ;; nodes carry an identity index function as a placeholder, so plain
+  ;; realize cannot evaluate them.
+  (define ssa-only-ops '(conv2d-fwd conv2d-bwd-data conv2d-bwd-weights))
+
+  (define (contains-ssa-only-op? m)
+    "True if the morphism DAG rooted at m has a node whose operation is in
+     ssa-only-ops.  Shared nodes are visited once."
+    (let ((visited (make-hash-table eq? eq?-hash)))
+      (let walk ((m m))
+        (let ((id (morph-stable-id m)))
+          (and (not (hash-table-ref/default visited id #f))
+               (begin
+                 (hash-table-set! visited id #t)
+                 (cases array-morphism m
+                   (concrete-array (data shape strides offset dtype alloc-id batch-axis)
+                     #f)
+                   (morphism-expr (mid op operands idx-fn shape dtype metadata batch-axis)
+                     (or (and (memq op ssa-only-ops) #t)
+                         (any walk operands)))
+                   (reduction-morphism (mid op operand reduce-axes idx-fn shape dtype batch-axis)
+                     (walk operand)))))))))
+
+  (define (realize-for-read m)
+    "Realize morphism m to a concrete array.  Morphisms that contain
+     SSA-only operations are compiled to an SSA program and executed with
+     ssa-realize, which evaluates those operations by their reference
+     decomposition; all others use realize."
+    (if (contains-ssa-only-op? m)
+        (car (ssa-realize (morphism-to-ssa (am:make-var m #f))))
+        (realize m)))
+
+  ;; Number of elements of the SRFI-4 vector v of the given dtype.
+  (define (srfi4-length v dtype)
+    (case dtype
+      ((f32) (f32vector-length v))
+      ((f64) (f64vector-length v))
+      ((s32) (s32vector-length v))
+      ((s64) (s64vector-length v))
+      (else (error "srfi4-length: unsupported dtype" dtype))))
+
   (define (morphism->srfi4 m)
-    "Realize morphism m and return a row-major SRFI-4 vector.
-     Reads elements via multi-index access so that zero-copy transposed views
-     are correctly de-transposed rather than read flat."
-    (cases array-morphism (realize m)
+    "Realize morphism m and return a row-major SRFI-4 vector holding exactly
+     its elements.  The array's own data vector is returned when it holds the
+     elements in row-major order and nothing else; otherwise (a zero-copy
+     transposed view, or a buffer from a morphism context that is larger than
+     the array) the elements are copied into a fresh vector."
+    (cases array-morphism (realize-for-read m)
       (concrete-array (data shape strides offset dtype alloc-id batch-axis)
         (let ((n     (shape-size shape))
               (nstrs (compute-strides shape)))
-          (if (and (= offset 0) (equal? strides nstrs))
+          (if (and (= offset 0) (equal? strides nstrs) (= n (srfi4-length data dtype)))
               data
               (let ((fresh (allocate-typed-vector dtype n)))
                 (do ((i 0 (+ i 1)))
@@ -203,11 +247,11 @@
        ;; ---- Data access ----
        ;; concrete-array: extract SRFI-4 vector zero-copy.
        ;; morphism-expr: realize on demand (may allocate).
+       ;; For a row-major array whose data vector holds exactly its
+       ;; elements, such as a parameter, this is the data vector itself, so
+       ;; in-place updates reach the tensor.
        ((tensor-data self)
-        (cases array-morphism (am:var-value mv)
-          (concrete-array (data shape strides offset dtype alloc-id batch-axis)
-            data)
-          (else (morphism->srfi4 (am:var-value mv)))))
+        (morphism->srfi4 (am:var-value mv)))
 
        ;; ---- Force to strict tensor ----
        ((tensor-force self)
@@ -1184,6 +1228,51 @@
            (am-reset-context! ctx)
            ;; Return loss as a lazy tensor
            (get-or-make-lazy (am:make-var loss-arr #f))))))
+
+  ;; Forward-only programs compiled by am-forward/ssa, keyed like
+  ;; *ssa-state-table*.  Each value: (list prog input-const-val input-shape).
+  (define *ssa-forward-table*
+    (make-hash-table))
+
+  (define (am-forward/ssa ctx model x-lt)
+    "Forward pass of model on x-lt through a compiled SSA program, for
+     inference.
+
+     The first call for a given ctx compiles the forward program and runs it
+     once to trace its buffer use; later calls replace the input with x-lt
+     and replay the compiled plan.  The parameters are constants of the
+     program that share their storage with the model, so every call sees
+     the current weights.  A compiled program is fixed to the shape of its
+     first input: use one ctx per input shape (for example per batch size).
+     Do not use a ctx for both am-forward/ssa and am-training-step/ssa.
+
+     Returns the output as a lazy tensor.  Its data lives in ctx's buffer
+     pool and is overwritten by the next call with the same ctx, so read it
+     (with tensor-data) before calling again."
+    (let* ((ctx-id  (morphism-context-id ctx))
+           (x-mv    (lazy-tensor-morph-variable x-lt))
+           (x-morph (am:var-value x-mv))
+           (x-shape (morph-shape x-morph)))
+      (unless (hash-table-ref/default *ssa-forward-table* ctx-id #f)
+        (let* ((out-lt  (forward model x-lt))
+               (prog    (morphism-to-ssa (lazy-tensor-morph-variable out-lt)))
+               (x-const (ssa-constant-id prog x-morph)))
+          (unless x-const
+            (error 'am-forward/ssa "the model output does not depend on the input"))
+          (hash-table-set! *ssa-forward-table* ctx-id (list prog x-const x-shape))))
+      (let* ((state   (hash-table-ref *ssa-forward-table* ctx-id))
+             (prog    (car state))
+             (x-const (cadr state)))
+        (unless (equal? x-shape (caddr state))
+          (error 'am-forward/ssa
+                 "input shape differs from the one this context was compiled for"
+                 x-shape (caddr state)))
+        (hash-table-set! (ssa-program-constants prog) (ssa-value-id x-const) x-morph)
+        (let ((out-arr (car (ssa-realize/ctx ctx prog))))
+          (unless (eq? (context-mode ctx) 'replay)
+            (am-finalize-context! ctx))
+          (am-reset-context! ctx)
+          (get-or-make-lazy (am:make-var out-arr #f))))))
 
   (define (am-replay-plan-stats ctx)
     "Return alist of (tag . count) for the SSA replay plan compiled for ctx."

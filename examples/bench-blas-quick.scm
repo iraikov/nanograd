@@ -1,6 +1,7 @@
 ;;; bench-blas-quick.scm -- Quick BLAS conv micro-bench + SSA per-step timing.
 ;;; Skips the slow scalar micro-benchmarks from bench-cnn.scm.
 
+(import (chicken blob))
 (import scheme (chicken base) (chicken format) (chicken random) (chicken time) (chicken sort))
 (import (only srfi-1 fold iota))
 (import srfi-4)
@@ -24,7 +25,7 @@
 (define (time-ms thunk)
   (let ((t0 (cpu-time))) (thunk) (- (cpu-time) t0)))
 
-(set-pseudo-random-seed! "42")
+(set-pseudo-random-seed! (string->blob "42"))
 (define batch-size 32)
 (define image-size 28)
 

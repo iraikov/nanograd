@@ -496,4 +496,54 @@
 ;;; Run All Tests
 ;;; ==================================================================
 
+;;; ==================================================================
+;;; Unit Tests: Optimizer kernels
+;;; ==================================================================
+
+(test-group "Adam - Registered update kernel"
+
+  ;; A Scheme stand-in for a compiled kernel, following the documented
+  ;; calling convention; it counts its calls.
+  (define calls 0)
+  (define (scheme-adam-kernel n hyper param grad m v)
+    (set! calls (+ calls 1))
+    (let ((lr (f64vector-ref hyper 0)) (b1 (f64vector-ref hyper 1))
+          (b2 (f64vector-ref hyper 2)) (eps (f64vector-ref hyper 3))
+          (bc1 (f64vector-ref hyper 4)) (bc2 (f64vector-ref hyper 5))
+          (wd (f64vector-ref hyper 6)))
+      (do ((i 0 (+ i 1))) ((= i n))
+        (when (> wd 0.0)
+          (f32vector-set! grad i (+ (f32vector-ref grad i) (* wd (f32vector-ref param i)))))
+        (let ((g (f32vector-ref grad i)))
+          (f32vector-set! m i (+ (* b1 (f32vector-ref m i)) (* (- 1.0 b1) g)))
+          (f32vector-set! v i (+ (* b2 (f32vector-ref v i)) (* (- 1.0 b2) g g)))
+          (f32vector-set! param i
+                          (- (f32vector-ref param i)
+                             (/ (* lr (/ (f32vector-ref m i) bc1))
+                                (+ (sqrt (/ (f32vector-ref v i) bc2)) eps))))))))
+
+  ;; Weights after three Adam steps with a fixed gradient.
+  (define (weights-after-steps)
+    (let* ((w (make-tensor32 (f32vector 0.5 -1.0 2.0) '(3)))
+           (opt (make-adam (list w) learning-rate: 0.01 weight-decay: 0.001)))
+      (do ((k 0 (+ k 1))) ((= k 3))
+        (zero-grad! w)
+        (add-to-grad! w (f32vector 0.3 -0.2 0.1))
+        (step! opt))
+      (f32vector->list (tensor-data w))))
+
+  (define without (weights-after-steps))
+  (register-optimizer-kernel! 'adam 'f32 scheme-adam-kernel)
+  (define with (weights-after-steps))
+  (register-optimizer-kernel! 'adam 'f32 #f)
+
+  (test-assert "The registered kernel performs the updates"
+    (= calls 3))
+
+  (test-assert "The kernel's result agrees with the built-in Adam"
+    (every (lambda (a b) (approx-equal? a b 1e-6)) without with))
+
+  (test-assert "Removing the registration restores the built-in update"
+    (not (optimizer-kernel 'adam 'f32))))
+
 (test-exit)

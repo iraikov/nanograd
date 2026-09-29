@@ -19,6 +19,7 @@
 ;;; Run with:
 ;;;   csi -q am-regression-perf.scm
 
+(import (chicken blob))
 (import scheme (chicken base) (chicken format) (chicken random) (chicken time))
 (import (only srfi-1 map fold filter take drop last iota append-map))
 (import srfi-4)
@@ -195,7 +196,7 @@
 ;;; Step 3 -- replay mode again (confirm steady state)
 ;;; ============================================================
 
-(set-pseudo-random-seed! "42")
+(set-pseudo-random-seed! (string->blob "42"))
 
 (define opt (make-adam params learning-rate: 1e-3))
 (define-values (ctx-fwd ctx-bwd) (make-am-training-context))

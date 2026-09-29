@@ -11,6 +11,7 @@
 ;;;   - Targets passed as extra-input to am-training-step/ssa
 ;;;   - Automatic buffer reuse through morphism context
 
+(import (chicken blob))
 (import scheme (chicken base) (chicken format) (chicken random) (chicken time))
 (import (only srfi-1 map fold take drop filter iota last))
 (import srfi-4)
@@ -202,30 +203,28 @@
             ((= j img-size))
           (f32vector-set! batched-data (+ offset j)
                           (f32vector-ref img-data j)))))
-    ;; Return as lazy tensor wrapping a morph-variable
+    ;; Return as a lazy tensor that wraps batched-data without copying.
     ;; Shape: (N, C, H, W) = (batch_size, 1, 28, 28)
-    (let ((mv (am:make-var (morph-from-list (f32vector->list batched-data)
-                                            (list batch-size num-channels
-                                                  image-size image-size)
-                                            'f32)
+    (let ((mv (am:make-var (make-morphism batched-data
+                                          (list batch-size num-channels
+                                                image-size image-size)
+                                          'f32)
                            #f)))  ; requires-grad? = #f for input
       (get-or-make-lazy mv))))
 
 (define (stack-targets batch)
   "Stack batch targets into one-hot encoded lazy tensor (N, num_classes)"
   (let* ((batch-size (length batch))
-         (target-data '()))
-    ;; Build flattened one-hot targets
-    (do ((i 0 (+ i 1)))
-        ((= i batch-size))
-      (let ((class (cdr (list-ref batch i))))
-        (set! target-data
-              (append target-data
-                      (f32vector->list (one-hot class num-classes))))))
-    ;; Return as lazy tensor
-    (let ((mv (am:make-var (morph-from-list target-data
-                                            (list batch-size num-classes)
-                                            'f32)
+         (target-data (make-f32vector (* batch-size num-classes) 0.0)))
+    ;; Set the one-hot entry of each row
+    (let loop ((i 0) (rest batch))
+      (unless (null? rest)
+        (f32vector-set! target-data (+ (* i num-classes) (cdar rest)) 1.0)
+        (loop (+ i 1) (cdr rest))))
+    ;; Return as a lazy tensor that wraps target-data without copying
+    (let ((mv (am:make-var (make-morphism target-data
+                                          (list batch-size num-classes)
+                                          'f32)
                            #f)))  ; requires-grad? = #f for targets
       (get-or-make-lazy mv))))
 
@@ -310,8 +309,22 @@
               (loop (+ i 1) i val)
               (loop (+ i 1) max-i max-val))))))
 
+;; Morphism contexts for the compiled forward passes of evaluate, one per
+;; batch size, since a compiled program is fixed to the shape of its input.
+(define eval-contexts '())
+
+(define (eval-context batch-size)
+  (let ((entry (assv batch-size eval-contexts)))
+    (if entry
+        (cdr entry)
+        (let ((ctx (make-morphism-context)))
+          (set! eval-contexts (cons (cons batch-size ctx) eval-contexts))
+          ctx))))
+
 (define (evaluate model test-data batch-size)
-  "Evaluate model on test data using batched forward passes"
+  "Evaluate model on test data using batched forward passes, each run as a
+   compiled SSA program that is replayed for every later batch of the same
+   size"
   (let ((correct 0)
         (total (length test-data))
         (confusion (make-vector (* num-classes num-classes) 0)))
@@ -333,7 +346,8 @@
                 (batch-targets (stack-targets batch)))
            
            ;; Forward pass (no gradients needed for eval)
-           (let ((logits (forward model batch-images)))
+           (let ((logits (am-forward/ssa (eval-context actual-batch-size)
+                                         model batch-images)))
              ;; logits is a lazy tensor, need to extract data
              (let ((logits-data (tensor-data logits)))
                ;; Process each sample in batch
@@ -386,7 +400,7 @@
   (printf "========================================\n\n")
   
   ;; Set random seed
-  (set-pseudo-random-seed! (number->string 42))
+  (set-pseudo-random-seed! (string->blob (number->string 42)))
   
   ;; Generate dataset
   (printf "Generating dataset...\n")

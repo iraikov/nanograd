@@ -73,7 +73,7 @@
    (chicken flonum)
    (srfi 1)
    (srfi 4)
-   (srfi 42)  ; Comprehensions
+   (only (chicken number-vector) subf32vector subf64vector)
    (srfi 69)
    mathh
    yasos
@@ -3177,16 +3177,22 @@
   (define (f64vector-fold f x0 v . rest)
     (let ((n   (f64vector-length v))
 	  (vs  (cons v rest)))
-      (fold-ec x0 (:range i 0 n)
-	       (map (lambda (v) (f64vector-ref v i)) vs)
-	       (lambda (x ax) (apply f (append x (list ax)))))))
+      (let loop ((i 0) (ax x0))
+        (if (= i n)
+            ax
+            (loop (+ i 1)
+                  (apply f (append (map (lambda (v) (f64vector-ref v i)) vs)
+                                   (list ax))))))))
 
   (define (f32vector-fold f x0 v . rest)
     (let ((n   (f32vector-length v))
 	  (vs  (cons v rest)))
-      (fold-ec x0 (:range i 0 n)
-	       (map (lambda (v) (f32vector-ref v i)) vs)
-	       (lambda (x ax) (apply f (append x (list ax)))))))
+      (let loop ((i 0) (ax x0))
+        (if (= i n)
+            ax
+            (loop (+ i 1)
+                  (apply f (append (map (lambda (v) (f32vector-ref v i)) vs)
+                                   (list ax))))))))
 
   ;; Vector subset
   (define (dsub x start len)

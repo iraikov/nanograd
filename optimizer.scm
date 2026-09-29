@@ -11,6 +11,9 @@
    ;; Optimizer operations
    step! get-learning-rate set-learning-rate!
    optimizer-state
+
+   ;; Whole-vector update kernels
+   register-optimizer-kernel! optimizer-kernel
    )
   
   (import
@@ -27,6 +30,37 @@
 
   ;; Hygienic macro for dtype-based operation dispatch
   (include "with-dtype.scm")
+
+  ;;; ==================================================================
+  ;;; Optimizer kernels
+  ;;; ==================================================================
+
+  ;; Kernels that perform an optimizer's whole update of one parameter
+  ;; vector in a single call, keyed by (name . dtype).  An adam kernel is
+  ;; a procedure (n hyper param grad m v) -> void updating the first n
+  ;; elements of the SRFI-4 vectors param, m and v (and grad, which
+  ;; receives the weight-decay term) in place.  hyper is an f64vector
+  ;; holding the learning rate, beta1, beta2, epsilon, the two bias
+  ;; corrections 1 - beta1^t and 1 - beta2^t, and the weight decay.
+  (define *optimizer-kernels* '())
+
+  (define (register-optimizer-kernel! name dtype kernel)
+    "Use kernel for the updates of optimizer name (a symbol, such as adam)
+    on dtype ('f32 or 'f64) parameters.  A kernel of #f removes the
+    registration, so that the optimizer's Scheme code is used again."
+    (unless (memq dtype '(f32 f64))
+      (error 'register-optimizer-kernel! "unsupported dtype" dtype))
+    (unless (or (not kernel) (procedure? kernel))
+      (error 'register-optimizer-kernel! "kernel must be a procedure or #f" kernel))
+    (set! *optimizer-kernels*
+          (let ((rest (remove (lambda (e) (equal? (car e) (cons name dtype)))
+                              *optimizer-kernels*)))
+            (if kernel (cons (cons (cons name dtype) kernel) rest) rest))))
+
+  (define (optimizer-kernel name dtype)
+    "The kernel registered for optimizer name on dtype parameters, or #f."
+    (let ((e (assoc (cons name dtype) *optimizer-kernels*)))
+      (and e (cdr e))))
 
   
   ;;; ==================================================================
@@ -194,13 +228,17 @@
                     (n (vector-length-for-dtype data dtype)))
 
                (when grad
-                 ;; Apply weight decay
-                 (when (> wd 0.0)
-                   (with-dtype dtype (axpy! n wd data grad)))
-                 
                  (let ((m (hash-table-ref m-buffers param))
-                       (v (hash-table-ref v-buffers param)))
-                   
+                       (v (hash-table-ref v-buffers param))
+                       (kernel (optimizer-kernel 'adam dtype)))
+                  (if kernel
+                   (kernel n (f64vector lr b1 b2 eps bias-correction1 bias-correction2 wd)
+                           data grad m v)
+                   (begin
+                   ;; Apply weight decay
+                   (when (> wd 0.0)
+                     (with-dtype dtype (axpy! n wd data grad)))
+
                    (with-dtype dtype
                       ;; Update biased first moment: m = beta1 * m + (1-beta1) * grad
                       (scal! n b1 m)
@@ -224,7 +262,7 @@
                                           (- (elt-ref data i)
                                              (/ (* lr m-hat)
                                                 (+ (sqrt v-hat) eps))))))
-                      ))
+                      ))))
                    ))
                  )
            parameters))))))

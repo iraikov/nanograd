@@ -1,6 +1,7 @@
 ;;; bench-cnn.scm -- profile one training batch of the CNN.
 ;;; Times full step (trace vs replay) and individual operations.
 
+(import (chicken blob))
 (import scheme (chicken base) (chicken format) (chicken random) (chicken time) (chicken sort))
 (import (only srfi-1 fold iota take))
 (import srfi-4)
@@ -37,7 +38,7 @@
 ;;; Model (same architecture as am-cnn-ssa.scm)
 ;;; ---------------------------------------------------------------
 
-(set-pseudo-random-seed! "42")
+(set-pseudo-random-seed! (string->blob "42"))
 
 (define batch-size 32)
 (define image-size 28)

@@ -12,6 +12,7 @@
 ;;;   - No explicit am-zero-grad! / am-reset-context! calls; handled inside
 ;;;     am-training-step/ssa.
 
+(import (chicken blob))
 (import scheme (chicken base) (chicken format) (chicken random) (chicken time))
 (import (only srfi-1 map fold filter take drop last iota))
 (import srfi-4)
@@ -198,7 +199,7 @@
 (printf "  (array-morphisms SSA fused forward+backward)\n")
 (printf "\n")
 
-(set-pseudo-random-seed! "42")
+(set-pseudo-random-seed! (string->blob "42"))
 
 ;; Dataset
 (define train-data (shuffle (generate-dataset 500)))

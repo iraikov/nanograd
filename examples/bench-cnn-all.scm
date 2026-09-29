@@ -10,6 +10,7 @@
 ;;;
 ;;; Usage: csi -s bench-cnn-comprehensive.scm
 
+(import (chicken blob))
 (import scheme (chicken base) (chicken format) (chicken random) (chicken time) (chicken sort))
 (import (only srfi-1 fold iota take))
 (import srfi-4)
@@ -91,7 +92,7 @@
 (printf "  Iterations per test: ~A\n" iters)
 (printf "\n")
 
-(set-pseudo-random-seed! "42")
+(set-pseudo-random-seed! (string->blob "42"))
 (register-blas-backend! (make-blas-egg-backend))
 
 ;; ============================================================

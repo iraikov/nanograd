@@ -20,9 +20,11 @@ operations, batch processing support, and a clean functional API.
 
 ## Installation
 
+nanograd requires CHICKEN 6.
+
 ```bash
 # Install dependencies
-chicken-install yasos blas mathh srfi-1 srfi-4 srfi-42 srfi-69
+chicken-install yasos blas mathh srfi-1 srfi-69 cbor array-morphisms
 
 # Clone the repository
 git clone https://github.com/iraikov/nanograd.git
@@ -567,8 +569,9 @@ chicken-install
 - **mathh**: Extended math functions
 - **srfi-1**: List utilities
 - **srfi-4**: Homogeneous numeric vectors
-- **srfi-42**: Eager comprehensions
 - **srfi-69**: Hash tables
+- **cbor**: CBOR (RFC 8949) encoding for model checkpoints
+- **array-morphisms**: Lazy tensors and SSA fusion
 
 ## License
 

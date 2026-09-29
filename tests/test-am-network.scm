@@ -8,6 +8,7 @@
 ;;; Run with:
 ;;;   csi -q test-am-network.scm
 
+(import (chicken blob))
 (import scheme (chicken base) (chicken format) (chicken random) (chicken time) (chicken gc))
 (import test)
 (import (only srfi-1 iota map fold every filter take drop))
@@ -50,7 +51,7 @@
 
 (define (set-random-seed! seed)
   "Set random seed for reproducibility"
-  (set-pseudo-random-seed! (number->string seed)))
+  (set-pseudo-random-seed! (string->blob (number->string seed))))
 
 
 ;;;; ============================================================
@@ -405,7 +406,7 @@
     ;; Overwrite He-init with deterministic uniform init (seed after model
     ;; creation so GC during He-init does not consume the seed's PRNG state).
     ;; params order: W1[8x2] b1[8] W2[2x8] b2[2]; biases stay zero.
-    (set-pseudo-random-seed! "123")
+    (set-pseudo-random-seed! (string->blob "123"))
     (uniform-init! (tensor-data (list-ref params 0)) 16 2)
     (uniform-init! (tensor-data (list-ref params 2)) 16 8)
 
@@ -497,7 +498,7 @@
     ;; affect the weights we actually train with.
     ;; params layout: W1[16x2] b1[16] W2[8x16] b2[8] W3[3x8] b3[3]
     ;; biases stay zero; only weight matrices are re-initialized.
-    (set-pseudo-random-seed! "456")
+    (set-pseudo-random-seed! (string->blob "456"))
     (uniform-init-mc! (tensor-data (list-ref params 0)) 32 2)
     (uniform-init-mc! (tensor-data (list-ref params 2)) 128 16)
     (uniform-init-mc! (tensor-data (list-ref params 4)) 24 8)

@@ -364,8 +364,9 @@
                 (printf " (confidence: ~A%)\n" 
                         (* 100 (f32vector-ref pred-data pred-class)))))))
         
-        (printf "Error: Model file not found: ~A\n" model-path)
-        (printf "Please run (main-with-save) first to train and save a model.\n"))))
+        (begin
+          (printf "Error: Model file not found: ~A\n" model-path)
+          (printf "Please run (main-with-save) first to train and save a model.\n")))))
 
 ;;; ==================================================================
 ;;; Model Transfer Learning Demo
@@ -408,8 +409,9 @@
             (printf "  4. Save the fine-tuned model\n")
             (printf "\nThis is left as an exercise - the infrastructure is in place!\n")))
         
-        (printf "Error: Model file not found: ~A\n" model-path)
-        (printf "Please run (main-with-save) first to train and save a model.\n"))))
+        (begin
+          (printf "Error: Model file not found: ~A\n" model-path)
+          (printf "Please run (main-with-save) first to train and save a model.\n")))))
 
 ;;; ==================================================================
 ;;; Usage Examples

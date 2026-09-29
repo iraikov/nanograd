@@ -10,7 +10,7 @@
 
 (import scheme (chicken base) (chicken format) (chicken random))
 (import test)
-(import (only srfi-1 iota map fold every filter))
+(import (only srfi-1 iota map fold every filter append-map))
 (import (only srfi-4 f64vector-ref f64vector-length f64vector-set!))
 (import datatype matchable)
 (import array-morphisms-core)
@@ -310,9 +310,14 @@
 (test-group "single am-training-step decreases loss"
 
   ;; Model: 1->1 identity, learn y=0 from x=1 batch
-  ;; Loss should decrease after one Adam step
+  ;; Loss should decrease after one Adam step.  The weights are fixed
+  ;; (W=1, b=0, so the initial loss is 1) because a random start close
+  ;; to the target lets one step of size 0.1 overshoot.
   (let* ((model (make-am-sequential
                  (list (make-am-dense-layer 1 1 activation: (make-identity) dtype: 'f64))))
+         (_     (let ((params (am-parameters model)))
+                  (f64vector-set! (tensor-data (car params)) 0 1.0)
+                  (f64vector-set! (tensor-data (cadr params)) 0 0.0)))
          (opt   (make-adam (am-parameters model) learning-rate: 0.1)))
     (let-values (((ctx-fwd ctx-bwd) (make-am-training-context)))
       (define (make-input) (make-lt '(1.0) '(1 1)))
@@ -343,6 +348,61 @@
               (>= (f64vector-ref (tensor-data loss) 0) 0.0))
             (test-assert "single step: loss decreased"
               (< lv2 lv0))))))))
+
+
+;;;; ============================================================
+;;;; Conv layer forward outside SSA training
+;;;; ============================================================
+
+(test-group "make-am-conv2d-layer forward (non-SSA)"
+
+  ;; Reading the output with tensor-data evaluates the conv2d-fwd op
+  ;; outside an SSA training step.  The result must match a direct
+  ;; convolution computed from the layer's own weights and bias.
+  (let* ((N 2) (C 2) (H 5) (W 5) (OC 3) (K 3) (S 2) (P 1)
+         (OH (+ 1 (quotient (+ H (* 2 P) (- K)) S)))
+         (OW (+ 1 (quotient (+ W (* 2 P) (- K)) S)))
+         (layer  (make-am-conv2d-layer C OC K stride: S padding: P
+                                       activation: (make-identity) dtype: 'f64))
+         (params (am-parameters layer))
+         (Wt     (tensor-data (car params)))    ; [OC, C*K*K]
+         (b      (tensor-data (cadr params)))   ; [OC]
+         (x-list (map (lambda (i) (exact->inexact (- (modulo (* i 7) 11) 5)))
+                      (iota (* N C H W))))
+         (x-vec  (list->vector x-list))
+         (out    (forward layer (make-lt x-list (list N C H W)))))
+    (do ((o 0 (+ o 1))) ((= o OC))
+      (f64vector-set! b o (* 0.1 (+ o 1))))
+    (let ((expected
+           ;; Output layout is NHWC: [N, OH, OW, OC]
+           (append-map
+            (lambda (n)
+              (append-map
+               (lambda (oh)
+                 (append-map
+                  (lambda (ow)
+                    (map (lambda (o)
+                           (let loop ((c 0) (kh 0) (kw 0) (acc (f64vector-ref b o)))
+                             (cond ((= c C) acc)
+                                   ((= kh K) (loop (+ c 1) 0 0 acc))
+                                   ((= kw K) (loop c (+ kh 1) 0 acc))
+                                   (else
+                                    (let ((ih (+ (* oh S) kh (- P)))
+                                          (iw (+ (* ow S) kw (- P))))
+                                      (loop c kh (+ kw 1)
+                                            (if (and (>= ih 0) (< ih H) (>= iw 0) (< iw W))
+                                                (+ acc
+                                                   (* (f64vector-ref Wt (+ (* o C K K) (* c K K) (* kh K) kw))
+                                                      (vector-ref x-vec (+ (* n C H W) (* c H W) (* ih W) iw))))
+                                                acc)))))))
+                         (iota OC)))
+                  (iota OW)))
+               (iota OH)))
+            (iota N))))
+      (test-assert "conv output shape [N,OH,OW,OC]"
+        (equal? (tensor-shape out) (list N OH OW OC)))
+      (test-assert "conv output matches a direct convolution"
+        (lists-approx= (lt-data out) expected)))))
 
 
 (test-exit)

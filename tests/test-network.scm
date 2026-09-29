@@ -1,5 +1,6 @@
 ;; Unit tests for complete neural network training
 
+(import (chicken blob))
 (import scheme
         (chicken base)
         (chicken format)
@@ -32,7 +33,7 @@
 
 (define (set-random-seed! seed)
   "Set random seed for reproducibility"
-  (set-pseudo-random-seed! (number->string seed)))
+  (set-pseudo-random-seed! (string->blob (number->string seed))))
 
 (define (in-range? val min-val max-val)
   "Check if value is in range [min-val, max-val]"

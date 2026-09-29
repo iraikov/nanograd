@@ -10,6 +10,7 @@
 ;;;   - f64 throughout (AM backend is f64-native)
 ;;;   - Context stats at the end showing buffer reuse
 
+(import (chicken blob))
 (import scheme (chicken base) (chicken format) (chicken random) (chicken time))
 (import (only srfi-1 map fold filter take drop last iota))
 (import srfi-4)
@@ -196,7 +197,7 @@
 (printf "  (array-morphisms lazy-tensor backend)\n")
 (printf "\n")
 
-(set-pseudo-random-seed! "42")
+(set-pseudo-random-seed! (string->blob "42"))
 
 ;; Dataset
 (define train-data (shuffle (generate-dataset 500)))

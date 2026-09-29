@@ -63,10 +63,10 @@
       (define original-biases (cadr original-params))
       
       ;; Save the layer
-      (save-layer layer "test-dense-layer.s11n")
+      (save-layer layer "test-dense-layer.ngrd")
       
       ;; Load the layer
-      (define loaded-layer (load-layer "test-dense-layer.s11n"))
+      (define loaded-layer (load-layer "test-dense-layer.ngrd"))
       
       ;; Verify loaded layer
       (define loaded-params (parameters loaded-layer))
@@ -107,7 +107,7 @@
                              1e-6))
       
       ;; Cleanup
-      (delete-file* "test-dense-layer.s11n")
+      (delete-file* "test-dense-layer.ngrd")
       
       (and metadata-ok weights-match biases-match forward-match))))
 
@@ -128,10 +128,10 @@
                      name: "TestNetwork"))
       
       ;; Save the model
-      (save-model model "test-model.s11n")
+      (save-model model "test-model.ngrd")
       
       ;; Load the model
-      (define loaded-model (load-model "test-model.s11n"))
+      (define loaded-model (load-model "test-model.ngrd"))
       
       ;; Verify structure
       (define structure-ok
@@ -167,7 +167,7 @@
                 (loop (cdr op) (cdr lp) (and all-match match))))))))
       
       ;; Cleanup
-      (delete-file* "test-model.s11n")
+      (delete-file* "test-model.ngrd")
       
       (and structure-ok forward-match params-match))))
 
@@ -183,14 +183,14 @@
                                           dtype: 'f32
                                           name: "F32Dense"))
       
-      (save-layer f32-layer "test-f32-layer.s11n")
-      (define loaded-f32-layer (load-layer "test-f32-layer.s11n"))
+      (save-layer f32-layer "test-f32-layer.ngrd")
+      (define loaded-f32-layer (load-layer "test-f32-layer.ngrd"))
       
       (define result
         (and (eq? (tensor-dtype (car (parameters f32-layer))) 'f32)
              (eq? (tensor-dtype (car (parameters loaded-f32-layer))) 'f32)))
       
-      (delete-file* "test-f32-layer.s11n")
+      (delete-file* "test-f32-layer.ngrd")
       result))
   
   (test-assert "Float64 dtype preserved"
@@ -199,14 +199,14 @@
                                           dtype: 'f64
                                           name: "F64Dense"))
       
-      (save-layer f64-layer "test-f64-layer.s11n")
-      (define loaded-f64-layer (load-layer "test-f64-layer.s11n"))
+      (save-layer f64-layer "test-f64-layer.ngrd")
+      (define loaded-f64-layer (load-layer "test-f64-layer.ngrd"))
       
       (define result
         (and (eq? (tensor-dtype (car (parameters f64-layer))) 'f64)
              (eq? (tensor-dtype (car (parameters loaded-f64-layer))) 'f64)))
       
-      (delete-file* "test-f64-layer.s11n")
+      (delete-file* "test-f64-layer.ngrd")
       result)))
 
 ;;; ==================================================================
@@ -230,7 +230,7 @@
            (define layer (make-dense-layer 2 2 
                                           activation: activation
                                           name: (string-append "Test-" act-name)))
-           (define filepath (string-append "test-" act-name ".s11n"))
+           (define filepath (string-append "test-" act-name ".ngrd"))
            
            (save-layer layer filepath)
            (define loaded (load-layer filepath))
@@ -290,10 +290,10 @@
                                             name: "TestConv"))
       
       ;; Save
-      (save-layer conv-layer "test-conv-layer.s11n")
+      (save-layer conv-layer "test-conv-layer.ngrd")
       
       ;; Load
-      (define loaded-conv (load-layer "test-conv-layer.s11n"))
+      (define loaded-conv (load-layer "test-conv-layer.ngrd"))
       
       ;; Verify structure
       (define structure-ok
@@ -323,7 +323,7 @@
                              1e-6))
       
       ;; Cleanup
-      (delete-file* "test-conv-layer.s11n")
+      (delete-file* "test-conv-layer.ngrd")
       
       (and structure-ok forward-match))))
 
@@ -347,10 +347,10 @@
          name: "LargeNetwork"))
       
       ;; Save
-      (save-model large-model "test-large-model.s11n")
+      (save-model large-model "test-large-model.ngrd")
       
       ;; Load
-      (define loaded-large (load-model "test-large-model.s11n"))
+      (define loaded-large (load-model "test-large-model.ngrd"))
       
       ;; Test forward pass with random input
       (define test-input 
@@ -370,9 +370,67 @@
                              1e-6))
       
       ;; Cleanup
-      (delete-file* "test-large-model.s11n")
+      (delete-file* "test-large-model.ngrd")
       
       result)))
+
+;;; ==================================================================
+;;; CNN Checkpoint Round Trip
+;;; ==================================================================
+
+(test-group "CNN Checkpoint Round Trip"
+
+  (define (f32-bits-equal? a b)
+    "Check that two f32vectors hold identical bit patterns"
+    (and (= (f32vector-length a) (f32vector-length b))
+         (let loop ((i 0))
+           (or (= i (f32vector-length a))
+               (and (eqv? (f32vector-ref a i) (f32vector-ref b i))
+                    (loop (+ i 1)))))))
+
+  ;; About 1.07 million parameters, most of them in the first dense layer.
+  (define cnn
+    (make-sequential
+     (list
+      (make-conv2d-layer 3 32 3 activation: (make-relu) name: "Conv1")
+      (make-conv2d-layer 32 64 3 activation: (make-relu) name: "Conv2")
+      (make-flatten name: "Flatten")
+      (make-dense-layer 4096 256 activation: (make-relu) name: "FC1")
+      (make-dense-layer 256 10 activation: (make-identity) name: "FC2"))
+     name: "CheckpointCNN"))
+
+  (define image
+    (make-tensor32
+     (let ((v (make-f32vector (* 3 12 12))))
+       (do ((i 0 (+ i 1)))
+           ((= i (f32vector-length v)) v)
+         (f32vector-set! v i (pseudo-random-real))))
+     '(3 12 12)))
+
+  (save-model cnn "test-cnn-model.ngrd")
+  (define loaded-cnn (load-model "test-cnn-model.ngrd"))
+
+  (test "Parameter count is preserved"
+        (apply + (map (lambda (p) (f32vector-length (tensor-data p))) (parameters cnn)))
+        (apply + (map (lambda (p) (f32vector-length (tensor-data p))) (parameters loaded-cnn))))
+
+  (test-assert "Parameters are bit-identical"
+    (every (lambda (p q) (f32-bits-equal? (tensor-data p) (tensor-data q)))
+           (parameters cnn) (parameters loaded-cnn)))
+
+  (test-assert "Forward outputs are bit-identical"
+    (f32-bits-equal? (tensor-data (forward cnn image))
+                     (tensor-data (forward loaded-cnn image))))
+
+  (test-assert "A file that is not a checkpoint is rejected"
+    (begin
+      (with-output-to-file "test-not-a-checkpoint.ngrd"
+        (lambda () (display "not a checkpoint")))
+      (condition-case (begin (load-model "test-not-a-checkpoint.ngrd") #f)
+        ((exn) #t))))
+
+  (delete-file* "test-cnn-model.ngrd")
+  (delete-file* "test-not-a-checkpoint.ngrd"))
 
 ;;; ==================================================================
 ;;; Run All Tests

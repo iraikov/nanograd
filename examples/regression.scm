@@ -2,6 +2,7 @@
 ;; Neural network regression example
 ;; Demonstrates building, training, and evaluating a feedforward network for regression
 
+(import (chicken blob))
 (import scheme
         (chicken base)
         (chicken format)
@@ -11,7 +12,6 @@
         (chicken io)
         (srfi 1)
         (srfi 4)
-        (srfi 42)
         (srfi 69)
         blas
         nanograd-autograd
@@ -19,15 +19,18 @@
         nanograd-optimizer)
 
 (define (f32vector-fold f x0 v . rest)
-  (let ((n   (f32vector-length v))
-        (vs  (cons v rest)))
-    (fold-ec x0 (:range i 0 n)
-             (map (lambda (v) (f32vector-ref v i)) vs)
-             (lambda (x ax) (apply f (append x (list ax)))))))
+  (let ((n  (f32vector-length v))
+        (vs (cons v rest)))
+    (let loop ((i 0) (ax x0))
+      (if (= i n)
+          ax
+          (loop (+ i 1)
+                (apply f (append (map (lambda (v) (f32vector-ref v i)) vs)
+                                 (list ax))))))))
 
 (define (set-random-seed! seed)
   "Set random seed for reproducibility"
-  (set-pseudo-random-seed! (number->string seed)))
+  (set-pseudo-random-seed! (string->blob (number->string seed))))
 
 ;;; ==================================================================
 ;;; Data Generation: Multi-variate Non-linear Function

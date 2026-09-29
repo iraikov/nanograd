@@ -47,7 +47,7 @@
    (srfi 4)
    yasos
    blas
-   s11n
+   (only cbor write-cbor-file read-cbor-file)
    nanograd-autograd
    )
 
@@ -132,7 +132,8 @@
   ;;; Serialization/Deserialization Helpers
   ;;; ==================================================================
 
-  ;; Tensor serialization (uses s11n for efficient storage)
+  ;; Tensor serialization.  The SRFI-4 data vector is stored as a CBOR
+  ;; typed array, written as one block of bytes.
   (define (tensor->serializable tensor)
     "Convert a tensor to a serializable representation"
     (let ((data (tensor-data tensor))
@@ -143,7 +144,7 @@
       `((dtype . ,dtype)
         (shape . ,shape)
         (requires-grad . ,requires-grad)
-        (data . ,data))  ; handle SRFI-4 vectors with s11n
+        (data . ,data))
       ))
 
   (define (serializable->tensor serializable-tensor)
@@ -1570,19 +1571,36 @@
   ;;; File I/O Operations
   ;;; ==================================================================
 
+  ;; Checkpoint files hold one CBOR data item: an alist that names the
+  ;; format and its version, and holds the serializable form of the
+  ;; layer under the key model.
+  (define checkpoint-format 'nanograd-checkpoint)
+  (define checkpoint-version 1)
+
   (define (save-layer-to-file layer filepath)
-    "Save a layer to a file using s11n serialization"
-    (let ((serializable (layer->serializable layer)))
-      (with-output-to-file filepath
-        (lambda ()
-          (serialize serializable)))))
+    "Save a layer to a CBOR checkpoint file"
+    (write-cbor-file filepath
+                     `((format . ,checkpoint-format)
+                       (version . ,checkpoint-version)
+                       (model . ,(layer->serializable layer)))))
 
   (define (load-layer-from-file filepath)
-    "Load a layer from a file using s11n deserialization"
-    (let ((serializable (with-input-from-file filepath
-                          (lambda ()
-                            (deserialize)))))
-      (serializable->layer serializable)))
+    "Load a layer from a CBOR checkpoint file"
+    (let* ((checkpoint (read-cbor-file filepath))
+           (field (lambda (key)
+                    (and (list? checkpoint)
+                         (every pair? checkpoint)
+                         (let ((entry (assq key checkpoint)))
+                           (and entry (cdr entry)))))))
+      (unless (eq? (field 'format) checkpoint-format)
+        (error 'load-layer
+               (format #f "~A is not a nanograd checkpoint" filepath)))
+      (let ((version (field 'version)))
+        (unless (and (fixnum? version) (<= 1 version checkpoint-version))
+          (error 'load-layer
+                 (format #f "~A has unsupported checkpoint version ~A"
+                         filepath version))))
+      (serializable->layer (field 'model))))
 
   ;; Public API for layer save/load
   (define (save-layer layer filepath)
