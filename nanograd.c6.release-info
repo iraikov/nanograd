@@ -2,4 +2,4 @@
 (repo git "git://github.com/iraikov/nanograd.git")
 (uri targz "https://github.com/iraikov/nanograd/tarball/{egg-release}")
 
-(release "3.0" )
+(release "3.1" )
