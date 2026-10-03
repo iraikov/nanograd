@@ -28,6 +28,8 @@
    scheme
    (chicken base)
    (chicken format)
+   (chicken fixnum)
+   (chicken flonum)
    (srfi 1)
    (srfi 4)
    (srfi 69)  ; Hash tables
@@ -43,19 +45,37 @@
   ;;; Gradient Statistics
   ;;; ==================================================================
 
+  ;; One pass over a gradient vector: the sum of squares, the largest
+  ;; absolute value and the sum of absolute values, in double precision.
+  ;; A NaN element makes the largest absolute value NaN (max would
+  ;; ignore it), so that non-finite gradients are detected.
+  (define (gradient-vector-stats grad dtype)
+    (let ((n (vector-length-for-dtype grad dtype)))
+      (define-syntax scan
+        (syntax-rules ()
+          ((_ ref)
+           (let loop ((i 0) (ss 0.0) (mx 0.0) (sa 0.0))
+             (if (fx= i n)
+                 (values ss (if (nan? ss) +nan.0 mx) sa n)
+                 (let ((a (fpabs (ref grad i))))
+                   (loop (fx+ i 1) (fp+ ss (fp* a a)) (if (fp> a mx) a mx) (fp+ sa a))))))))
+      (case dtype
+        ((f32) (scan f32vector-ref))
+        ((f64) (scan f64vector-ref))
+        (else (error 'gradient-vector-stats "Unsupported dtype" dtype)))))
+
+  (define (nan-max a b)
+    (if (or (nan? a) (nan? b)) +nan.0 (max a b)))
+
   (define (gradient-l2-norm grad dtype)
     "Compute L2 norm (Euclidean norm) of gradient vector"
-    (let ((n (vector-length-for-dtype grad dtype)))
-      (sqrt (with-dtype dtype (dot n grad grad)))))
+    (let-values (((ss mx sa n) (gradient-vector-stats grad dtype)))
+      (sqrt ss)))
 
   (define (gradient-inf-norm grad dtype)
     "Compute infinity norm (max absolute value) of gradient"
-    (let ((n (vector-length-for-dtype grad dtype)))
-      (let loop ((i 0) (max-val 0.0))
-        (if (= i n)
-            max-val
-            (let ((val (abs (with-dtype dtype (elt-ref grad i)))))
-              (loop (+ i 1) (max max-val val)))))))
+    (let-values (((ss mx sa n) (gradient-vector-stats grad dtype)))
+      mx))
 
   (define (compute-gradient-norm parameters #!key (norm-type 'l2))
     "Compute gradient norm across all parameters"
@@ -67,9 +87,8 @@
          (lambda (param acc)
            (let ((grad (tensor-grad param)))
              (if grad
-                 (let* ((dtype (tensor-dtype param))
-                        (norm (gradient-l2-norm grad dtype)))
-                   (+ acc (* norm norm)))
+                 (let-values (((ss mx sa n) (gradient-vector-stats grad (tensor-dtype param))))
+                   (+ acc ss))
                  acc)))
          0.0
          parameters)))
@@ -80,9 +99,7 @@
         (lambda (param acc)
           (let ((grad (tensor-grad param)))
             (if grad
-                (let* ((dtype (tensor-dtype param))
-                       (norm (gradient-inf-norm grad dtype)))
-                  (max acc norm))
+                (nan-max acc (gradient-inf-norm grad (tensor-dtype param)))
                 acc)))
         0.0
         parameters))
@@ -91,37 +108,26 @@
        (error 'compute-gradient-norm "Unknown norm type" norm-type))))
 
   (define (gradient-stats parameters)
-    "Compute gradient statistics"
-    (let ((l2-norm (compute-gradient-norm parameters norm-type: 'l2))
-          (inf-norm (compute-gradient-norm parameters norm-type: 'inf))
-          (layer-stats '()))
-      
-      ;; Per-parameter statistics
-      (for-each
-       (lambda (param idx)
-         (let ((grad (tensor-grad param)))
-           (when grad
-             (let* ((dtype (tensor-dtype param))
-                    (n (vector-length-for-dtype grad dtype))
-                    (l2 (gradient-l2-norm grad dtype))
-                    (inf (gradient-inf-norm grad dtype))
-                    ;; Compute mean
-                    (sum (with-dtype dtype (fold + 0.0 grad)))
-                    (mean (/ sum n)))
-               
-               (set! layer-stats
-                     (cons `((layer . ,idx)
-                            (l2-norm . ,l2)
-                            (inf-norm . ,inf)
-                            (mean-abs . ,mean)
-                            (size . ,n))
-                           layer-stats))))))
-       parameters
-       (iota (length parameters)))
-      
-      `((global-l2-norm . ,l2-norm)
-        (global-inf-norm . ,inf-norm)
-        (layer-stats . ,(reverse layer-stats)))))
+    "Compute gradient statistics: the global L2 and infinity norms, and
+     for each parameter with a gradient its index, L2 norm, infinity
+     norm, mean absolute value and size.  Each gradient is read once."
+    (let loop ((ps parameters) (idx 0) (ss-total 0.0) (inf-total 0.0) (layer-stats '()))
+      (if (null? ps)
+          `((global-l2-norm . ,(sqrt ss-total))
+            (global-inf-norm . ,inf-total)
+            (layer-stats . ,(reverse layer-stats)))
+          (let* ((param (car ps))
+                 (grad (tensor-grad param)))
+            (if grad
+                (let-values (((ss mx sa n) (gradient-vector-stats grad (tensor-dtype param))))
+                  (loop (cdr ps) (+ idx 1) (+ ss-total ss) (nan-max inf-total mx)
+                        (cons `((layer . ,idx)
+                                (l2-norm . ,(sqrt ss))
+                                (inf-norm . ,mx)
+                                (mean-abs . ,(if (zero? n) 0.0 (/ sa n)))
+                                (size . ,n))
+                              layer-stats)))
+                (loop (cdr ps) (+ idx 1) ss-total inf-total layer-stats))))))
 
   ;;; ==================================================================
   ;;; Gradient Health Checks
@@ -145,10 +151,20 @@
   (define (check-gradient-health parameters #!key
                                  (exploding-threshold 10.0)
                                  (vanishing-threshold 1e-7)
+                                 (imbalance-threshold 1000.0)
                                  (warn? #t))
-    "Perform gradient health check"
-    (let ((stats (gradient-stats parameters))
-          (issues '()))
+    "Perform gradient health check.  Gradients are unbalanced when the
+     largest per-parameter L2 norm exceeds IMBALANCE-THRESHOLD times the
+     smallest one (this check is skipped when some gradient is zero)."
+    (gradient-health-of-stats (gradient-stats parameters)
+                              exploding-threshold vanishing-threshold
+                              imbalance-threshold warn?))
+
+  ;; The health check of check-gradient-health, on the result STATS of
+  ;; gradient-stats.
+  (define (gradient-health-of-stats stats exploding-threshold vanishing-threshold
+                                    imbalance-threshold warn?)
+    (let ((issues '()))
       
       (let ((global-norm (cdr (assoc 'global-l2-norm stats)))
             (global-inf (cdr (assoc 'global-inf-norm stats))))
@@ -185,7 +201,7 @@
             (let ((min-norm (apply min layer-norms))
                   (max-norm (apply max layer-norms)))
               (when (and (> min-norm 0) 
-                        (> (/ max-norm min-norm) 1000.0))
+                        (> (/ max-norm min-norm) imbalance-threshold))
                 (set! issues (cons 'gradient-imbalance issues))
                 (when warn?
                   (printf "WARNING: Large gradient imbalance across layers!\n")
@@ -207,6 +223,7 @@
   (define (make-gradient-monitor #!key 
                                 (exploding-threshold 10.0)
                                 (vanishing-threshold 1e-7)
+                                (imbalance-threshold 1000.0)
                                 (history-size 100))
     "Create a gradient monitoring object"
     (let ((history '())
@@ -226,10 +243,8 @@
         (let* ((stats (gradient-stats parameters))
                (global-norm (cdr (assoc 'global-l2-norm stats)))
                (global-inf (cdr (assoc 'global-inf-norm stats)))
-               (health (check-gradient-health parameters
-                                            exploding-threshold: exp-thresh
-                                            vanishing-threshold: van-thresh
-                                            warn?: #f)))
+               (health (gradient-health-of-stats stats exp-thresh van-thresh
+                                                 imbalance-threshold #f)))
           
           ;; Record in history
           (set! history
@@ -348,28 +363,26 @@
 
   (define (clip-gradients! parameters #!key 
                           (max-norm 1.0)
-                          (norm-type 'l2))
-    "Clip gradients to prevent exploding gradients"
+                          (norm-type 'l2)
+                          (verbose? #t))
+    "Clip gradients to prevent exploding gradients.  Returns the norm
+     before clipping if clipping was applied, #f otherwise."
     (let ((current-norm (compute-gradient-norm parameters norm-type: norm-type)))
-      
-      (when (> current-norm max-norm)
-        (let ((scale (/ max-norm current-norm)))
-          
-          ;; Scale all gradients
-          (for-each
-           (lambda (param)
-             (let ((grad (tensor-grad param)))
-               (when grad
-                 (let* ((dtype (tensor-dtype param))
-                        (n (vector-length-for-dtype grad dtype)))
-                   (with-dtype dtype (scal! n scale grad))))
-               ))
-           parameters)
-          
-          (printf "  Gradient clipping applied (scale: ~A)\n" scale)
-          current-norm))  ; Return current-norm if clipping was applied
-      
-      #f))  ; Return #f if no clipping needed
+      (if (> current-norm max-norm)
+          (let ((scale (/ max-norm current-norm)))
+            ;; Scale all gradients
+            (for-each
+             (lambda (param)
+               (let ((grad (tensor-grad param)))
+                 (when grad
+                   (let* ((dtype (tensor-dtype param))
+                          (n (vector-length-for-dtype grad dtype)))
+                     (with-dtype dtype (scal! n scale grad))))))
+             parameters)
+            (when verbose?
+              (printf "  Gradient clipping applied (scale: ~A)\n" scale))
+            current-norm)
+          #f)))
 
   (define (suggest-learning-rate parameters current-lr gradient-norm)
     "Suggest learning rate adjustment based on gradient norm"
@@ -426,7 +439,7 @@
         (printf "  L2 Norm:  ~A\n" (cdr (assoc 'global-l2-norm stats)))
         (printf "  Inf Norm: ~A\n" (cdr (assoc 'global-inf-norm stats)))
         
-        (printf "\nPer-Layer Statistics:\n")
+        (printf "\nPer-Layer Statistics (Mean = mean absolute value):\n")
         (let ((layer-stats (cdr (assoc 'layer-stats stats))))
           (for-each
            (lambda (ls)

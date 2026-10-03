@@ -34,6 +34,7 @@
     "test-batchnorm"
     "test-tensor-slice"
     "test-gradcheck"
+    "test-diagnostics"
     "test-am-autograd"
     "test-am-layer"
     "test-am-network"
