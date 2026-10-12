@@ -8,7 +8,7 @@
  (category math)
 
  ; A list of eggs nanograd depends on.
- (dependencies test srfi-1 srfi-4 srfi-69
+ (dependencies test srfi-1 srfi-69
                mathh vector-lib yasos blas cbor array-morphisms)
 
  (author "Ivan Raikov")
