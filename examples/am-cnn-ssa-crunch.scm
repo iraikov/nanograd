@@ -14,6 +14,11 @@
 ;;;     AM_CRUNCH_ACTIVATIONS=single to use one thread for those kernels,
 ;;;     and AM_CRUNCH_THREADS to choose the thread count.
 ;;;   - The Adam update runs on the crunch Adam kernel.
+;;;   - The segops that no catalogue kernel runs, such as the fused bias
+;;;     gradients, run as kernels generated and compiled by the code
+;;;     generator of array-morphisms-crunch when the plan is compiled.
+;;;     The compiled kernels are kept in a cache directory; set
+;;;     AM_CRUNCH_CODEGEN=0 to run those segops as Scheme loops instead.
 ;;;
 ;;; Differences from cnn.scm:
 ;;;   - Uses AM-backed layers (make-am-conv2d-layer, make-am-dense-layer)
@@ -35,6 +40,7 @@
 (import array-morphisms-crunch-activations)
 (import array-morphisms-crunch-threads)
 (import array-morphisms-crunch-optimizers)
+(import array-morphisms-crunch-codegen)
 (import (prefix array-morphisms-grad am:))
 (import nanograd-autograd nanograd-layer nanograd-optimizer)
 (import nanograd-array-morphisms)
@@ -47,6 +53,7 @@
  (if threaded-activations?
      (make-crunch-threaded-activation-backend)
      (make-crunch-activation-backend)))
+(register-crunch-codegen-backend!)
 (register-optimizer-kernel! 'adam 'f32 crunch-adam-f32)
 (register-optimizer-kernel! 'adam 'f64 crunch-adam-f64)
 
@@ -429,6 +436,7 @@
       (printf "Activations: crunch, threaded (~A threads, min chunk ~A)\n\n"
               (crunch-thread-count) (crunch-thread-min-chunk))
       (printf "Activations: crunch, single thread\n\n"))
+  (printf "Code generation: ~A\n\n" (if (crunch-codegen) "on" "off"))
   
   ;; Set random seed
   (set-pseudo-random-seed! (string->blob (number->string 42)))
