@@ -20,3 +20,6 @@
 
 *.ngrd
 *.ngrd.meta
+
+# Development diagnostics and benchmarks
+diagnostics/
