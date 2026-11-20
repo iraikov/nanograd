@@ -306,9 +306,9 @@
          (when (tensor-requires-grad? param)
            (let ((grad (tensor-grad param)))
              (when grad
-               (let* ((grad-data (tensor-data grad))
-                      (dtype (tensor-dtype grad))
-                      (size (apply * (tensor-shape grad))))
+               (let* ((grad-data grad)
+                      (dtype (tensor-dtype param))
+                      (size (apply * (tensor-shape param))))
                  
                  (with-dtype dtype
                     (do ((i 0 (+ i 1)))
