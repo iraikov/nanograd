@@ -28,6 +28,7 @@
   '("test-autograd"
     "test-layer"
     "test-optimizer"
+    "test-training"
     "test-network"
     "test-serialization"
     "test-gelu-silu"
