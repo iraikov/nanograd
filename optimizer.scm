@@ -3,10 +3,10 @@
 (module nanograd-optimizer
   (
    ;; Optimizer predicates
-   optimizer? sgd? adam? rmsprop?
-   
+   optimizer? sgd? adam? adamw? rmsprop?
+
    ;; Optimizer constructors
-   make-sgd make-adam make-rmsprop
+   make-sgd make-adam make-adamw make-rmsprop
    
    ;; Optimizer operations
    step! get-learning-rate set-learning-rate!
@@ -42,6 +42,11 @@
   ;; receives the weight-decay term) in place.  hyper is an f64vector
   ;; holding the learning rate, beta1, beta2, epsilon, the two bias
   ;; corrections 1 - beta1^t and 1 - beta2^t, and the weight decay.
+  ;; An adamw kernel has the same arguments, but applies the weight decay
+  ;; by scaling param by 1 - lr * wd before the Adam update, and leaves
+  ;; grad unchanged.  Adam with decoupled weight decay uses the adamw
+  ;; kernel when one is registered; otherwise it scales param itself and
+  ;; calls the adam kernel with a weight decay of 0.
   (define *optimizer-kernels* '())
 
   (define (register-optimizer-kernel! name dtype kernel)
@@ -70,6 +75,7 @@
   (define-predicate optimizer?)
   (define-predicate sgd?)
   (define-predicate adam?)
+  (define-predicate adamw?)
   (define-predicate rmsprop?)
   
   (define-operation (step! opt))
@@ -169,8 +175,17 @@
                      (beta1 0.9)
                      (beta2 0.999)
                      (epsilon 1e-8)
-                     (weight-decay 0.0))
-    
+                     (weight-decay 0.0)
+                     (decoupled-weight-decay #f))
+    "Adam optimizer over the list of parameter tensors PARAMETERS.
+
+     weight-decay is applied in one of two ways:
+       decoupled-weight-decay #f (default): L2 regularization; wd * p is
+         added to the gradient before the moment updates.
+       decoupled-weight-decay #t (AdamW, Loshchilov and Hutter): each
+         parameter is first scaled by (1 - lr * wd), and the Adam update
+         then uses the plain gradient."
+
     (let ((lr learning-rate)
           (b1 beta1)
           (b2 beta2)
@@ -198,7 +213,8 @@
        ;; Type predicates
        ((optimizer? self) #t)
        ((adam? self) #t)
-       
+       ((adamw? self) decoupled-weight-decay)
+
        ;; Learning rate accessors
        ((get-learning-rate self) lr)
        ((set-learning-rate! self new-lr) (set! lr new-lr))
@@ -210,6 +226,7 @@
           (beta2 . ,b2)
           (epsilon . ,eps)
           (weight-decay . ,wd)
+          (decoupled-weight-decay . ,decoupled-weight-decay)
           (step . ,t)))
        
        ;; Perform optimization step
@@ -228,16 +245,27 @@
                     (n (vector-length-for-dtype data dtype)))
 
                (when grad
-                 (let ((m (hash-table-ref m-buffers param))
-                       (v (hash-table-ref v-buffers param))
-                       (kernel (optimizer-kernel 'adam dtype)))
+                 (let* ((m (hash-table-ref m-buffers param))
+                        (v (hash-table-ref v-buffers param))
+                        (adamw-kernel (and decoupled-weight-decay
+                                           (optimizer-kernel 'adamw dtype)))
+                        (kernel (or adamw-kernel (optimizer-kernel 'adam dtype)))
+                        ;; Decoupled decay not handled by an adamw kernel
+                        (scale-here? (and decoupled-weight-decay (not adamw-kernel)))
+                        ;; Weight decay passed to the kernel
+                        (kernel-wd (if scale-here? 0.0 wd))
+                        ;; Weight decay that enters through the gradient
+                        (coupled-wd (if decoupled-weight-decay 0.0 wd)))
+                  ;; Decoupled weight decay: p <- (1 - lr * wd) p
+                  (when (and scale-here? (> wd 0.0))
+                    (with-dtype dtype (scal! n (- 1.0 (* lr wd)) data)))
                   (if kernel
-                   (kernel n (f64vector lr b1 b2 eps bias-correction1 bias-correction2 wd)
+                   (kernel n (f64vector lr b1 b2 eps bias-correction1 bias-correction2 kernel-wd)
                            data grad m v)
                    (begin
                    ;; Apply weight decay
-                   (when (> wd 0.0)
-                     (with-dtype dtype (axpy! n wd data grad)))
+                   (when (> coupled-wd 0.0)
+                     (with-dtype dtype (axpy! n coupled-wd data grad)))
 
                    (with-dtype dtype
                       ;; Update biased first moment: m = beta1 * m + (1-beta1) * grad
@@ -266,6 +294,29 @@
                    ))
                  )
            parameters))))))
+
+  ;;; ==================================================================
+  ;;; AdamW Optimizer
+  ;;; ==================================================================
+
+  (define (make-adamw parameters
+                      #!key
+                      (learning-rate 0.001)
+                      (beta1 0.9)
+                      (beta2 0.999)
+                      (epsilon 1e-8)
+                      (weight-decay 0.01))
+    "AdamW: Adam with decoupled weight decay.  Each step first scales
+     every parameter by (1 - learning-rate * weight-decay) and then
+     applies the Adam update computed from the plain gradient.  The
+     result answers #t to both adam? and adamw?."
+    (make-adam parameters
+               learning-rate: learning-rate
+               beta1: beta1
+               beta2: beta2
+               epsilon: epsilon
+               weight-decay: weight-decay
+               decoupled-weight-decay: #t))
 
   ;;; ==================================================================
   ;;; RMSprop Optimizer

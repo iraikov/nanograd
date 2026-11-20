@@ -167,6 +167,34 @@
         (lambda (xs) (cross-entropy-loss (car xs) (constant-tensor (f64vector 3.0) '(1))
                                          from-logits: #t))
         '((5)))
+       1e-6))
+  (test-assert "cross-entropy from logits, class indices with a row mask"
+    (< (max-gradient-error
+        (lambda (xs) (cross-entropy-loss (car xs) (constant-tensor (f64vector 2.0 1.0 0.0 3.0) '(4))
+                                         from-logits: #t
+                                         mask: (f64vector 1.0 0.0 0.5 1.0)))
+        '((4 4)))
+       1e-6))
+  (test-assert "cross-entropy from logits, one-hot with a row mask, sum"
+    (< (max-gradient-error
+        (lambda (xs) (cross-entropy-loss (car xs)
+                                         (constant-tensor (f64vector 0 0 1 0 1 0 0 0 0 0 0 1) '(3 4))
+                                         from-logits: #t reduction: 'sum
+                                         mask: (f64vector 0.0 1.0 1.0)))
+        '((3 4)))
+       1e-6))
+  (test-assert "binary cross-entropy with logits, mean"
+    (< (max-gradient-error
+        (lambda (xs) (binary-cross-entropy-with-logits
+                      (car xs) (constant-tensor (f64vector 1.0 0.0 0.3 1.0 0.0 0.7) '(2 3))))
+        '((2 3)))
+       1e-6))
+  (test-assert "binary cross-entropy with logits, none, with a mask"
+    (< (max-gradient-error
+        (lambda (xs) (binary-cross-entropy-with-logits
+                      (car xs) (constant-tensor (f64vector 1.0 0.0 0.3 1.0) '(4))
+                      reduction: 'none mask: (f64vector 1.0 0.0 2.0 1.0)))
+        '((4)))
        1e-6)))
 
 (test-group "dense layer on a batch"

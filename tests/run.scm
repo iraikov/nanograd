@@ -28,6 +28,7 @@
   '("test-autograd"
     "test-layer"
     "test-optimizer"
+    "test-losses"
     "test-training"
     "test-network"
     "test-serialization"

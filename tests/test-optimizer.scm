@@ -546,4 +546,181 @@
   (test-assert "Removing the registration restores the built-in update"
     (not (optimizer-kernel 'adam 'f32))))
 
+;;; ==================================================================
+;;; Unit Tests: AdamW (decoupled weight decay)
+;;; ==================================================================
+
+;; Reference AdamW on one f64 parameter vector P with a fixed gradient
+;; G, for STEPS steps; returns the final parameter values as a list.
+(define (reference-adamw p g steps lr b1 b2 eps wd)
+  (let ((n (length p)))
+    (let loop ((t 1) (p p) (m (make-list n 0.0)) (v (make-list n 0.0)))
+      (if (> t steps)
+          p
+          (let* ((m (map (lambda (mi gi) (+ (* b1 mi) (* (- 1.0 b1) gi))) m g))
+                 (v (map (lambda (vi gi) (+ (* b2 vi) (* (- 1.0 b2) gi gi))) v g))
+                 (bc1 (- 1.0 (expt b1 t)))
+                 (bc2 (- 1.0 (expt b2 t)))
+                 (p (map (lambda (pi mi vi)
+                           (- (* pi (- 1.0 (* lr wd)))
+                              (/ (* lr (/ mi bc1)) (+ (sqrt (/ vi bc2)) eps))))
+                         p m v)))
+            (loop (+ t 1) p m v))))))
+
+;; Runs OPT for STEPS steps on W with the fixed gradient vector G.
+(define (run-steps! opt w g steps)
+  (do ((k 0 (+ k 1))) ((= k steps))
+    (zero-grad! w)
+    (add-to-grad! w g)
+    (step! opt)))
+
+(test-group "AdamW - Construction"
+  (let* ((w (make-tensor64 (f64vector 1.0 2.0) '(2)))
+         (opt (make-adamw (list w) learning-rate: 1e-4 beta2: 0.95 weight-decay: 1.0))
+         (state (optimizer-state opt)))
+    (test-assert "Is an optimizer" (optimizer? opt))
+    (test-assert "Is an Adam optimizer" (adam? opt))
+    (test-assert "Is an AdamW optimizer" (adamw? opt))
+    (test-approximate "beta2 = 0.95" 0.95 (cdr (assoc 'beta2 state)) 1e-12)
+    (test-approximate "weight decay = 1.0" 1.0 (cdr (assoc 'weight-decay state)) 1e-12)
+    (test "state records decoupled weight decay" #t
+          (cdr (assoc 'decoupled-weight-decay state))))
+  (let ((w (make-tensor64 (f64vector 1.0) '(1))))
+    (test-approximate "default weight decay is 0.01"
+      0.01 (cdr (assoc 'weight-decay (optimizer-state (make-adamw (list w))))) 1e-12)
+    (test-assert "plain Adam is not AdamW"
+      (not (adamw? (make-adam (list w) weight-decay: 0.1))))))
+
+(test-group "AdamW - Zero gradient shrinks parameters by (1 - lr * wd)"
+  (let* ((w (make-tensor64 (f64vector 2.0 -4.0) '(2)))
+         (opt (make-adamw (list w) learning-rate: 0.1 weight-decay: 0.5)))
+    (run-steps! opt w (f64vector 0.0 0.0) 3)
+    (test-assert "w = w0 * 0.95^3"
+      (every (lambda (actual w0) (approx-equal? actual (* w0 (expt 0.95 3)) 1e-12))
+             (f64vector->list (tensor-data w)) '(2.0 -4.0))))
+  ;; Coupled L2 decay feeds wd * w into the Adam moments instead, so the
+  ;; parameter moves by about lr per step regardless of its size.
+  (let* ((w (make-tensor64 (f64vector 2.0 -4.0) '(2)))
+         (opt (make-adam (list w) learning-rate: 0.1 weight-decay: 0.5)))
+    (run-steps! opt w (f64vector 0.0 0.0) 3)
+    (test-assert "coupled Adam gives a different result"
+      (not (approx-equal? (f64vector-ref (tensor-data w) 0) (* 2.0 (expt 0.95 3)) 1e-3)))))
+
+(test-group "AdamW - Matches the reference update"
+  (let* ((p0 '(0.5 -1.0 2.0 0.0))
+         (g '(0.3 -0.2 0.1 -0.05))
+         (w (make-tensor64 (list->f64vector p0) '(4)))
+         (opt (make-adamw (list w) learning-rate: 0.01 beta1: 0.9 beta2: 0.95
+                          epsilon: 1e-8 weight-decay: 0.1)))
+    (run-steps! opt w (list->f64vector g) 5)
+    (test-assert "five steps agree with the formula"
+      (every (lambda (a e) (approx-equal? a e 1e-12))
+             (f64vector->list (tensor-data w))
+             (reference-adamw p0 g 5 0.01 0.9 0.95 1e-8 0.1)))))
+
+(test-group "AdamW - Gradient is left unchanged"
+  (let* ((w (make-tensor64 (f64vector 1.0 2.0) '(2)))
+         (opt (make-adamw (list w) learning-rate: 0.01 weight-decay: 0.5)))
+    (run-steps! opt w (f64vector 0.25 -0.5) 1)
+    (test "gradient after the step" '(0.25 -0.5)
+          (f64vector->list (tensor-grad w)))))
+
+(test-group "AdamW - Zero weight decay equals Adam"
+  (let ((wa (make-tensor64 (f64vector 1.0 -2.0) '(2)))
+        (wb (make-tensor64 (f64vector 1.0 -2.0) '(2))))
+    (run-steps! (make-adam (list wa) learning-rate: 0.01) wa (f64vector 0.1 0.2) 4)
+    (run-steps! (make-adamw (list wb) learning-rate: 0.01 weight-decay: 0.0)
+                wb (f64vector 0.1 0.2) 4)
+    (test "identical parameters" (f64vector->list (tensor-data wa))
+          (f64vector->list (tensor-data wb)))))
+
+(test-group "AdamW - Registered update kernel"
+  ;; The kernel receives the coupled weight decay, which is 0 for AdamW;
+  ;; the decoupled decay is applied before the kernel is called.
+  (define kernel-wds '())
+  (define (scheme-adam-kernel n hyper param grad m v)
+    (set! kernel-wds (cons (f64vector-ref hyper 6) kernel-wds))
+    (let ((lr (f64vector-ref hyper 0)) (b1 (f64vector-ref hyper 1))
+          (b2 (f64vector-ref hyper 2)) (eps (f64vector-ref hyper 3))
+          (bc1 (f64vector-ref hyper 4)) (bc2 (f64vector-ref hyper 5)))
+      (do ((i 0 (+ i 1))) ((= i n))
+        (let ((g (f32vector-ref grad i)))
+          (f32vector-set! m i (+ (* b1 (f32vector-ref m i)) (* (- 1.0 b1) g)))
+          (f32vector-set! v i (+ (* b2 (f32vector-ref v i)) (* (- 1.0 b2) g g)))
+          (f32vector-set! param i
+                          (- (f32vector-ref param i)
+                             (/ (* lr (/ (f32vector-ref m i) bc1))
+                                (+ (sqrt (/ (f32vector-ref v i) bc2)) eps))))))))
+
+  (define (weights-after-steps)
+    (let* ((w (make-tensor32 (f32vector 0.5 -1.0 2.0) '(3)))
+           (opt (make-adamw (list w) learning-rate: 0.01 weight-decay: 0.1)))
+      (run-steps! opt w (f32vector 0.3 -0.2 0.1) 3)
+      (f32vector->list (tensor-data w))))
+
+  (define without (weights-after-steps))
+  (register-optimizer-kernel! 'adam 'f32 scheme-adam-kernel)
+  (define with (weights-after-steps))
+  (register-optimizer-kernel! 'adam 'f32 #f)
+
+  (test "kernel called once per step" 3 (length kernel-wds))
+  (test-assert "kernel receives zero coupled weight decay"
+    (every zero? kernel-wds))
+  (test-assert "kernel result agrees with the built-in AdamW"
+    (every (lambda (a b) (approx-equal? a b 1e-6)) without with)))
+
+(test-group "AdamW - Registered adamw kernel"
+  ;; A Scheme stand-in for a compiled adamw kernel: decoupled decay, then
+  ;; the Adam update; it records the weight decay it receives.
+  (define adamw-wds '())
+  (define adam-calls 0)
+  (define (scheme-adamw-kernel n hyper param grad m v)
+    (set! adamw-wds (cons (f64vector-ref hyper 6) adamw-wds))
+    (let ((lr (f64vector-ref hyper 0)) (b1 (f64vector-ref hyper 1))
+          (b2 (f64vector-ref hyper 2)) (eps (f64vector-ref hyper 3))
+          (bc1 (f64vector-ref hyper 4)) (bc2 (f64vector-ref hyper 5))
+          (wd (f64vector-ref hyper 6)))
+      (do ((i 0 (+ i 1))) ((= i n))
+        (f32vector-set! param i (* (- 1.0 (* lr wd)) (f32vector-ref param i)))
+        (let ((g (f32vector-ref grad i)))
+          (f32vector-set! m i (+ (* b1 (f32vector-ref m i)) (* (- 1.0 b1) g)))
+          (f32vector-set! v i (+ (* b2 (f32vector-ref v i)) (* (- 1.0 b2) g g)))
+          (f32vector-set! param i
+                          (- (f32vector-ref param i)
+                             (/ (* lr (/ (f32vector-ref m i) bc1))
+                                (+ (sqrt (/ (f32vector-ref v i) bc2)) eps))))))))
+  (define (counting-adam-kernel n hyper param grad m v)
+    (set! adam-calls (+ adam-calls 1)))
+
+  (define (weights-after-steps make-opt)
+    (let* ((w (make-tensor32 (f32vector 0.5 -1.0 2.0) '(3)))
+           (opt (make-opt (list w))))
+      (run-steps! opt w (f32vector 0.3 -0.2 0.1) 3)
+      (f32vector->list (tensor-data w))))
+
+  (define (adamw-opt params) (make-adamw params learning-rate: 0.01 weight-decay: 0.1))
+
+  (define without (weights-after-steps adamw-opt))
+  (register-optimizer-kernel! 'adamw 'f32 scheme-adamw-kernel)
+  (register-optimizer-kernel! 'adam 'f32 counting-adam-kernel)
+  (define with (weights-after-steps adamw-opt))
+
+  (test "adamw kernel called once per step" 3 (length adamw-wds))
+  (test-assert "adamw kernel receives the weight decay"
+    (every (lambda (wd) (approx-equal? wd 0.1 1e-12)) adamw-wds))
+  (test "adam kernel is not called for AdamW" 0 adam-calls)
+  (test-assert "adamw kernel result agrees with the built-in AdamW"
+    (every (lambda (a b) (approx-equal? a b 1e-6)) without with))
+
+  ;; Coupled weight decay keeps using the adam kernel.
+  (weights-after-steps (lambda (params)
+                         (make-adam params learning-rate: 0.01 weight-decay: 0.1)))
+  (test "plain Adam uses the adam kernel" 3 adam-calls)
+  (test "plain Adam does not use the adamw kernel" 3 (length adamw-wds))
+
+  (register-optimizer-kernel! 'adamw 'f32 #f)
+  (register-optimizer-kernel! 'adam 'f32 #f)
+  (test-assert "registrations removed"
+    (not (or (optimizer-kernel 'adamw 'f32) (optimizer-kernel 'adam 'f32)))))
+
 (test-exit)
