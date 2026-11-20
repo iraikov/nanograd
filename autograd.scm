@@ -40,6 +40,7 @@
    
    ;; Loss functions
    mse-loss cross-entropy-loss
+   binary-cross-entropy-with-logits
 
    ;; Reduction operators
    reduce-tensor
@@ -2251,7 +2252,7 @@
 
 
   ;; Cross Entropy Loss with batch handling
-  (define (cross-entropy-loss pred target #!key (reduction 'mean) (from-logits #f))
+  (define (cross-entropy-loss pred target #!key (reduction 'mean) (from-logits #f) (mask #f))
     "Cross Entropy loss with batch support.
    
      Args:
@@ -2264,18 +2265,26 @@
        reduction: 'mean (default) - average over batch
                   'sum' - sum over batch
        from-logits: If true, apply log-softmax to pred first
-   
+       mask: Optional per-row weights for 2-D pred (tensor or f32/f64
+             vector of batch_size non-negative numbers).  Weight 0 removes
+             a row from the loss and from the gradient.  With 'mean the
+             weighted sum is divided by the total weight; the loss is 0
+             when the total weight is 0.
+
      Returns:
        Scalar loss tensor"
-  
+
     (assert (eq? (tensor-dtype pred) (tensor-dtype target)))
-  
+
     (let* ((dtype (tensor-dtype pred))
            (pred-shape (tensor-shape pred))
            (target-shape (tensor-shape target))
            (requires-grad? (tensor-requires-grad? pred)))
 
       (cond
+       ((and mask (not (= (length pred-shape) 2)))
+        (error 'cross-entropy-loss "mask requires 2-D predictions" pred-shape))
+
        ;; Case 0: 1D input (single sample)
        ((= (length pred-shape) 1)
         (let ((n-classes (car pred-shape)))
@@ -2378,8 +2387,21 @@
                                target-shape pred-shape))))))))
  
        ((= (length pred-shape) 2)
-        (let ((batch-size (car pred-shape))
-              (n-classes (cadr pred-shape)))
+        (let* ((batch-size (car pred-shape))
+               (n-classes (cadr pred-shape))
+               (weights (and mask (loss-weights mask batch-size 'cross-entropy-loss)))
+               ;; Weight of row b; 1 for every row without a mask
+               (row-weight (if weights
+                               (lambda (b) (f64vector-ref weights b))
+                               (lambda (b) 1.0)))
+               ;; Factor turning the weighted row sum into the loss
+               (scale (case reduction
+                        ((mean) (let ((total (if weights
+                                                 (f64vector-total weights)
+                                                 (exact->inexact batch-size))))
+                                  (if (> total 0.0) (/ 1.0 total) 0.0)))
+                        ((sum) 1.0)
+                        (else (error 'cross-entropy-loss "Unknown reduction" reduction)))))
         
           ;; Apply log-softmax if needed
           (let ((log-probs (if from-logits
@@ -2407,12 +2429,10 @@
                          (with-dtype dtype
                                      (let loop ((i 0) (sum 0.0))
                                        (if (= i n)
-                                           (case reduction
-                                             ((mean) (- (/ sum (exact->inexact batch-size))))
-                                             ((sum) (- sum))
-                                             (else (error 'cross-entropy-loss "Unknown reduction")))
+                                           (- (* scale sum))
                                            (loop (+ i 1)
-                                                 (+ sum (* (elt-ref data-target i)
+                                                 (+ sum (* (row-weight (quotient i n-classes))
+                                                           (elt-ref data-target i)
                                                            (elt-ref log-probs-data i)))))))))
                     
                     (let ((loss-tensor (make-base-tensor
@@ -2426,28 +2446,25 @@
                            ;; or use log-softmax gradient if from-logits
                            (if from-logits
                                ;; Gradient flows through log-softmax
-                               (let ((grad-log-probs (with-dtype dtype (vec n 0.0)))
-                                     (scale (case reduction
-                                              ((mean) (/ 1.0 (exact->inexact batch-size)))
-                                              ((sum) 1.0))))
+                               (let ((grad-log-probs (with-dtype dtype (vec n 0.0))))
                                  (with-dtype dtype
                                              (do ((i 0 (+ i 1)))
                                                  ((= i n))
                                                (elt-set! grad-log-probs i
-                                                         (* (- scale) (elt-ref data-target i)))))
+                                                         (* (- scale)
+                                                            (row-weight (quotient i n-classes))
+                                                            (elt-ref data-target i)))))
                                  (add-to-grad! log-probs (scale-by-upstream! grad-log-probs loss-tensor dtype)))
                                
                                ;; Direct gradient to pred
                                (let ((grad-pred (with-dtype dtype (vec n 0.0)))
-                                     (data-pred (tensor-data pred))
-                                     (scale (case reduction
-                                              ((mean) (/ 1.0 (exact->inexact batch-size)))
-                                              ((sum) 1.0))))
+                                     (data-pred (tensor-data pred)))
                                  (with-dtype dtype
                                              (do ((i 0 (+ i 1)))
                                                  ((= i n))
                                                (elt-set! grad-pred i
                                                          (* (- scale)
+                                                            (row-weight (quotient i n-classes))
                                                             (/ (elt-ref data-target i)
                                                                (max 1e-10 (elt-ref data-pred i)))))))
                                  (add-to-grad! pred (scale-by-upstream! grad-pred loss-tensor dtype)))))
@@ -2465,13 +2482,15 @@
                          (with-dtype dtype
                                      (let loop ((b 0) (sum 0.0))
                                        (if (= b batch-size)
-                                           (case reduction
-                                             ((mean) (- (/ sum (exact->inexact batch-size))))
-                                             ((sum) (- sum)))
-                                           (let* ((class-idx (inexact->exact (elt-ref data-target b)))
-                                                  (log-prob (elt-ref log-probs-data 
-                                                                     (+ (* b n-classes) class-idx))))
-                                             (loop (+ b 1) (+ sum log-prob))))))))
+                                           (- (* scale sum))
+                                           (let ((w (row-weight b)))
+                                             (if (= w 0.0)
+                                                 ;; A masked row may hold any target value
+                                                 (loop (+ b 1) sum)
+                                                 (let* ((class-idx (inexact->exact (elt-ref data-target b)))
+                                                        (log-prob (elt-ref log-probs-data
+                                                                           (+ (* b n-classes) class-idx))))
+                                                   (loop (+ b 1) (+ sum (* w log-prob)))))))))))
                     
                     (let ((loss-tensor (make-base-tensor
                                         (with-dtype dtype (vec0 loss-value))
@@ -2482,36 +2501,34 @@
                          (lambda ()
                            (if from-logits
                                ;; Gradient through log-softmax: softmax - one_hot
-                               (let ((grad-log-probs (with-dtype dtype 
-                                                                 (vec (* batch-size n-classes) 0.0)))
-                                     (scale (case reduction
-                                              ((mean) (/ 1.0 (exact->inexact batch-size)))
-                                              ((sum) 1.0))))
+                               (let ((grad-log-probs (with-dtype dtype
+                                                                 (vec (* batch-size n-classes) 0.0))))
                                  (with-dtype dtype
                                              (do ((b 0 (+ b 1)))
                                                  ((= b batch-size))
-                                               (let ((class-idx (inexact->exact (elt-ref data-target b)))
-                                                     (offset (* b n-classes)))
-                                                 (elt-set! grad-log-probs (+ offset class-idx)
-                                                           (- scale)))))
+                                               (let ((w (row-weight b)))
+                                                 (unless (= w 0.0)
+                                                   (let ((class-idx (inexact->exact (elt-ref data-target b)))
+                                                         (offset (* b n-classes)))
+                                                     (elt-set! grad-log-probs (+ offset class-idx)
+                                                               (* (- scale) w)))))))
                                  (add-to-grad! log-probs (scale-by-upstream! grad-log-probs loss-tensor dtype)))
                                ;; Direct gradient to probabilities
-                               (let ((grad-pred (with-dtype dtype 
+                               (let ((grad-pred (with-dtype dtype
                                                             (vec (* batch-size n-classes) 0.0)))
-                                     (data-pred (tensor-data pred))
-                                     (scale (case reduction
-                                              ((mean) (/ 1.0 (exact->inexact batch-size)))
-                                              ((sum) 1.0))))
+                                     (data-pred (tensor-data pred)))
                                  (with-dtype dtype
                                              (do ((b 0 (+ b 1)))
                                                  ((= b batch-size))
-                                               (let ((class-idx (inexact->exact (elt-ref data-target b)))
-                                                     (offset (* b n-classes)))
-                                                 (elt-set! grad-pred (+ offset class-idx)
-                                                           (* (- scale)
-                                                              (/ 1.0 (max 1e-10 
-                                                                          (elt-ref data-pred 
-                                                                                   (+ offset class-idx)))))))))
+                                               (let ((w (row-weight b)))
+                                                 (unless (= w 0.0)
+                                                   (let ((class-idx (inexact->exact (elt-ref data-target b)))
+                                                         (offset (* b n-classes)))
+                                                     (elt-set! grad-pred (+ offset class-idx)
+                                                               (* (- scale) w
+                                                                  (/ 1.0 (max 1e-10
+                                                                              (elt-ref data-pred
+                                                                                       (+ offset class-idx)))))))))))
                                  (add-to-grad! pred (scale-by-upstream! grad-pred loss-tensor dtype)))))
                          ;; With logits the gradient goes through log-softmax.
                          (if from-logits (list log-probs) (list pred))))
@@ -2519,9 +2536,131 @@
                
                (else
                 (error 'cross-entropy-loss 
-                       (format #f "Target shape ~A incompatible with pred shape ~A" 
+                       (format #f "Target shape ~A incompatible with pred shape ~A"
                                target-shape pred-shape)))))))))
       ))
+
+  (define (loss-weights mask n who)
+    "Convert MASK, a tensor or an f32/f64 vector of N non-negative
+     weights, to an f64vector.  WHO names the caller in error messages."
+    (let* ((v (if (tensor? mask) (tensor-data mask) mask))
+           (len (cond ((f32vector? v) (f32vector-length v))
+                      ((f64vector? v) (f64vector-length v))
+                      (else (error who "mask must be a tensor or an f32/f64 vector"
+                                   mask)))))
+      (unless (= len n)
+        (error who (format #f "mask has ~A elements, expected ~A" len n)))
+      (let ((w (make-f64vector n 0.0)))
+        (do ((i 0 (+ i 1))) ((= i n) w)
+          (f64vector-set! w i (if (f32vector? v)
+                                  (f32vector-ref v i)
+                                  (f64vector-ref v i)))))))
+
+  (define (f64vector-total v)
+    "Sum of the elements of the f64vector V."
+    (let ((n (f64vector-length v)))
+      (let loop ((i 0) (s 0.0))
+        (if (= i n) s (loop (+ i 1) (+ s (f64vector-ref v i)))))))
+
+  (define (binary-cross-entropy-with-logits logits target
+                                            #!key (reduction 'mean) (mask #f))
+    "Binary cross-entropy on logits, element-wise over tensors of any shape.
+
+     For a logit q and a target t in [0, 1] the loss is
+       l = softplus(q) - t q = max(q, 0) - t q + log(1 + exp(-|q|)),
+     which equals -[t log sigmoid(q) + (1 - t) log(1 - sigmoid(q))] and
+     never overflows.  The gradient with respect to q is sigmoid(q) - t.
+     The target is treated as a constant.
+
+     Args:
+       logits: Tensor of logits
+       target: Tensor of targets, same shape and dtype as logits
+       reduction: 'mean (default) - weighted mean over all elements
+                  'sum            - weighted sum over all elements
+                  'none           - per-element weighted losses, shape of logits
+       mask: Optional per-element weights (tensor or f32/f64 vector with as
+             many elements as logits).  Weight 0 removes an element from the
+             loss.  With 'mean the weighted sum is divided by the total
+             weight; the loss is 0 when the total weight is 0.
+
+     Returns:
+       Loss tensor: shape (1) for 'mean and 'sum, shape of logits for 'none"
+
+    (assert (eq? (tensor-dtype logits) (tensor-dtype target)))
+    (unless (equal? (tensor-shape logits) (tensor-shape target))
+      (error 'binary-cross-entropy-with-logits
+             (format #f "Target shape ~A differs from logits shape ~A"
+                     (tensor-shape target) (tensor-shape logits))))
+
+    (let* ((dtype (tensor-dtype logits))
+           (shape (tensor-shape logits))
+           (q (tensor-data logits))
+           (t (tensor-data target))
+           (n (vector-length-for-dtype q dtype))
+           (weights (and mask (loss-weights mask n 'binary-cross-entropy-with-logits)))
+           (weight (if weights
+                       (lambda (i) (f64vector-ref weights i))
+                       (lambda (i) 1.0)))
+           (scale (case reduction
+                    ((mean) (let ((total (if weights
+                                             (f64vector-total weights)
+                                             (exact->inexact n))))
+                              (if (> total 0.0) (/ 1.0 total) 0.0)))
+                    ((sum none) 1.0)
+                    (else (error 'binary-cross-entropy-with-logits
+                                 "Unknown reduction" reduction))))
+           (requires-grad? (tensor-requires-grad? logits))
+           (losses (with-dtype dtype (vec n 0.0))))
+
+      ;; Local gradient d(loss)/d(q_i), before the upstream gradient
+      (define (local-gradient)
+        (let ((g (with-dtype dtype (vec n 0.0))))
+          (with-dtype dtype
+            (do ((i 0 (+ i 1))) ((= i n))
+              (let* ((qi (elt-ref q i))
+                     (sig (if (>= qi 0.0)
+                              (/ 1.0 (+ 1.0 (exp (- qi))))
+                              (let ((e (exp qi))) (/ e (+ 1.0 e))))))
+                (elt-set! g i (* scale (weight i) (- sig (elt-ref t i)))))))
+          g))
+
+      ;; Per-element weighted losses
+      (with-dtype dtype
+        (do ((i 0 (+ i 1))) ((= i n))
+          (let ((qi (elt-ref q i)))
+            (elt-set! losses i
+                      (* (weight i)
+                         (+ (max qi 0.0)
+                            (- (* (elt-ref t i) qi))
+                            (log1p (exp (- (abs qi))))))))))
+
+      (if (eq? reduction 'none)
+          (let ((result (make-base-tensor losses shape dtype requires-grad?)))
+            (when requires-grad?
+              (set-backward-fn!
+               result
+               (lambda ()
+                 (let ((g (local-gradient))
+                       (up (tensor-grad result)))
+                   (with-dtype dtype
+                     (do ((i 0 (+ i 1))) ((= i n))
+                       (elt-set! g i (* (elt-ref g i) (elt-ref up i)))))
+                   (add-to-grad! logits g)))
+               (list logits)))
+            result)
+          (let* ((total (with-dtype dtype
+                          (let loop ((i 0) (s 0.0))
+                            (if (= i n) s (loop (+ i 1) (+ s (elt-ref losses i)))))))
+                 (loss-tensor (make-base-tensor (with-dtype dtype (vec0 (* scale total)))
+                                                '(1) dtype requires-grad?)))
+            (when requires-grad?
+              (set-backward-fn!
+               loss-tensor
+               (lambda ()
+                 (add-to-grad! logits
+                               (scale-by-upstream! (local-gradient) loss-tensor dtype)))
+               (list logits)))
+            loss-tensor))))
 
 
   ;;; ==================================================================
